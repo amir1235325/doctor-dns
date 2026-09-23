@@ -184,6 +184,22 @@ out = since(at)
 check("a long list is logged as a count, not thirty names", "d=[30]" in out, out)
 check("secret-looking fields are masked whatever the action",
       admin.describe({"new_password": ["hunter2"], "id": ["1"]}) == " id=1 new_password=***")
+# The change-password form sends the new password twice. Its second box was
+# called "again", which no secret-looking word matched, so the new admin
+# password went into the journal in full - and the journal is on the panel's
+# own Logs page.
+check("every box on the change-password form is masked",
+      admin.describe({"password": ["hunter2"], "password_again": ["hunter2"]})
+      == " password=*** password_again=***")
+check("and so is anything else that carries a code or a confirmation",
+      "s3cret" not in admin.describe(
+          {"again": ["s3cret"], "confirm": ["s3cret"], "code": ["s3cret"],
+           "pin": ["s3cret"]}))
+form = admin.Admin.settings
+check("the form itself sends the name the masking knows",
+      "password_again" in open(
+          os.path.join(HERE, "..", "templates", "smartdns-admin"),
+          encoding="utf-8").read() and form is not None)
 
 at = mark()
 status, _, _ = request(aport, "GET", "/wp-login.php")

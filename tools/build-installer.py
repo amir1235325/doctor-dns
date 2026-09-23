@@ -73,6 +73,7 @@ PAYLOADS = [
     ("FONT_LICENSE", "common/fonts/OFL.txt"),
     ("DOMAINS", "domains/domains.txt"),
     ("SERVICES", "domains/services.json"),
+    ("GAMES", "domains/games.json"),
 ]
 
 # Binary payloads, carried as base64 and decoded by the installer.

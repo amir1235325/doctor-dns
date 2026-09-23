@@ -190,20 +190,25 @@ def conf_value(key):
 
 print("the admin's password is asked for twice")
 r = Rec()
-r.action("password", {"password": ["a-good-password"], "again": ["a-typo"]})
+r.action("password", {"password": ["a-good-password"], "password_again": ["a-typo"]})
 check("a mismatch is refused", "m=!" in where(r), where(r))
 check("nothing was written", conf_value("ADMIN_HASH") == "deadbeef")
 
 r = Rec()
-r.action("password", {"password": ["short"], "again": ["short"]})
+r.action("password", {"password": ["short"], "password_again": ["short"]})
 check("a short one is refused", "m=!" in where(r), where(r))
 
 r = Rec()
-r.action("password", {"password": ["a-good-password"], "again": ["a-good-password"]})
+r.action("password", {"password": ["a-good-password"], "password_again": ["a-good-password"]})
 check("matching and long enough is accepted", "m=!" not in where(r), where(r))
 check("the hash changed", conf_value("ADMIN_HASH") != "deadbeef")
 check("the password is not in the file",
       "a-good-password" not in open(conf, encoding="utf-8").read())
+# Both boxes carry the new password, so both have to be masked before the
+# journal - and the panel's own Logs page - sees them.
+check("neither box reaches the journal",
+      "a-good-password" not in admin.describe(
+          {"password": ["a-good-password"], "password_again": ["a-good-password"]}))
 
 print("moving the panel's port")
 for bad, why in [("443", "https"), ("53", "dns"), ("8443", "the sync API"),

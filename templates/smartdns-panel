@@ -673,6 +673,7 @@ def inspect_backup(path):
 # or exclude them like any brand. Its domain list lives in the database rather
 # than the catalogue file, so it is filled in at use rather than shipped.
 CUSTOM_SERVICE = {"key": "custom", "label": "دامنه‌های دلخواه شما",
+                  "section": "other",
                   "groups": [{"key": "main", "label": "همه", "domains": []}]}
 
 
@@ -693,6 +694,95 @@ def load_catalogue():
 
 def io_open(path):
     return open(path, encoding="utf-8")
+
+
+def follow_catalogue_split(store, catalogue):
+    """Keep templates pointing at groups after a group is split in two.
+
+    A template names the groups it routes, by key. When an upgrade breaks one
+    group into several - "every shooter" into a group per game - the old key
+    stops existing, and a template that named it would quietly route nothing
+    of that service at all. The admin ticked "shooters" and would find their
+    customers without the games.
+
+    So a row naming a group this catalogue no longer has is replaced by every
+    group the service has now, except the ones that are off until asked for.
+    That keeps the promise the tick made - everything under that heading -
+    and leaves the admin free to untick what they do not want. A row whose
+    whole service is gone is left alone: nothing here can guess where it went,
+    and routed_for ignores what it cannot find.
+    """
+    groups = {}
+    for svc in catalogue:
+        groups[svc["key"]] = [g for g in svc["groups"]]
+    moved = 0
+    for row in store.q("SELECT DISTINCT service_key, group_key FROM template_services"):
+        have = groups.get(row["service_key"])
+        if have is None or any(g["key"] == row["group_key"] for g in have):
+            continue
+        fresh = [g["key"] for g in have if not g.get("opt_in") and not g.get("locked")]
+        if not fresh:
+            continue
+        for tid in [r["template_id"] for r in store.q(
+                "SELECT template_id FROM template_services"
+                " WHERE service_key = ? AND group_key = ?",
+                (row["service_key"], row["group_key"]))]:
+            for key in fresh:
+                store.run(
+                    "INSERT OR IGNORE INTO template_services"
+                    " (template_id, service_key, group_key) VALUES (?, ?, ?)",
+                    (tid, row["service_key"], key))
+            store.run(
+                "DELETE FROM template_services"
+                " WHERE template_id = ? AND service_key = ? AND group_key = ?",
+                (tid, row["service_key"], row["group_key"]))
+            moved += 1
+        log(INFO, "template group %s/%s became %s"
+            % (row["service_key"], row["group_key"], ", ".join(fresh)))
+    return moved
+
+
+def games_in_template(store, template_id):
+    """The games a template covers, by name.
+
+    A game counts as covered only when every group it needs is routed: half
+    of Valorant is not Valorant, and a customer told they have it would find
+    the client unable to sign in.
+    """
+    if not GAMES:
+        return []
+    row = store.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
+    if row and row["is_default"]:
+        # The default routes everything the catalogue has, except what is off
+        # until somebody asks for it.
+        have = {(svc["key"], grp["key"]) for svc in CATALOGUE for grp in svc["groups"]
+                if not grp.get("opt_in") and not grp.get("locked")}
+    else:
+        have = store.template_groups(template_id)
+    out = []
+    for game in GAMES:
+        need = {tuple(ref.split("/", 1)) for ref in game["needs"]}
+        if need and need <= have:
+            out.append(game["name"])
+    return out
+
+
+GAMES_FILE = "/usr/local/share/smart-dns/games.json"
+
+
+def load_games():
+    """The game index - names, and the groups each game needs.
+
+    Read here as well as in the admin panel because the bot API answers with
+    it: a customer asking what a plan contains wants "Valorant, Fortnite",
+    not "riot/main, epic/main".
+    """
+    try:
+        with io_open(GAMES_FILE) as fh:
+            return json.load(fh).get("games", [])
+    except Exception as e:
+        log(WARN, "no game index at %s: %s" % (GAMES_FILE, e))
+        return []
 
 
 def load_config():
@@ -892,20 +982,32 @@ class Store:
 
     def plans_for_sale(self):
         """The plans a customer may buy, grouped the way they are shown: by
-        template, then cheapest first."""
-        return [dict(r) for r in self.q(
+        template, then cheapest first.
+
+        Each one carries the names of the games it covers. A customer asked to
+        choose between "کامل" and "بازی" cannot tell what either one is; a
+        list of games can be read.
+        """
+        rows = [dict(r) for r in self.q(
             "SELECT p.id, p.name, p.days, p.quota_bytes, p.price, p.speed_kbps,"
-            " p.note, t.name AS template FROM plans p"
+            " p.note, p.template_id, t.name AS template FROM plans p"
             " JOIN templates t ON t.id = p.template_id"
             " WHERE p.active = 1 AND p.is_trial = 0 ORDER BY t.id, p.price, p.id")]
+        for row in rows:
+            row["games"] = games_in_template(self, row.pop("template_id"))
+        return rows
 
     def trial_plan(self):
         """The free trial on offer, if the operator made one."""
         row = self.one("SELECT p.id, p.name, p.days, p.quota_bytes, p.speed_kbps, p.note,"
-                       " t.name AS template FROM plans p JOIN templates t"
+                       " p.template_id, t.name AS template FROM plans p JOIN templates t"
                        " ON t.id = p.template_id WHERE p.active = 1 AND p.is_trial = 1"
                        " ORDER BY p.id LIMIT 1")
-        return dict(row) if row else None
+        if not row:
+            return None
+        plan = dict(row)
+        plan["games"] = games_in_template(self, plan.pop("template_id"))
+        return plan
 
     def user_ips(self, user_id):
         return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
@@ -3728,6 +3830,7 @@ def watch_self(store):
 
 
 CATALOGUE = []
+GAMES = []
 # A one-element list so the API thread sees updates without a global statement.
 DEFAULT_TEMPLATE = [0]
 
@@ -3738,6 +3841,8 @@ def main():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     store = Store(DB)
     CATALOGUE = load_catalogue() + [CUSTOM_SERVICE]
+    GAMES[:] = load_games()
+    follow_catalogue_split(store, CATALOGUE)
     DEFAULT_TEMPLATE[0] = store.ensure_default_template(CATALOGUE)["id"]
     print("catalogue: %d services, default template #%d"
           % (len(CATALOGUE), DEFAULT_TEMPLATE[0]), flush=True)

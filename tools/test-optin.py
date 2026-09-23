@@ -53,8 +53,8 @@ print("the catalogue that ships")
 cat = json.load(open(os.path.join(HERE, "..", "domains", "services.json"),
                      encoding="utf-8"))["services"]
 epic = next(s for s in cat if s["key"] == "epic")
-check("Epic itself is only the store now",
-      [g["key"] for g in epic["groups"]] == ["main"],
+check("Epic itself is the store and its downloads, not the game backend",
+      [g["key"] for g in epic["groups"]] == ["main", "download"],
       str([g["key"] for g in epic["groups"]]))
 
 # One home for everything the installer deliberately keeps out of the hijack.
@@ -62,15 +62,16 @@ check("Epic itself is only the store now",
 # the other six were in bypass.conf and nowhere an operator could see them.
 byp = next(s for s in cat if s["key"] == "bypass")
 groups = {g["key"]: g for g in byp["groups"]}
-check("the bypass category has the four groups",
-      set(groups) == {"ea", "playstation", "epic", "azure"}, str(set(groups)))
+check("the bypass category has a group per thing kept out of the hijack",
+      set(groups) == {"ea", "playstation", "epic", "azure", "voice", "steam"},
+      str(set(groups)))
 check("every one of them is opt-in",
       all(g.get("opt_in") is True for g in byp["groups"]))
 check("and every one says why, in its own words",
       all(g.get("note") for g in byp["groups"]),
       str([g["key"] for g in byp["groups"] if not g.get("note")]))
 check("the notes are not all the same sentence",
-      len({g["note"] for g in byp["groups"]}) == 4)
+      len({g["note"] for g in byp["groups"]}) == len(byp["groups"]))
 
 bypass_conf = open(os.path.join(HERE, "..", "common", "bypass.conf"),
                    encoding="utf-8").read()

@@ -180,7 +180,10 @@ for name in ("templates", "template_editor", "template_list"):
 html_out = Page().templates()
 check("the editor renders", "<details" in html_out, html_out[:200])
 check("it lists the domains", "spotifycdn.com" in html_out)
-check("the drawer with an exception is open", "<details class='svc' open>" in html_out)
+check("the drawer with an exception is open",
+      "<details class='svc' open data-name=" in html_out)
+check("a row carries what a search matches on",
+      "data-name='" in html_out and "spotifycdn.com" in html_out)
 list_out = Page.template_list(Page())
 check("the list renders", "قالب تازه" in list_out, list_out[:200])
 check("the list links to the editor", "templates?t=%d" % tid2 in list_out)

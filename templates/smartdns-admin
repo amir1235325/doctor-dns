@@ -47,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 CONFIG = "/etc/smart-dns/admin.env"
 DB = "/var/lib/smart-dns/panel.db"
 SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
+GAMES_FILE = "/usr/local/share/smart-dns/games.json"
 # Put there by the installer and served from here - see above about CDNs. The
 # version goes in the font's address, so a browser's kept copy is never stale.
 FONT_FILE = "/usr/local/share/smart-dns/Vazirmatn.woff2"
@@ -391,6 +392,30 @@ PENDING = {}
 
 
 CATALOGUE = []
+GAMES = []
+SECTIONS = []
+
+
+def load_games():
+    """The game index the installer ships beside the catalogue.
+
+    Names only: every entry points at groups that already exist, so this file
+    can never route anything the catalogue does not have.
+    """
+    try:
+        with open(GAMES_FILE, encoding="utf-8") as fh:
+            return json.load(fh).get("games", [])
+    except Exception:
+        return []
+
+
+def load_sections():
+    """The headings the services are drawn under, in the order given."""
+    try:
+        with open(SERVICES_FILE, encoding="utf-8") as fh:
+            return json.load(fh).get("sections", [])
+    except Exception:
+        return []
 
 
 def load_catalogue():
@@ -400,6 +425,7 @@ def load_catalogue():
     except Exception:
         services = []
     services.append({"key": "custom", "label": "دامنه‌های دلخواه شما",
+                     "section": "other",
                      "groups": [{"key": "main", "label": "همه", "domains": []}]})
     return services
 
@@ -541,6 +567,23 @@ details.svc>summary label{flex:1}
 .pick button{padding:3px 10px;font-size:11px;font-weight:400;
  background:transparent;border:1px solid var(--line2);color:var(--muted)}
 .pick button:hover{background:var(--row)}
+.gtools{display:flex;gap:8px;align-items:center;margin:0 0 14px}
+.gtools button{padding:7px 14px;font-size:12px;font-weight:400;background:transparent;
+ border:1px solid var(--line2);color:var(--muted)}
+.gtools button:hover{background:var(--row)}
+.gtools{display:flex;gap:8px;align-items:center;margin:0 0 14px}
+.gsearch{flex:1;max-width:340px;margin:0}
+.gtools button{padding:7px 14px;font-size:12px;font-weight:400;background:transparent;
+ border:1px solid var(--line2);color:var(--muted)}
+.gtools button:hover{background:var(--row)}
+/* The row is named after the games in it; the group it really is goes
+   underneath, quietly, for whoever needs to know. */
+.under{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:2px}
+.alsoneed{margin:0;padding:8px 30px 10px;font-size:11px;color:var(--warn);
+ border-top:1px solid var(--row)}
+h3.sec{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em;
+ margin:24px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--row)}
+h3.sec:first-of-type{margin-top:6px}
 .brand{text-align:center;margin:4px 0 26px;direction:ltr;line-height:1.15}
 .brand .mark{font-size:clamp(28px,6vw,38px);vertical-align:middle;margin-right:10px}
 .brand .name{display:inline-block;vertical-align:middle;font-size:clamp(34px,8vw,50px);
@@ -1182,7 +1225,13 @@ def log_access(h, prefix, code, path, who=""):
 
 
 # Form fields never written to the journal, whatever the action.
-SECRET_FIELDS = re.compile(r"pass|token|secret|session|salt|hash", re.I)
+# Anything that could be a secret, by the name of its field. The confirmation
+# box on the change-password form used to be called "again", which none of
+# these matched - so a new admin password went into the journal in full, and
+# from there onto the panel's own Logs page. The field is called
+# password_again now; the words below are the second lock on that door.
+SECRET_FIELDS = re.compile(
+    r"pass|token|secret|session|salt|hash|again|confirm|code|pin", re.I)
 
 
 def describe(params):
@@ -1300,6 +1349,127 @@ class TLSServer(http.server.ThreadingHTTPServer):
 
 STORE = None
 CFG = {}
+
+
+def ordered_rows(out):
+    """Every row of the editor, under its heading, in the order given.
+
+    A row is one group. Which heading it falls under is the group's own
+    section where it names one - the downloads do - and otherwise its
+    service's. That is what lets a store's gigabytes sit together under
+    "downloads" while the store itself stays with the games.
+    """
+    order = [sec["key"] for sec in SECTIONS]
+    label = {sec["key"]: sec["label"] for sec in SECTIONS}
+    rows = []
+    for svc in catalogue_now():
+        for grp in svc["groups"]:
+            # A locked group is not a choice: it is bypassed for every
+            # template, so it is not drawn where it could be ticked.
+            if grp.get("locked"):
+                continue
+            where = grp.get("section") or svc.get("section") or ""
+            rank = order.index(where) if where in order else len(order)
+            rows.append((rank, svc, grp))
+    seen = set()
+    for rank, svc, grp in sorted(rows, key=lambda r: r[0]):
+        if rank not in seen:
+            seen.add(rank)
+            if rank < len(order) and label.get(order[rank]):
+                out.append("<h3 class='sec'>%s</h3>" % html.escape(label[order[rank]]))
+        yield svc, grp
+
+
+def games_by_group():
+    """Which games each group carries, in the order the index lists them.
+
+    A group is what routes; a game is what the operator is selling. Most of
+    the time one group is one game, and then the row can simply say so. Where
+    a publisher's own zone carries five games - Riot's does - the row says all
+    five, because there is no routing that has one of them without the others.
+    """
+    out = {}
+    for game in GAMES:
+        # A game names the rows of its own publisher only. Apex needs Steam,
+        # but Steam's row is Steam's own domains - the store, the community,
+        # the login - and naming it after fifty-nine games that pass through
+        # it said nothing about what is in it. What Apex also needs is said on
+        # Apex's row instead, where it belongs.
+        home = game["needs"][0].split("/")[0]
+        for ref in game["needs"]:
+            if ref.split("/")[0] == home:
+                out.setdefault(ref, []).append(game)
+    return out
+
+
+def group_title(svc, grp, games, most=6):
+    """What the row is called: the games in it, or the group's own label."""
+    # A row that is off by default is not about selling a game. The anti-cheat
+    # group holds EAC, BattlEye and Demonware as well as Tarkov's own servers,
+    # and calling the row "Escape from Tarkov" would say the other three are
+    # not in there.
+    if not games or grp.get("opt_in"):
+        if svc["key"] == "bypass":
+            # Its heading already says these are never routed; repeating it in
+            # front of every row leaves less room for what the row is.
+            return grp["label"], ""
+        return (svc["label"] if len(svc["groups"]) == 1
+                else "%s — %s" % (svc["label"], grp["label"])), ""
+    # The Latin spelling, because that is how a game writes its own name and
+    # how an operator will search for it. The Persian one is still in the
+    # index, and is what the customer's panel and the bot say.
+    names = [g["en"] for g in games]
+    # "and 1 more" is longer than the name it is hiding, so the last one is
+    # never counted - it is said.
+    shown = names if len(names) <= most + 1 else names[:most]
+    rest = len(names) - len(shown)
+    head = "، ".join(shown) + (" و %d بازی دیگر" % rest if rest else "")
+    return head, grp["label"]
+
+
+def also_needed(games, ref, catalogue, most=6):
+    """The other groups the games in this row need to work.
+
+    Helldivers is its own name, Steam, and PlayStation's network for the
+    sign-in. A row that only showed its own two domains would let an operator
+    tick it and wonder why the game still does not start.
+
+    Each one is named the way its own row is - by its games where it has
+    them - so what is written here can be found in the list above.
+    """
+    carried = games_by_group()
+    label = {}
+    for svc in catalogue:
+        for grp in svc["groups"]:
+            key = "%s/%s" % (svc["key"], grp["key"])
+            mine = carried.get(key, [])
+            if mine:
+                # A store is named after itself, not after three of the fifty
+                # games that go through it.
+                # The store that owns this zone, not every store that uses
+                # it: FACEIT needs Steam, but Steam's row is Steam's.
+                shop = [g["en"] for g in mine
+                        if g.get("kind") == "platform"
+                        and all(ref.split("/")[0] == svc["key"]
+                                for ref in g["needs"])]
+                names = shop or [g["en"] for g in mine[:3]]
+                label[key] = "، ".join(names) + (
+                    "…" if not shop and len(mine) > 3 else "")
+                # Only a facet is worth naming after the games: "(download)"
+                # says something, "(all)" does not.
+                if grp["key"] in ("download", "backend"):
+                    label[key] += " (%s)" % grp["label"]
+            else:
+                label[key] = (svc["label"] if len(svc["groups"]) == 1
+                              else "%s (%s)" % (svc["label"], grp["label"]))
+    out = []
+    for game in games:
+        for other in game["needs"]:
+            if other != ref and label.get(other) and label[other] not in out:
+                out.append(label[other])
+    if len(out) > most + 1:
+        out = out[:most] + ["و %d مورد دیگر" % (len(out) - most)]
+    return out
 
 
 class Admin(http.server.BaseHTTPRequestHandler):
@@ -2450,62 +2620,84 @@ class Admin(http.server.BaseHTTPRequestHandler):
         off = STORE.template_domains_off(t["id"])
         out = [back,
                "<div class='card'><h2>%s</h2>" % html.escape(t["name"]),
-               "<p class='muted'>تیک سرویس یعنی همهٔ دامنه‌هایش از رله می‌رود — "
-               "از جمله دامنه‌هایی که بعداً به آن اضافه شوند. کشو را باز کنید تا "
-               "بین دامنه‌ها یکی‌یکی انتخاب کنید.</p>",
                "<form method='post' action='/%s/template-save'>"
-               "<input type='hidden' name='id' value='%d'>" % (p, t["id"])]
+               "<input type='hidden' name='id' value='%d'>" % (p, t["id"]),
+               "<p class='muted'>هر ردیف یک تیک دارد: زدنش یعنی همهٔ دامنه‌های آن "
+               "از رله می‌رود، از جمله دامنه‌هایی که بعداً اضافه شوند. کشو را باز "
+               "کنید تا خود دامنه‌ها را ببینید و یکی‌یکی انتخاب کنید.</p>",
+               "<div class='row gtools'>"
+               "<input class='gsearch' type='search' autocomplete='off' "
+               "placeholder='جستجوی بازی یا دامنه…'>"
+               "<button type='button' data-all-rows='1'>همه</button>"
+               "<button type='button' data-all-rows='0'>هیچ‌کدام</button></div>"]
 
-        for svc in catalogue_now():
-            for g in svc["groups"]:
-                # A locked group is not a choice: it is bypassed for every
-                # template, so it is not drawn where it could be ticked.
-                if g.get("locked"):
-                    continue
-                key = "%s.%s" % (svc["key"], g["key"])
-                on = (svc["key"], g["key"]) in groups
-                label = (svc["label"] if len(svc["groups"]) == 1
-                         else "%s — %s" % (svc["label"], g["label"]))
-                # An opt-in group is one where routing is the wrong default,
-                # not a matter of taste. Say why, next to the tick, rather
-                # than letting it look like every other box on the page.
-                if g.get("opt_in"):
-                    # The reason comes from the group, not from here. These
-                    # are switched off for four different reasons and only one
-                    # of them is matchmaking - a warning that says the same
-                    # thing about all of them is wrong about three.
-                    label += ("<span class='optin'>پیش‌فرض خاموش — %s</span>"
-                              % html.escape(g.get("note") or
-                                            "روشن کردنش چیزی را می‌شکند"))
-                kept = [d for d in g["domains"] if d not in off]
-                # Open the drawer when the operator has already been in here
-                # picking domains, so their exceptions are visible rather than
-                # hidden behind a summary that looks like every other one.
-                partial = on and len(kept) != len(g["domains"])
-                out.append(
-                    "<details class='svc'%s><summary>"
-                    "<label><input type='checkbox' name='g' value='%s'%s> %s</label>"
-                    "<span class='muted count'>%d از %d دامنه</span>"
-                    "<span class='pick'><button type='button' data-all='1'>همه</button>"
-                    "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
-                    "</summary>"
-                    % (" open" if partial else "", html.escape(key),
-                       " checked" if on else "", label,
-                       len(kept) if on else 0, len(g["domains"])))
-                if not g["domains"]:
-                    out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
-                out.append("<div class='doms'>")
-                for d in sorted(g["domains"]):
-                    # A tick on this page means "routed". Inside a group that
-                    # is switched off nothing is routed, so nothing there is
-                    # ticked - otherwise the drawer contradicts the summary
-                    # beside it, which already says 0 of however many.
-                    out.append("<label><input type='checkbox' name='d' value='%s'%s>"
-                               "<span>%s</span></label>"
-                               % (html.escape(d),
-                                  " checked" if on and d not in off else "",
-                                  html.escape(d)))
-                out.append("</div></details>")
+        in_group = games_by_group()
+        for svc, g in ordered_rows(out):
+            key = "%s.%s" % (svc["key"], g["key"])
+            ref = "%s/%s" % (svc["key"], g["key"])
+            on = (svc["key"], g["key"]) in groups
+            here = in_group.get(ref, [])
+            label, under = group_title(svc, g, here)
+            label = html.escape(label)
+            if under:
+                label += "<span class='under'>%s</span>" % html.escape(under)
+            # An opt-in group is one where routing is the wrong default,
+            # not a matter of taste. Say why, next to the tick, rather
+            # than letting it look like every other box on the page.
+            if g.get("opt_in"):
+                # The reason comes from the group, not from here. These
+                # are switched off for four different reasons and only one
+                # of them is matchmaking - a warning that says the same
+                # thing about all of them is wrong about three.
+                label += ("<span class='optin'>پیش‌فرض خاموش — %s</span>"
+                          % html.escape(g.get("note") or
+                                        "روشن کردنش چیزی را می‌شکند"))
+            kept = [d for d in g["domains"] if d not in off]
+            # Open the drawer when the operator has already been in here
+            # picking domains, so their exceptions are visible rather than
+            # hidden behind a summary that looks like every other one.
+            partial = on and len(kept) != len(g["domains"])
+            # What a search matches on: the game names in both languages,
+            # the group's own label, and every domain in it - so looking
+            # for "terraria.org" finds the row it lives in.
+            terms = " ".join(
+                [svc["label"], g["label"]]
+                + [x["name"] + " " + x["en"] for x in here]
+                + g["domains"]).lower()
+            out.append(
+                "<details class='svc'%s%s data-name='%s'><summary>"
+                "<label><input type='checkbox' name='g' value='%s'%s> %s</label>"
+                "<span class='muted count'>%d از %d دامنه</span>"
+                "<span class='pick'><button type='button' data-all='1'>همه</button>"
+                "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
+                "</summary>"
+                % (" open" if partial else "",
+                   " data-optin='1'" if g.get("opt_in") else "",
+                   html.escape(terms),
+                   html.escape(key), " checked" if on else "", label,
+                   len(kept) if on else 0, len(g["domains"])))
+            # Only where it helps. On Steam's own row this would be the
+            # other half of what fifty-nine games need - EA's zone, Riot's,
+            # Rockstar's - which is every one of their rows repeated here.
+            # Each of those rows says it for itself.
+            needs = also_needed(here, ref, catalogue_now()) if len(here) <= 6 else []
+            if needs:
+                out.append("<p class='alsoneed'>برای کار کردن، این‌ها هم باید "
+                           "روشن باشند: %s</p>" % html.escape("، ".join(needs)))
+            if not g["domains"]:
+                out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
+            out.append("<div class='doms'>")
+            for d in sorted(g["domains"]):
+                # A tick on this page means "routed". Inside a group that
+                # is switched off nothing is routed, so nothing there is
+                # ticked - otherwise the drawer contradicts the summary
+                # beside it, which already says 0 of however many.
+                out.append("<label><input type='checkbox' name='d' value='%s'%s>"
+                           "<span>%s</span></label>"
+                           % (html.escape(d),
+                              " checked" if on and d not in off else "",
+                              html.escape(d)))
+            out.append("</div></details>")
 
         out.append("<div style='margin-top:16px'><button>ذخیره</button> "
                    "<button class='danger' formaction='/%s/template-delete' "
@@ -2557,6 +2749,49 @@ class Admin(http.server.BaseHTTPRequestHandler):
       if (e.target.checked) d2.querySelector('summary input[name=g]').checked = true;
       count(d2);
     }
+  });
+
+  // ---- finding a row, and the two mass buttons ----------------------
+  // A hundred and thirty rows is too many to scroll. The box matches on the
+  // game names, the group's label and every domain in it, so both "والورانت"
+  // and "riotgames.com" land on the same row.
+  var rows = [].slice.call(document.querySelectorAll('details.svc'));
+
+  var search = document.querySelector('.gsearch');
+  if (search) {
+    search.addEventListener('input', function () {
+      var q = this.value.trim().toLowerCase();
+      rows.forEach(function (d) {
+        d.style.display = !q || d.dataset.name.indexOf(q) >= 0 ? '' : 'none';
+      });
+      // A heading with nothing under it is noise while a search is on.
+      document.querySelectorAll('h3.sec').forEach(function (h) {
+        var any = false, n = h.nextElementSibling;
+        while (n && n.tagName !== 'H3') {
+          if (n.matches('details.svc') && n.style.display !== 'none') any = true;
+          n = n.nextElementSibling;
+        }
+        h.style.display = any || !q ? '' : 'none';
+      });
+    });
+  }
+
+  document.addEventListener('click', function (e) {
+    var mass = e.target.closest('.gtools button');
+    if (!mass) return;
+    // Only what the search is showing, so "tick all" after a search means
+    // what it says rather than everything in the catalogue.
+    var on = mass.dataset.allRows === '1';
+    rows.forEach(function (d) {
+      if (d.style.display === 'none') return;
+      // "All" never turns on a group that is off by default. Those are off
+      // because routing them breaks something, and a button pressed over a
+      // list is not the deliberate choice that switching one on should be.
+      if (on && d.dataset.optin === '1') return;
+      d.querySelector('summary input[name=g]').checked = on;
+      d.querySelectorAll('.doms input').forEach(function (i) { i.checked = on; });
+      count(d);
+    });
   });
 })();
 </script>""")
@@ -2650,7 +2885,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    "<input type='password' name='password' style='width:100%%'>"
                    "</div>"
                    "<div class='f'><label>تکرار رمز تازه</label>"
-                   "<input type='password' name='again' style='width:100%%'>"
+                   "<input type='password' name='password_again' style='width:100%%'>"
                    "</div><button>تغییر رمز</button></form>"
                    "<p class='muted'>رمز ذخیره نمی‌شود، فقط هشش. با تغییر آن "
                    "همهٔ نشست‌های دیگر بسته می‌شوند.</p></div>" % p)
@@ -3403,7 +3638,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             new = one("password")
             # Asked twice, because it cannot be read back to check afterwards
             # and a typo here locks the operator out of their own panel.
-            if new != one("again"):
+            if new != one("password_again"):
                 return self.redirect("settings?m=!دو رمز یکی نیستند")
             if len(new) < 8:
                 return self.redirect("settings?m=!رمز باید حداقل ۸ نویسه باشد")
@@ -3466,6 +3701,8 @@ def main():
     global STORE, CFG, CATALOGUE
     CFG = load_config()
     CATALOGUE = load_catalogue()
+    GAMES[:] = load_games()
+    SECTIONS[:] = load_sections()
     STORE = Store(DB)
 
     port = int(CFG["ADMIN_PORT"])

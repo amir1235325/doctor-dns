@@ -419,6 +419,24 @@ class Bot:
         self.say(chat, "پلن را انتخاب کنید:" + ("\n\n" + notes if notes else ""),
                  {"inline_keyboard": rows})
 
+    def plan_games(self, plan, most=12):
+        """The games a plan covers, as the customer reads them.
+
+        The panel sends the names; a long list is cut off here, because a
+        message that scrolls past the price is not an answer to "what is in
+        it". The count that follows says the rest is still there.
+        """
+        games = plan.get("games") or []
+        if not games:
+            return ""
+        # One more name is shorter than saying there is one more.
+        shown = games if len(games) <= most + 1 else games[:most]
+        rest = len(games) - len(shown)
+        line = "، ".join(shown)
+        if rest > 0:
+            line += " و %d بازی دیگر" % rest
+        return "\n\n🎮 شامل: " + line
+
     def chose_plan(self, chat, sender, plan_id):
         sale = self.panel.call("GET", "/plans")
         plans = {p["id"]: p for p in sale["plans"]}
@@ -436,8 +454,9 @@ class Bot:
         elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
             warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
         self.state[chat] = ("receipt", plan_id)
-        self.say(chat, "پلن «%s» — %s تومان%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
-                 "بفرستید." % (plan["name"], format(plan["price"], ","), warn,
+        self.say(chat, "پلن «%s» — %s تومان%s%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+                 "بفرستید." % (plan["name"], format(plan["price"], ","),
+                               self.plan_games(plan), warn,
                                pay or "برای روش پرداخت با پشتیبانی تماس بگیرید."),
                  CANCEL)
 

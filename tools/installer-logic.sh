@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.2"
+VERSION="0.6.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -1515,6 +1515,10 @@ EOF
     mkdir -p /usr/local/share/smart-dns
     note_file /usr/local/share/smart-dns/services.json
     payload SERVICES > /usr/local/share/smart-dns/services.json
+    # The game index: which groups each game needs. Only names and
+    # references - nothing here routes anything on its own.
+    note_file /usr/local/share/smart-dns/games.json
+    payload GAMES > /usr/local/share/smart-dns/games.json
     # Only the relays reach the sync API. The panel's service runs this before
     # every start, so a relay added to RELAY_IP by hand is let in the next time
     # the panel restarts - exactly when the panel itself would let it in.

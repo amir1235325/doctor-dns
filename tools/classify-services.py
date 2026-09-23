@@ -27,6 +27,11 @@ Domains belonging to no recognisable brand fall into catch-all services at the
 end, so nothing is lost and the total always reconciles.
 
 Writes domains/services.json, stable across runs so it diffs cleanly.
+
+Careful: domains/services.json has been edited by hand since - the game
+brands added from testing, their notes, and the opt-in backend group are not
+reproduced by the patterns below. Treat this as the tool that built the first
+catalogue, not as the one that owns it: running it now would drop that work.
 """
 import io
 import json

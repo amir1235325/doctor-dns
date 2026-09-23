@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.2"
+VERSION="0.6.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -1515,6 +1515,10 @@ EOF
     mkdir -p /usr/local/share/smart-dns
     note_file /usr/local/share/smart-dns/services.json
     payload SERVICES > /usr/local/share/smart-dns/services.json
+    # The game index: which groups each game needs. Only names and
+    # references - nothing here routes anything on its own.
+    note_file /usr/local/share/smart-dns/games.json
+    payload GAMES > /usr/local/share/smart-dns/games.json
     # Only the relays reach the sync API. The panel's service runs this before
     # every start, so a relay added to RELAY_IP by hand is let in the next time
     # the panel restarts - exactly when the panel itself would let it in.
@@ -2130,6 +2134,32 @@ exit 0
 #server=/edea.live.use1a.on.epicgames.com/9.9.9.9
 #server=/core.windows.net/1.1.1.1
 #server=/core.windows.net/9.9.9.9
+#
+## Voice, and two control channels, none of which the relay can carry.
+##
+##   discord.media   Discord voice and video: WebRTC over UDP, and the name the
+##                   client measures every voice region with - routed, every
+##                   region measures as the distance to the exit and it picks
+##                   the wrong continent.
+##   vivox.com       voice for Valorant, League of Legends and Rainbow Six: RTP
+##                   over UDP.
+##   steamserver.net Steam's connection managers, which is where a client signs
+##                   in. Asked for its own list, Steam answers with 83 bare
+##                   addresses on 27017 - no name at all, so nothing DNS does
+##                   reaches them - and 200 WebSocket managers under this zone,
+##                   on 27018 to 27024 and, for 19 of the 200, on 443. Routed,
+##                   the ones that are not on 443 resolve to the relay and find
+##                   nothing listening: the client waits, falls back to the
+##                   address list, and the operator hears "Steam Connection
+##                   Error" for a sign-in that does eventually work. The store,
+##                   the community and everything a person browses stay routed;
+##                   only the sign-in channel goes direct.
+#server=/discord.media/1.1.1.1
+#server=/discord.media/9.9.9.9
+#server=/vivox.com/1.1.1.1
+#server=/vivox.com/9.9.9.9
+#server=/steamserver.net/1.1.1.1
+#server=/steamserver.net/9.9.9.9
 #__END_BYPASS__
 
 #__BEGIN_NO_AAAA__
@@ -2165,6 +2195,13 @@ exit 0
 ## what worker_connections says - a PS5 game download opens far more than that in
 ## parallel and the surplus gets reset mid-transfer.
 #worker_rlimit_nofile 65535;
+#
+## Where errors go. Ubuntu builds nginx with --error-log-path=stderr, so without
+## this line every error is written to the journal and /var/log/nginx/error.log
+## stays empty except for one startup notice - which is the file the admin
+## panel's "nginx errors" card reads, and the first place to look when a
+## customer says a site will not open.
+#error_log /var/log/nginx/error.log warn;
 #load_module /usr/lib/nginx/modules/ngx_stream_module.so;
 #
 #events {
@@ -2308,6 +2345,13 @@ exit 0
 ## what worker_connections says - a PS5 game download opens far more than that in
 ## parallel and the surplus gets reset mid-transfer.
 #worker_rlimit_nofile 65535;
+#
+## Where errors go. Ubuntu builds nginx with --error-log-path=stderr, so without
+## this line every error is written to the journal and /var/log/nginx/error.log
+## stays empty except for one startup notice - which is the file the admin
+## panel's "nginx errors" card reads, and the first place to look when a
+## customer says a site will not open.
+#error_log /var/log/nginx/error.log warn;
 #load_module __MODULE_PATH__;
 #
 #events {
@@ -3975,6 +4019,7 @@ exit 0
 ## or exclude them like any brand. Its domain list lives in the database rather
 ## than the catalogue file, so it is filled in at use rather than shipped.
 #CUSTOM_SERVICE = {"key": "custom", "label": "دامنه‌های دلخواه شما",
+#                  "section": "other",
 #                  "groups": [{"key": "main", "label": "همه", "domains": []}]}
 #
 #
@@ -3995,6 +4040,95 @@ exit 0
 #
 #def io_open(path):
 #    return open(path, encoding="utf-8")
+#
+#
+#def follow_catalogue_split(store, catalogue):
+#    """Keep templates pointing at groups after a group is split in two.
+#
+#    A template names the groups it routes, by key. When an upgrade breaks one
+#    group into several - "every shooter" into a group per game - the old key
+#    stops existing, and a template that named it would quietly route nothing
+#    of that service at all. The admin ticked "shooters" and would find their
+#    customers without the games.
+#
+#    So a row naming a group this catalogue no longer has is replaced by every
+#    group the service has now, except the ones that are off until asked for.
+#    That keeps the promise the tick made - everything under that heading -
+#    and leaves the admin free to untick what they do not want. A row whose
+#    whole service is gone is left alone: nothing here can guess where it went,
+#    and routed_for ignores what it cannot find.
+#    """
+#    groups = {}
+#    for svc in catalogue:
+#        groups[svc["key"]] = [g for g in svc["groups"]]
+#    moved = 0
+#    for row in store.q("SELECT DISTINCT service_key, group_key FROM template_services"):
+#        have = groups.get(row["service_key"])
+#        if have is None or any(g["key"] == row["group_key"] for g in have):
+#            continue
+#        fresh = [g["key"] for g in have if not g.get("opt_in") and not g.get("locked")]
+#        if not fresh:
+#            continue
+#        for tid in [r["template_id"] for r in store.q(
+#                "SELECT template_id FROM template_services"
+#                " WHERE service_key = ? AND group_key = ?",
+#                (row["service_key"], row["group_key"]))]:
+#            for key in fresh:
+#                store.run(
+#                    "INSERT OR IGNORE INTO template_services"
+#                    " (template_id, service_key, group_key) VALUES (?, ?, ?)",
+#                    (tid, row["service_key"], key))
+#            store.run(
+#                "DELETE FROM template_services"
+#                " WHERE template_id = ? AND service_key = ? AND group_key = ?",
+#                (tid, row["service_key"], row["group_key"]))
+#            moved += 1
+#        log(INFO, "template group %s/%s became %s"
+#            % (row["service_key"], row["group_key"], ", ".join(fresh)))
+#    return moved
+#
+#
+#def games_in_template(store, template_id):
+#    """The games a template covers, by name.
+#
+#    A game counts as covered only when every group it needs is routed: half
+#    of Valorant is not Valorant, and a customer told they have it would find
+#    the client unable to sign in.
+#    """
+#    if not GAMES:
+#        return []
+#    row = store.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
+#    if row and row["is_default"]:
+#        # The default routes everything the catalogue has, except what is off
+#        # until somebody asks for it.
+#        have = {(svc["key"], grp["key"]) for svc in CATALOGUE for grp in svc["groups"]
+#                if not grp.get("opt_in") and not grp.get("locked")}
+#    else:
+#        have = store.template_groups(template_id)
+#    out = []
+#    for game in GAMES:
+#        need = {tuple(ref.split("/", 1)) for ref in game["needs"]}
+#        if need and need <= have:
+#            out.append(game["name"])
+#    return out
+#
+#
+#GAMES_FILE = "/usr/local/share/smart-dns/games.json"
+#
+#
+#def load_games():
+#    """The game index - names, and the groups each game needs.
+#
+#    Read here as well as in the admin panel because the bot API answers with
+#    it: a customer asking what a plan contains wants "Valorant, Fortnite",
+#    not "riot/main, epic/main".
+#    """
+#    try:
+#        with io_open(GAMES_FILE) as fh:
+#            return json.load(fh).get("games", [])
+#    except Exception as e:
+#        log(WARN, "no game index at %s: %s" % (GAMES_FILE, e))
+#        return []
 #
 #
 #def load_config():
@@ -4194,20 +4328,32 @@ exit 0
 #
 #    def plans_for_sale(self):
 #        """The plans a customer may buy, grouped the way they are shown: by
-#        template, then cheapest first."""
-#        return [dict(r) for r in self.q(
+#        template, then cheapest first.
+#
+#        Each one carries the names of the games it covers. A customer asked to
+#        choose between "کامل" and "بازی" cannot tell what either one is; a
+#        list of games can be read.
+#        """
+#        rows = [dict(r) for r in self.q(
 #            "SELECT p.id, p.name, p.days, p.quota_bytes, p.price, p.speed_kbps,"
-#            " p.note, t.name AS template FROM plans p"
+#            " p.note, p.template_id, t.name AS template FROM plans p"
 #            " JOIN templates t ON t.id = p.template_id"
 #            " WHERE p.active = 1 AND p.is_trial = 0 ORDER BY t.id, p.price, p.id")]
+#        for row in rows:
+#            row["games"] = games_in_template(self, row.pop("template_id"))
+#        return rows
 #
 #    def trial_plan(self):
 #        """The free trial on offer, if the operator made one."""
 #        row = self.one("SELECT p.id, p.name, p.days, p.quota_bytes, p.speed_kbps, p.note,"
-#                       " t.name AS template FROM plans p JOIN templates t"
+#                       " p.template_id, t.name AS template FROM plans p JOIN templates t"
 #                       " ON t.id = p.template_id WHERE p.active = 1 AND p.is_trial = 1"
 #                       " ORDER BY p.id LIMIT 1")
-#        return dict(row) if row else None
+#        if not row:
+#            return None
+#        plan = dict(row)
+#        plan["games"] = games_in_template(self, plan.pop("template_id"))
+#        return plan
 #
 #    def user_ips(self, user_id):
 #        return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
@@ -7030,6 +7176,7 @@ exit 0
 #
 #
 #CATALOGUE = []
+#GAMES = []
 ## A one-element list so the API thread sees updates without a global statement.
 #DEFAULT_TEMPLATE = [0]
 #
@@ -7040,6 +7187,8 @@ exit 0
 #    os.makedirs(os.path.dirname(DB), exist_ok=True)
 #    store = Store(DB)
 #    CATALOGUE = load_catalogue() + [CUSTOM_SERVICE]
+#    GAMES[:] = load_games()
+#    follow_catalogue_split(store, CATALOGUE)
 #    DEFAULT_TEMPLATE[0] = store.ensure_default_template(CATALOGUE)["id"]
 #    print("catalogue: %d services, default template #%d"
 #          % (len(CATALOGUE), DEFAULT_TEMPLATE[0]), flush=True)
@@ -8228,6 +8377,7 @@ exit 0
 #label.plan input{width:auto;margin:5px 0 0;accent-color:var(--btn)}
 #label.plan .p{font-weight:600}
 #label.plan small{color:var(--muted)}
+#label.plan small.games{color:var(--dim);line-height:2}
 #.dns input[type=file]{width:100%;padding:10px;font-size:12px;
 # border:1px dashed var(--line2);background:transparent;margin-bottom:4px}
 #details.pw{margin-top:16px;border:1px solid var(--line);border-radius:12px;
@@ -8595,6 +8745,25 @@ exit 0
 #            % (" — <span class='ok'>%d جواب تازه</span>" % answered if answered else ""))
 #
 #
+#def plan_games(plan, most=14):
+#    """The games a plan covers, for the customer choosing between plans.
+#
+#    Cut off after a handful: the full list of a complete plan is a hundred
+#    names and would bury the price. The rest is said as a count, which is
+#    what somebody skimming needs - "and 90 more" tells them it is everything.
+#    """
+#    games = plan.get("games") or []
+#    if not games:
+#        return ""
+#    # One more name is shorter than saying there is one more.
+#    shown = [html.escape(g) for g in (games if len(games) <= most + 1
+#                                      else games[:most])]
+#    rest = len(games) - len(shown)
+#    if rest > 0:
+#        shown.append("و %d بازی دیگر" % rest)
+#    return "<br><small class='games'>%s</small>" % "، ".join(shown)
+#
+#
 #def plan_line(p):
 #    """One plan as the customer reads it: what they get and what it costs."""
 #    size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] \
@@ -8674,8 +8843,9 @@ exit 0
 #                % (p["id"], " checked" if mine else "", html.escape(p["name"]),
 #                   " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
 #                   html.escape(plan_line(p)),
-#                   "<br><small>%s</small>" % html.escape(p["note"])
-#                   if p.get("note") else ""))
+#                   plan_games(p) +
+#                   ("<br><small>%s</small>" % html.escape(p["note"])
+#                    if p.get("note") else "")))
 #        out.append("</div>")
 #        if held:
 #            out.append("<p class='note'>تمدید همان پلن، روزها و حجم را روی "
@@ -9770,6 +9940,7 @@ exit 0
 #CONFIG = "/etc/smart-dns/admin.env"
 #DB = "/var/lib/smart-dns/panel.db"
 #SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
+#GAMES_FILE = "/usr/local/share/smart-dns/games.json"
 ## Put there by the installer and served from here - see above about CDNs. The
 ## version goes in the font's address, so a browser's kept copy is never stale.
 #FONT_FILE = "/usr/local/share/smart-dns/Vazirmatn.woff2"
@@ -10114,6 +10285,30 @@ exit 0
 #
 #
 #CATALOGUE = []
+#GAMES = []
+#SECTIONS = []
+#
+#
+#def load_games():
+#    """The game index the installer ships beside the catalogue.
+#
+#    Names only: every entry points at groups that already exist, so this file
+#    can never route anything the catalogue does not have.
+#    """
+#    try:
+#        with open(GAMES_FILE, encoding="utf-8") as fh:
+#            return json.load(fh).get("games", [])
+#    except Exception:
+#        return []
+#
+#
+#def load_sections():
+#    """The headings the services are drawn under, in the order given."""
+#    try:
+#        with open(SERVICES_FILE, encoding="utf-8") as fh:
+#            return json.load(fh).get("sections", [])
+#    except Exception:
+#        return []
 #
 #
 #def load_catalogue():
@@ -10123,6 +10318,7 @@ exit 0
 #    except Exception:
 #        services = []
 #    services.append({"key": "custom", "label": "دامنه‌های دلخواه شما",
+#                     "section": "other",
 #                     "groups": [{"key": "main", "label": "همه", "domains": []}]})
 #    return services
 #
@@ -10264,6 +10460,23 @@ exit 0
 #.pick button{padding:3px 10px;font-size:11px;font-weight:400;
 # background:transparent;border:1px solid var(--line2);color:var(--muted)}
 #.pick button:hover{background:var(--row)}
+#.gtools{display:flex;gap:8px;align-items:center;margin:0 0 14px}
+#.gtools button{padding:7px 14px;font-size:12px;font-weight:400;background:transparent;
+# border:1px solid var(--line2);color:var(--muted)}
+#.gtools button:hover{background:var(--row)}
+#.gtools{display:flex;gap:8px;align-items:center;margin:0 0 14px}
+#.gsearch{flex:1;max-width:340px;margin:0}
+#.gtools button{padding:7px 14px;font-size:12px;font-weight:400;background:transparent;
+# border:1px solid var(--line2);color:var(--muted)}
+#.gtools button:hover{background:var(--row)}
+#/* The row is named after the games in it; the group it really is goes
+#   underneath, quietly, for whoever needs to know. */
+#.under{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:2px}
+#.alsoneed{margin:0;padding:8px 30px 10px;font-size:11px;color:var(--warn);
+# border-top:1px solid var(--row)}
+#h3.sec{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em;
+# margin:24px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--row)}
+#h3.sec:first-of-type{margin-top:6px}
 #.brand{text-align:center;margin:4px 0 26px;direction:ltr;line-height:1.15}
 #.brand .mark{font-size:clamp(28px,6vw,38px);vertical-align:middle;margin-right:10px}
 #.brand .name{display:inline-block;vertical-align:middle;font-size:clamp(34px,8vw,50px);
@@ -10905,7 +11118,13 @@ exit 0
 #
 #
 ## Form fields never written to the journal, whatever the action.
-#SECRET_FIELDS = re.compile(r"pass|token|secret|session|salt|hash", re.I)
+## Anything that could be a secret, by the name of its field. The confirmation
+## box on the change-password form used to be called "again", which none of
+## these matched - so a new admin password went into the journal in full, and
+## from there onto the panel's own Logs page. The field is called
+## password_again now; the words below are the second lock on that door.
+#SECRET_FIELDS = re.compile(
+#    r"pass|token|secret|session|salt|hash|again|confirm|code|pin", re.I)
 #
 #
 #def describe(params):
@@ -11023,6 +11242,127 @@ exit 0
 #
 #STORE = None
 #CFG = {}
+#
+#
+#def ordered_rows(out):
+#    """Every row of the editor, under its heading, in the order given.
+#
+#    A row is one group. Which heading it falls under is the group's own
+#    section where it names one - the downloads do - and otherwise its
+#    service's. That is what lets a store's gigabytes sit together under
+#    "downloads" while the store itself stays with the games.
+#    """
+#    order = [sec["key"] for sec in SECTIONS]
+#    label = {sec["key"]: sec["label"] for sec in SECTIONS}
+#    rows = []
+#    for svc in catalogue_now():
+#        for grp in svc["groups"]:
+#            # A locked group is not a choice: it is bypassed for every
+#            # template, so it is not drawn where it could be ticked.
+#            if grp.get("locked"):
+#                continue
+#            where = grp.get("section") or svc.get("section") or ""
+#            rank = order.index(where) if where in order else len(order)
+#            rows.append((rank, svc, grp))
+#    seen = set()
+#    for rank, svc, grp in sorted(rows, key=lambda r: r[0]):
+#        if rank not in seen:
+#            seen.add(rank)
+#            if rank < len(order) and label.get(order[rank]):
+#                out.append("<h3 class='sec'>%s</h3>" % html.escape(label[order[rank]]))
+#        yield svc, grp
+#
+#
+#def games_by_group():
+#    """Which games each group carries, in the order the index lists them.
+#
+#    A group is what routes; a game is what the operator is selling. Most of
+#    the time one group is one game, and then the row can simply say so. Where
+#    a publisher's own zone carries five games - Riot's does - the row says all
+#    five, because there is no routing that has one of them without the others.
+#    """
+#    out = {}
+#    for game in GAMES:
+#        # A game names the rows of its own publisher only. Apex needs Steam,
+#        # but Steam's row is Steam's own domains - the store, the community,
+#        # the login - and naming it after fifty-nine games that pass through
+#        # it said nothing about what is in it. What Apex also needs is said on
+#        # Apex's row instead, where it belongs.
+#        home = game["needs"][0].split("/")[0]
+#        for ref in game["needs"]:
+#            if ref.split("/")[0] == home:
+#                out.setdefault(ref, []).append(game)
+#    return out
+#
+#
+#def group_title(svc, grp, games, most=6):
+#    """What the row is called: the games in it, or the group's own label."""
+#    # A row that is off by default is not about selling a game. The anti-cheat
+#    # group holds EAC, BattlEye and Demonware as well as Tarkov's own servers,
+#    # and calling the row "Escape from Tarkov" would say the other three are
+#    # not in there.
+#    if not games or grp.get("opt_in"):
+#        if svc["key"] == "bypass":
+#            # Its heading already says these are never routed; repeating it in
+#            # front of every row leaves less room for what the row is.
+#            return grp["label"], ""
+#        return (svc["label"] if len(svc["groups"]) == 1
+#                else "%s — %s" % (svc["label"], grp["label"])), ""
+#    # The Latin spelling, because that is how a game writes its own name and
+#    # how an operator will search for it. The Persian one is still in the
+#    # index, and is what the customer's panel and the bot say.
+#    names = [g["en"] for g in games]
+#    # "and 1 more" is longer than the name it is hiding, so the last one is
+#    # never counted - it is said.
+#    shown = names if len(names) <= most + 1 else names[:most]
+#    rest = len(names) - len(shown)
+#    head = "، ".join(shown) + (" و %d بازی دیگر" % rest if rest else "")
+#    return head, grp["label"]
+#
+#
+#def also_needed(games, ref, catalogue, most=6):
+#    """The other groups the games in this row need to work.
+#
+#    Helldivers is its own name, Steam, and PlayStation's network for the
+#    sign-in. A row that only showed its own two domains would let an operator
+#    tick it and wonder why the game still does not start.
+#
+#    Each one is named the way its own row is - by its games where it has
+#    them - so what is written here can be found in the list above.
+#    """
+#    carried = games_by_group()
+#    label = {}
+#    for svc in catalogue:
+#        for grp in svc["groups"]:
+#            key = "%s/%s" % (svc["key"], grp["key"])
+#            mine = carried.get(key, [])
+#            if mine:
+#                # A store is named after itself, not after three of the fifty
+#                # games that go through it.
+#                # The store that owns this zone, not every store that uses
+#                # it: FACEIT needs Steam, but Steam's row is Steam's.
+#                shop = [g["en"] for g in mine
+#                        if g.get("kind") == "platform"
+#                        and all(ref.split("/")[0] == svc["key"]
+#                                for ref in g["needs"])]
+#                names = shop or [g["en"] for g in mine[:3]]
+#                label[key] = "، ".join(names) + (
+#                    "…" if not shop and len(mine) > 3 else "")
+#                # Only a facet is worth naming after the games: "(download)"
+#                # says something, "(all)" does not.
+#                if grp["key"] in ("download", "backend"):
+#                    label[key] += " (%s)" % grp["label"]
+#            else:
+#                label[key] = (svc["label"] if len(svc["groups"]) == 1
+#                              else "%s (%s)" % (svc["label"], grp["label"]))
+#    out = []
+#    for game in games:
+#        for other in game["needs"]:
+#            if other != ref and label.get(other) and label[other] not in out:
+#                out.append(label[other])
+#    if len(out) > most + 1:
+#        out = out[:most] + ["و %d مورد دیگر" % (len(out) - most)]
+#    return out
 #
 #
 #class Admin(http.server.BaseHTTPRequestHandler):
@@ -12173,62 +12513,84 @@ exit 0
 #        off = STORE.template_domains_off(t["id"])
 #        out = [back,
 #               "<div class='card'><h2>%s</h2>" % html.escape(t["name"]),
-#               "<p class='muted'>تیک سرویس یعنی همهٔ دامنه‌هایش از رله می‌رود — "
-#               "از جمله دامنه‌هایی که بعداً به آن اضافه شوند. کشو را باز کنید تا "
-#               "بین دامنه‌ها یکی‌یکی انتخاب کنید.</p>",
 #               "<form method='post' action='/%s/template-save'>"
-#               "<input type='hidden' name='id' value='%d'>" % (p, t["id"])]
+#               "<input type='hidden' name='id' value='%d'>" % (p, t["id"]),
+#               "<p class='muted'>هر ردیف یک تیک دارد: زدنش یعنی همهٔ دامنه‌های آن "
+#               "از رله می‌رود، از جمله دامنه‌هایی که بعداً اضافه شوند. کشو را باز "
+#               "کنید تا خود دامنه‌ها را ببینید و یکی‌یکی انتخاب کنید.</p>",
+#               "<div class='row gtools'>"
+#               "<input class='gsearch' type='search' autocomplete='off' "
+#               "placeholder='جستجوی بازی یا دامنه…'>"
+#               "<button type='button' data-all-rows='1'>همه</button>"
+#               "<button type='button' data-all-rows='0'>هیچ‌کدام</button></div>"]
 #
-#        for svc in catalogue_now():
-#            for g in svc["groups"]:
-#                # A locked group is not a choice: it is bypassed for every
-#                # template, so it is not drawn where it could be ticked.
-#                if g.get("locked"):
-#                    continue
-#                key = "%s.%s" % (svc["key"], g["key"])
-#                on = (svc["key"], g["key"]) in groups
-#                label = (svc["label"] if len(svc["groups"]) == 1
-#                         else "%s — %s" % (svc["label"], g["label"]))
-#                # An opt-in group is one where routing is the wrong default,
-#                # not a matter of taste. Say why, next to the tick, rather
-#                # than letting it look like every other box on the page.
-#                if g.get("opt_in"):
-#                    # The reason comes from the group, not from here. These
-#                    # are switched off for four different reasons and only one
-#                    # of them is matchmaking - a warning that says the same
-#                    # thing about all of them is wrong about three.
-#                    label += ("<span class='optin'>پیش‌فرض خاموش — %s</span>"
-#                              % html.escape(g.get("note") or
-#                                            "روشن کردنش چیزی را می‌شکند"))
-#                kept = [d for d in g["domains"] if d not in off]
-#                # Open the drawer when the operator has already been in here
-#                # picking domains, so their exceptions are visible rather than
-#                # hidden behind a summary that looks like every other one.
-#                partial = on and len(kept) != len(g["domains"])
-#                out.append(
-#                    "<details class='svc'%s><summary>"
-#                    "<label><input type='checkbox' name='g' value='%s'%s> %s</label>"
-#                    "<span class='muted count'>%d از %d دامنه</span>"
-#                    "<span class='pick'><button type='button' data-all='1'>همه</button>"
-#                    "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
-#                    "</summary>"
-#                    % (" open" if partial else "", html.escape(key),
-#                       " checked" if on else "", label,
-#                       len(kept) if on else 0, len(g["domains"])))
-#                if not g["domains"]:
-#                    out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
-#                out.append("<div class='doms'>")
-#                for d in sorted(g["domains"]):
-#                    # A tick on this page means "routed". Inside a group that
-#                    # is switched off nothing is routed, so nothing there is
-#                    # ticked - otherwise the drawer contradicts the summary
-#                    # beside it, which already says 0 of however many.
-#                    out.append("<label><input type='checkbox' name='d' value='%s'%s>"
-#                               "<span>%s</span></label>"
-#                               % (html.escape(d),
-#                                  " checked" if on and d not in off else "",
-#                                  html.escape(d)))
-#                out.append("</div></details>")
+#        in_group = games_by_group()
+#        for svc, g in ordered_rows(out):
+#            key = "%s.%s" % (svc["key"], g["key"])
+#            ref = "%s/%s" % (svc["key"], g["key"])
+#            on = (svc["key"], g["key"]) in groups
+#            here = in_group.get(ref, [])
+#            label, under = group_title(svc, g, here)
+#            label = html.escape(label)
+#            if under:
+#                label += "<span class='under'>%s</span>" % html.escape(under)
+#            # An opt-in group is one where routing is the wrong default,
+#            # not a matter of taste. Say why, next to the tick, rather
+#            # than letting it look like every other box on the page.
+#            if g.get("opt_in"):
+#                # The reason comes from the group, not from here. These
+#                # are switched off for four different reasons and only one
+#                # of them is matchmaking - a warning that says the same
+#                # thing about all of them is wrong about three.
+#                label += ("<span class='optin'>پیش‌فرض خاموش — %s</span>"
+#                          % html.escape(g.get("note") or
+#                                        "روشن کردنش چیزی را می‌شکند"))
+#            kept = [d for d in g["domains"] if d not in off]
+#            # Open the drawer when the operator has already been in here
+#            # picking domains, so their exceptions are visible rather than
+#            # hidden behind a summary that looks like every other one.
+#            partial = on and len(kept) != len(g["domains"])
+#            # What a search matches on: the game names in both languages,
+#            # the group's own label, and every domain in it - so looking
+#            # for "terraria.org" finds the row it lives in.
+#            terms = " ".join(
+#                [svc["label"], g["label"]]
+#                + [x["name"] + " " + x["en"] for x in here]
+#                + g["domains"]).lower()
+#            out.append(
+#                "<details class='svc'%s%s data-name='%s'><summary>"
+#                "<label><input type='checkbox' name='g' value='%s'%s> %s</label>"
+#                "<span class='muted count'>%d از %d دامنه</span>"
+#                "<span class='pick'><button type='button' data-all='1'>همه</button>"
+#                "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
+#                "</summary>"
+#                % (" open" if partial else "",
+#                   " data-optin='1'" if g.get("opt_in") else "",
+#                   html.escape(terms),
+#                   html.escape(key), " checked" if on else "", label,
+#                   len(kept) if on else 0, len(g["domains"])))
+#            # Only where it helps. On Steam's own row this would be the
+#            # other half of what fifty-nine games need - EA's zone, Riot's,
+#            # Rockstar's - which is every one of their rows repeated here.
+#            # Each of those rows says it for itself.
+#            needs = also_needed(here, ref, catalogue_now()) if len(here) <= 6 else []
+#            if needs:
+#                out.append("<p class='alsoneed'>برای کار کردن، این‌ها هم باید "
+#                           "روشن باشند: %s</p>" % html.escape("، ".join(needs)))
+#            if not g["domains"]:
+#                out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
+#            out.append("<div class='doms'>")
+#            for d in sorted(g["domains"]):
+#                # A tick on this page means "routed". Inside a group that
+#                # is switched off nothing is routed, so nothing there is
+#                # ticked - otherwise the drawer contradicts the summary
+#                # beside it, which already says 0 of however many.
+#                out.append("<label><input type='checkbox' name='d' value='%s'%s>"
+#                           "<span>%s</span></label>"
+#                           % (html.escape(d),
+#                              " checked" if on and d not in off else "",
+#                              html.escape(d)))
+#            out.append("</div></details>")
 #
 #        out.append("<div style='margin-top:16px'><button>ذخیره</button> "
 #                   "<button class='danger' formaction='/%s/template-delete' "
@@ -12280,6 +12642,49 @@ exit 0
 #      if (e.target.checked) d2.querySelector('summary input[name=g]').checked = true;
 #      count(d2);
 #    }
+#  });
+#
+#  // ---- finding a row, and the two mass buttons ----------------------
+#  // A hundred and thirty rows is too many to scroll. The box matches on the
+#  // game names, the group's label and every domain in it, so both "والورانت"
+#  // and "riotgames.com" land on the same row.
+#  var rows = [].slice.call(document.querySelectorAll('details.svc'));
+#
+#  var search = document.querySelector('.gsearch');
+#  if (search) {
+#    search.addEventListener('input', function () {
+#      var q = this.value.trim().toLowerCase();
+#      rows.forEach(function (d) {
+#        d.style.display = !q || d.dataset.name.indexOf(q) >= 0 ? '' : 'none';
+#      });
+#      // A heading with nothing under it is noise while a search is on.
+#      document.querySelectorAll('h3.sec').forEach(function (h) {
+#        var any = false, n = h.nextElementSibling;
+#        while (n && n.tagName !== 'H3') {
+#          if (n.matches('details.svc') && n.style.display !== 'none') any = true;
+#          n = n.nextElementSibling;
+#        }
+#        h.style.display = any || !q ? '' : 'none';
+#      });
+#    });
+#  }
+#
+#  document.addEventListener('click', function (e) {
+#    var mass = e.target.closest('.gtools button');
+#    if (!mass) return;
+#    // Only what the search is showing, so "tick all" after a search means
+#    // what it says rather than everything in the catalogue.
+#    var on = mass.dataset.allRows === '1';
+#    rows.forEach(function (d) {
+#      if (d.style.display === 'none') return;
+#      // "All" never turns on a group that is off by default. Those are off
+#      // because routing them breaks something, and a button pressed over a
+#      // list is not the deliberate choice that switching one on should be.
+#      if (on && d.dataset.optin === '1') return;
+#      d.querySelector('summary input[name=g]').checked = on;
+#      d.querySelectorAll('.doms input').forEach(function (i) { i.checked = on; });
+#      count(d);
+#    });
 #  });
 #})();
 #</script>""")
@@ -12373,7 +12778,7 @@ exit 0
 #                   "<input type='password' name='password' style='width:100%%'>"
 #                   "</div>"
 #                   "<div class='f'><label>تکرار رمز تازه</label>"
-#                   "<input type='password' name='again' style='width:100%%'>"
+#                   "<input type='password' name='password_again' style='width:100%%'>"
 #                   "</div><button>تغییر رمز</button></form>"
 #                   "<p class='muted'>رمز ذخیره نمی‌شود، فقط هشش. با تغییر آن "
 #                   "همهٔ نشست‌های دیگر بسته می‌شوند.</p></div>" % p)
@@ -13126,7 +13531,7 @@ exit 0
 #            new = one("password")
 #            # Asked twice, because it cannot be read back to check afterwards
 #            # and a typo here locks the operator out of their own panel.
-#            if new != one("again"):
+#            if new != one("password_again"):
 #                return self.redirect("settings?m=!دو رمز یکی نیستند")
 #            if len(new) < 8:
 #                return self.redirect("settings?m=!رمز باید حداقل ۸ نویسه باشد")
@@ -13189,6 +13594,8 @@ exit 0
 #    global STORE, CFG, CATALOGUE
 #    CFG = load_config()
 #    CATALOGUE = load_catalogue()
+#    GAMES[:] = load_games()
+#    SECTIONS[:] = load_sections()
 #    STORE = Store(DB)
 #
 #    port = int(CFG["ADMIN_PORT"])
@@ -15717,6 +16124,24 @@ exit 0
 #        self.say(chat, "پلن را انتخاب کنید:" + ("\n\n" + notes if notes else ""),
 #                 {"inline_keyboard": rows})
 #
+#    def plan_games(self, plan, most=12):
+#        """The games a plan covers, as the customer reads them.
+#
+#        The panel sends the names; a long list is cut off here, because a
+#        message that scrolls past the price is not an answer to "what is in
+#        it". The count that follows says the rest is still there.
+#        """
+#        games = plan.get("games") or []
+#        if not games:
+#            return ""
+#        # One more name is shorter than saying there is one more.
+#        shown = games if len(games) <= most + 1 else games[:most]
+#        rest = len(games) - len(shown)
+#        line = "، ".join(shown)
+#        if rest > 0:
+#            line += " و %d بازی دیگر" % rest
+#        return "\n\n🎮 شامل: " + line
+#
 #    def chose_plan(self, chat, sender, plan_id):
 #        sale = self.panel.call("GET", "/plans")
 #        plans = {p["id"]: p for p in sale["plans"]}
@@ -15734,8 +16159,9 @@ exit 0
 #        elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
 #            warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
 #        self.state[chat] = ("receipt", plan_id)
-#        self.say(chat, "پلن «%s» — %s تومان%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
-#                 "بفرستید." % (plan["name"], format(plan["price"], ","), warn,
+#        self.say(chat, "پلن «%s» — %s تومان%s%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+#                 "بفرستید." % (plan["name"], format(plan["price"], ","),
+#                               self.plan_games(plan), warn,
 #                               pay or "برای روش پرداخت با پشتیبانی تماس بگیرید."),
 #                 CANCEL)
 #
@@ -16228,9 +16654,11 @@ exit 0
 #adobelogin.com
 #ads.google.com
 #adservice.google.com
+#ageofempires.com
 #ai.google
 #aistudio.google.com
 #aka.ms
+#albiononline.com
 #algolia.com
 #algolia.net
 #altera.com
@@ -16244,37 +16672,71 @@ exit 0
 #apache.org
 #apexlegends.com
 #apis.google.com
+#app.launchdarkly.com
 #appengine.google.com
 #apple.com
 #apps.admob.com
 #appspot.com
 #arcgis.com
 #archive.ubuntu.com
+#arcraiders.com
+#arcsystemworks.com
 #arduino.cc
+#arenabreakout.com
+#arenabreakoutinfinite.com
+#arma3.com
+#arrowheadgamestudios.com
 #arxiv.org
 #asana.com
+#assassinscreed.com
+#assets1.xboxlive.com
+#assets2.xboxlive.com
+#assettocorsa.net
 #atlassian.com
 #atlassian.net
+#atvi.com
+#audio-ak-spotify-com.akamaized.net
 #aws.amazon.com
 #b4x.com
 #baeldung.com
+#bandainamco.co.jp
+#bandainamcoent.com
+#bandainamcoent.eu
 #battle.net
 #battlecode.org
 #battlefield.com
+#battlenet.com
+#battlenet.com.cn
+#battlestategames.com
+#battleye.com
 #beans.org
 #bethesda.net
+#bethsoft.com
+#bhsr.com
+#bhvr.com
+#bing.com
 #bintray.com
 #bioware.com
+#bistudio.com
 #bit.dev
 #bitbucket.org
 #bitsrc.io
 #bitvise.com
+#blizzard.cn
 #blizzard.com
+#bloodstrike.com
 #bluemix.net
+#blzstatic.com
+#bnetcmsus-a.akamaihd.net
+#bohemia.net
 #books.google.com
+#boombeach.com
 #bootstrapcdn.com
 #bootswatch.com
 #branch.io
+#brawlhalla.com
+#brawlstars.com
+#brawlstarsgame.com
 #bugsnag.com
 #bun.sh
 #business.google.com
@@ -16282,22 +16744,35 @@ exit 0
 #caddy.com
 #caddyserver.com
 #callofduty.com
+#callofdutywarzone.com
 #canva.com
+#capcom-games.com
+#capcom.co.jp
+#capcom.com
+#cdn.blizzard.com
+#cdn.gog.com
+#cdn.ubi.com
+#cdprojektred.com
 #centos.org
 #chatgpt.com
 #chocolatey.org
 #cisco.com
 #clamav.net
+#clashofclans.com
+#clashroyale.com
 #classroom.google.com
 #claude.ai
 #clients.google.com
 #clients2.google.com
 #clients6.google.com
+#clientstream.launchdarkly.com
 #cljdoc.org
 #cloud.google.com
 #cloudera.com
 #cloudflare.com
 #cloudfront.net
+#cloudimperiumgames.com
+#cncnet.org
 #cocalc.com
 #code.google.com
 #code.visualstudio.com
@@ -16306,9 +16781,13 @@ exit 0
 #codeium.com
 #codesandbox.io
 #codex.cs.yale.edu
+#codwarzone.com
 #coinbase.com
 #colab.research.google.com
+#conanexiles.com
+#copilot.microsoft.com
 #count.ly
+#counter-strike.net
 #coursehero.com
 #coursera-apps.org
 #coursera.com
@@ -16316,67 +16795,121 @@ exit 0
 #cp.maxcdn.com
 #crashlytics.com
 #crates.io
+#crimsondesert.com
 #criteriongames.com
+#crytek.com
 #csb.app
 #curd.io
 #cursor.com
 #cursor.sh
+#cyberpunk.net
+#cygames.co.jp
+#d1.xboxlive.com
+#d2.xboxlive.com
 #dartlang.org
 #datacamp.com
+#datadoghq.com
+#dayz.com
+#deadbydaylight.com
 #deepmind.google
 #deepseek.com
 #dell.com
 #demandbase.com
+#demonware.net
 #deno.land
 #design.google.com
 #developer.chrome.com
 #developer.google.com
 #developer.samsung.com
 #developers.google.com
+#diablo.com
+#diablo4.com
 #dice.se
 #digikey.com
+#digitalextremes.com
 #digitalocean.com
+#dis.gd
+#discord-activities.com
+#discord.co
 #discord.com
 #discord.gg
+#discord.gift
+#discord.new
 #discordapp.com
+#discordapp.io
 #discordapp.net
+#discordcdn.com
+#discordstatus.com
+#dist.blizzard.com
 #dl-ssl.google.com
+#dl.delivery.mp.microsoft.com
 #dl.google.com
+#dlassets-ssl.xboxlive.com
+#dlassets.xboxlive.com
 #dns.google.com
 #docker.com
 #docker.io
 #docs.datastax.com
 #domains.google.com
+#dota2.com
 #dotnet.microsoft.com
 #doubleclick.net
 #doubleclickbygoogle.com
 #download.01.org
+#download.epicgames.com
 #download.virtualbox.org
+#download2.epicgames.com
+#download3.epicgames.com
+#download4.epicgames.com
+#dunegames.com
+#dyn.riotcdn.net
 #ea.com
+#ea.com.cn
 #eaaccess.com
 #eaassets-a.akamaihd.net
+#eac-cdn.com
 #eacdn.com
+#eafc.com
 #eamobile.com
 #eaplay.com
+#easebar.com
 #easports.com
+#easyanticheat.net
+#edge.blizzard.com
 #edgesuite.net
 #edx.org
+#efootball.com
 #elastic.co
+#elderscrollsonline.com
+#electronicarts.com
 #element14.com
+#embark.games
 #en25.com
+#endfield.hypergryph.com
+#enlisted.net
 #enterprisedb.com
 #envato-static.com
 #envato.com
+#epicgames-download1.akamaized.net
 #epicgames.com
+#epicgames.dev
+#epicgames.net
+#epicgames.statuspage.io
 #es.io
+#escapefromtarkov.com
 #eslint.org
 #espressif.com
 #events.google.com
+#events.launchdarkly.com
 #explainshell.com
 #expo.io
 #expressjs.com
 #fabric.io
 #faceit.com
+#facepunch.com
+#fallguys.com
+#fastly-download.epicgames.com
+#fatsharkgames.com
 #fbsbx.com
 #fcmobile.com
 #fiber.google.com
@@ -16389,20 +16922,31 @@ exit 0
 #fluttercrashcourse.com
 #flutterlearn.com
 #fly.io
+#focus-entmt.com
 #fodev.org
+#fortnite.com
 #forums.cpanel.net
+#forzamotorsport.net
+#fragpunk.com
 #freecodecamp.org
+#fromsoftware.jp
 #frostbite.com
 #fsdn.com
+#funcom.com
+#gaijin.net
 #gallery.io
 #gallerycdn.vsassets.io
+#gameloop.com
 #gamepass.com
+#gameranger.com
 #garena.com
 #gcr.io
 #geforce.com
+#geforcenow.com
 #gemini.google.com
 #getbootstrap.com
 #getcaddy.com
+#gfn.am
 #ggpht.com
 #ghcr.io
 #github.com
@@ -16436,24 +16980,44 @@ exit 0
 #graphicriver.net
 #graphql.org
 #gravatar.com
+#grayzonewarfare.com
+#grindinggear.com
+#grok.com
 #groq.com
+#gryphline.com
+#gst.prod.dl.playstation.net
 #gstatic.com
+#gtaonline.com
+#guiltygear.com
 #gvt1.com
 #hackerrank.com
+#halowaypoint.com
 #hashicorp.com
+#haydaygame.com
+#hearthstone.com
+#helldivers2.com
+#hellletloose.com
 #helm.sh
 #heroku.com
 #hetzner.com
 #hf.co
+#hirezstudios.com
+#honkaiimpact3.com
+#honkaistarrail.com
+#hoyolab.com
 #hoyoverse.com
 #huggingface.co
 #humblebundle.com
+#huntshowdown.com
 #hyper.is
+#hypergryph.com
 #i.stack.imgur.com
 #i18next.com
 #ibm.com
 #ieee.org
 #incredibuild.com
+#infinityward.com
+#innersloth.com
 #intel.com
 #invis.io
 #issuetracker.google.com
@@ -16470,6 +17034,8 @@ exit 0
 #jhipster.tech
 #jitpack.io
 #jitsi.org
+#joinsquad.com
+#jtvnw.net
 #jungle.net
 #justpaste.it
 #jwplayer.com
@@ -16478,8 +17044,13 @@ exit 0
 #kaggle.net
 #kaggleusercontent.com
 #khanacademy.org
+#kineticgames.co.uk
+#konami.com
+#konami.net
 #krafton.com
 #kubernetes.io
+#kurogame.com
+#kurogames.com
 #labix.org
 #labs.google
 #laravel.com
@@ -16487,15 +17058,21 @@ exit 0
 #leagueoflegends.com
 #learn.microsoft.com
 #lenovo.com
+#level3.blizzard.com
 #libraries.io
 #lightstep.com
 #linear.app
 #linode.com
 #livefyre.com
+#llnw.blizzard.com
+#lolesports.com
+#lostlight.game
 #maas.io
+#madfingergames.com
 #mailgun.com
 #marketingplantform.google.com
 #marketplace.visualstudio.com
+#marvelrivals.com
 #material.io
 #mathworks.com
 #maven.google.com
@@ -16505,6 +17082,7 @@ exit 0
 #medium.com
 #metasploit.com
 #microchip.com
+#midjourney.com
 #mihoyo.com
 #minecraft.net
 #minecraftservices.com
@@ -16514,7 +17092,10 @@ exit 0
 #mojang.com
 #mongodb.com
 #mongodb.org
+#monsterhunter.com
+#mortalkombat.com
 #mp.microsoft.com
+#multiversus.com
 #mybridge.co
 #myfonts.net
 #mysql.com
@@ -16524,6 +17105,8 @@ exit 0
 #netlify.app
 #netlify.com
 #newrelic.com
+#newworld.com
+#newworldinteractive.com
 #nextjs.org
 #nflxext.com
 #nflximg.net
@@ -16540,133 +17123,237 @@ exit 0
 #npmjs.org
 #nuget.org
 #nvidia.com
+#nvidiagrid.net
 #oaistatic.com
 #oaiusercontent.com
+#offworldindustries.com
 #ollama.com
+#oncehuman.game
+#onstove.com
 #openai.com
 #openrouter.ai
 #optimize.google.com
 #optimizely.com
 #oracle.com
+#origin-a.akamaihd.net
 #origin.com
 #overleaf.com
+#overwatch2.com
 #packagesource.com
 #packagist.org
 #packtpub.com
+#paladins.com
+#palworldgame.com
 #parsely.com
+#patches.rockstargames.com
+#pathofexile.com
+#pathofexile2.com
+#paydaythegame.com
 #payments.google.com
 #paypal.com
 #paypalobjects.com
+#pearlabyss.com
+#perfectworld.com
 #perplexity.ai
 #photodune.net
 #php.net
 #piles.overleaf.com
 #pkg.go.dev
 #play.google.com
+#play2xko.com
+#playartifact.com
+#playblackdesert.com
+#playdarktide.com
+#playdeltaforce.com
+#playfabapi.com
+#playlostark.com
+#playoverwatch.com
+#playruneterra.com
 #playstation.com
+#playstation.com.cn
 #playstation.net
+#playstationnetwork.com
+#playthroneandliberty.com
+#playvalorant.com
 #pnpm.io
+#pocketpair.jp
+#poe.com
 #polymer-project.org
 #popcap.com
 #postman.com
 #proandroiddev.com
+#ps5cel.np.dl.playstation.net
 #pscdn.co
+#psn.dl.playstation.net
+#psyonix.com
 #pubg.com
+#pwrd.com
 #pypi.org
 #python.org
 #qt.io
 #qualcomm.com
 #quay.io
+#radeon.com
 #railway.app
+#rainbow6.com
 #rapid7.com
 #raspberrypi.com
+#ravensoftware.com
+#rbx.com
 #rbxcdn.com
+#re-logic.com
 #reactjs.org
 #realm.io
+#recroom.com
+#reddeadonline.com
 #registry.k8s.io
 #releases.hashicorp.com
 #render.com
 #replit.com
 #researchgate.net
 #respawn.com
+#rgpub.io
+#riotcdn.net
+#riotgames.co.kr
 #riotgames.com
+#riotgames.com.tr
+#riotgames.zendesk.com
+#robertsspaceindustries.com
+#roblox.cn
 #roblox.com
+#robloxlabs.com
+#rocketleague.com
 #rockstargames.com
+#rockstargames.statuspage.io
+#rockstarnorth.com
+#roguecompany.com
+#rsg.sc
 #ruby-doc.org
 #rubygems.org
 #rust-lang.org
+#rustafied.com
 #salesforce.com
 #scdn.co
 #schema.org
 #sciencedirect.com
+#scopely.com
+#scssoft.com
+#seaofthieves.com
 #seleniumhq.org
 #sendgrid.com
 #sentry.io
 #serialport.io
 #serverfault.com
+#setup.rbxcdn.com
+#sie.com
+#sims.com
 #slack-edge.com
 #slack.com
+#sledgehammergames.com
+#smilegate.com
 #socket.io
 #softlayer.com
 #softonic.com
 #sonarsource.com
 #sonatype.org
 #sonyentertainmentnetwork.com
+#soulframe.com
 #sparkjava.com
 #spiceworks.com
 #splunk.com
+#spoti.fi
 #spotify.com
+#spotifycdn.com
 #spring.io
 #springer.com
+#squadbusters.game
+#squadbustersgame.com
 #sstatic.net
 #st.com
 #stackexchange.com
 #stackoverflow.com
+#starbreeze.com
+#steam-chat.com
+#steamcommunity-a.akamaihd.net
 #steamcommunity.com
 #steamcontent.com
+#steamdeck.com
+#steamgames.com
 #steampowered.com
+#steamstat.us
 #steamstatic.com
+#steamusercontent-a.akamaihd.net
 #storage.googleapis.com
+#straightbackgames.com
+#streetfighter.com
+#strinova.com
 #stripe.com
+#studiowildcard.com
+#stumbleguys.com
 #sun.com
 #supabase.com
 #supercell.com
+#supercell.net
+#supercellid.com
 #superuser.com
 #surveys.google.com
+#survivetheark.com
 #swaggerhub.com
 #swift.org
 #swtor.com
 #symfony.com
 #tagmanager.google.com
 #take2games.com
+#team17.com
 #teamtreehouse.com
 #teamviewer.com
 #telerik.com
+#tencentgames.com
 #tensorflow.org
 #terraform.io
+#terraria.org
+#thedivisiongame.com
+#thefinals.com
 #themeforest.net
 #thesims.com
+#thewitcher.com
 #ti.com
+#tiberiumalliances.com
 #tinyjpg.com
 #tinypng.com
 #together.ai
 #toggl.com
+#toweroffantasy-global.com
+#trackmania.com
 #traviscistatus.com
 #trello.com
+#treyarch.com
+#truckersmp.com
 #ttvnw.net
 #twitch.tv
+#twitchcdn.net
 #ubi.com
+#ubisoft.ca
 #ubisoft.com
+#ubisoftconnect.com
 #udemy.com
 #udemycdn-a.com
 #udemycdn.com
+#uef.np.dl.playstation.net
+#uflgame.com
+#umamusume.jp
+#underlords.com
 #unity.com
 #unity3d.com
+#uno.demonware.net
 #unrealengine.com
+#unrealengine.dev
 #unsplash.com
+#uplay.com
 #upwork.com
 #vagrantup.com
 #valorant.com
+#valorantesports.com
 #valvesoftware.com
 #vercel.app
 #vercel.com
@@ -16675,25 +17362,50 @@ exit 0
 #visualstudio.microsoft.com
 #vmcdn.com
 #vmware.com
+#voidinteractive.net
+#vrchat.com
+#vrchat.net
 #vscode-cdn.net
 #vscode.dev
 #vuejs.org
 #vuetifyjs.com
 #vuforia.com
+#warframe.com
+#wargaming.net
+#warthunder.com
+#wbgames.com
 #web.dev
 #wikia.com
 #windsurf.com
 #withgoogle.com
 #wolframalpha.com
+#worldoftanks.com
+#worldoftanks.eu
+#worldoftrucks.com
+#worldofwarcraft.com
+#worldofwarships.com
 #wpastra.com
+#wutheringwaves.kurogames.com
 #x.ai
 #xbox.com
+#xboxab.com
+#xboxgamestudios.com
 #xboxlive.com
+#xboxservices.com
+#xdefiant.com
 #xilinx.com
+#xvcf1.xboxlive.com
+#xvcf2.xboxlive.com
+#xvcf3.xboxlive.com
 #yarnpkg.com
 #yarnpkg.org
+#you.com
+#yuanshen.com
 #zeit.co
+#zenimax.com
+#zenlesszonezero.com
 #zeplin.io
+#zeus.dl.playstation.net
 #zoom.us
 #__END_DOMAINS__
 
@@ -16709,8 +17421,11 @@ exit 0
 #          "label": "فروشگاه، اکانت و بازی آنلاین",
 #          "domains": [
 #            "playstation.com",
+#            "playstation.com.cn",
 #            "playstation.net",
+#            "playstationnetwork.com",
 #            "pscdn.co",
+#            "sie.com",
 #            "sonyentertainmentnetwork.com"
 #          ]
 #        },
@@ -16720,11 +17435,14 @@ exit 0
 #          "domains": [
 #            "gst.prod.dl.playstation.net",
 #            "ps5cel.np.dl.playstation.net",
+#            "psn.dl.playstation.net",
 #            "uef.np.dl.playstation.net",
 #            "zeus.dl.playstation.net"
-#          ]
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "xbox",
@@ -16735,10 +17453,16 @@ exit 0
 #          "label": "فروشگاه، اکانت و بازی آنلاین",
 #          "domains": [
 #            "edgesuite.net",
+#            "forzamotorsport.net",
 #            "gamepass.com",
+#            "halowaypoint.com",
 #            "mp.microsoft.com",
+#            "seaofthieves.com",
 #            "xbox.com",
-#            "xboxlive.com"
+#            "xboxab.com",
+#            "xboxgamestudios.com",
+#            "xboxlive.com",
+#            "xboxservices.com"
 #          ]
 #        },
 #        {
@@ -16746,13 +17470,20 @@ exit 0
 #          "label": "دانلود بازی",
 #          "domains": [
 #            "assets1.xboxlive.com",
+#            "assets2.xboxlive.com",
+#            "d1.xboxlive.com",
+#            "d2.xboxlive.com",
 #            "dl.delivery.mp.microsoft.com",
+#            "dlassets-ssl.xboxlive.com",
 #            "dlassets.xboxlive.com",
 #            "xvcf1.xboxlive.com",
-#            "xvcf2.xboxlive.com"
-#          ]
+#            "xvcf2.xboxlive.com",
+#            "xvcf3.xboxlive.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "nintendo",
@@ -16766,7 +17497,8 @@ exit 0
 #            "nintendo.net"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "steam",
@@ -16776,9 +17508,18 @@ exit 0
 #          "key": "main",
 #          "label": "فروشگاه و انجمن",
 #          "domains": [
+#            "counter-strike.net",
+#            "dota2.com",
+#            "playartifact.com",
+#            "steam-chat.com",
+#            "steamcommunity-a.akamaihd.net",
 #            "steamcommunity.com",
+#            "steamdeck.com",
+#            "steamgames.com",
 #            "steampowered.com",
+#            "steamstat.us",
 #            "steamstatic.com",
+#            "underlords.com",
 #            "valvesoftware.com"
 #          ]
 #        },
@@ -16786,10 +17527,13 @@ exit 0
 #          "key": "download",
 #          "label": "دانلود بازی",
 #          "domains": [
-#            "steamcontent.com"
-#          ]
+#            "steamcontent.com",
+#            "steamusercontent-a.akamaihd.net"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "epic",
@@ -16799,11 +17543,33 @@ exit 0
 #          "key": "main",
 #          "label": "فروشگاه، لانچر و اکانت",
 #          "domains": [
+#            "epicgames-download1.akamaized.net",
 #            "epicgames.com",
-#            "unrealengine.com"
+#            "epicgames.dev",
+#            "epicgames.net",
+#            "epicgames.statuspage.io",
+#            "fallguys.com",
+#            "fortnite.com",
+#            "psyonix.com",
+#            "rocketleague.com",
+#            "unrealengine.com",
+#            "unrealengine.dev"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "download.epicgames.com",
+#            "download2.epicgames.com",
+#            "download3.epicgames.com",
+#            "download4.epicgames.com",
+#            "fastly-download.epicgames.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "ea",
@@ -16819,12 +17585,15 @@ exit 0
 #            "criteriongames.com",
 #            "dice.se",
 #            "ea.com",
+#            "ea.com.cn",
 #            "eaaccess.com",
 #            "eaassets-a.akamaihd.net",
 #            "eacdn.com",
+#            "eafc.com",
 #            "eamobile.com",
 #            "eaplay.com",
 #            "easports.com",
+#            "electronicarts.com",
 #            "fcmobile.com",
 #            "frostbite.com",
 #            "maxis.com",
@@ -16832,11 +17601,22 @@ exit 0
 #            "origin.com",
 #            "popcap.com",
 #            "respawn.com",
+#            "sims.com",
 #            "swtor.com",
-#            "thesims.com"
+#            "thesims.com",
+#            "tiberiumalliances.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "origin-a.akamaihd.net"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "blizzard",
@@ -16847,12 +17627,45 @@ exit 0
 #          "label": "همه",
 #          "domains": [
 #            "activision.com",
+#            "atvi.com",
 #            "battle.net",
+#            "battlenet.com",
+#            "battlenet.com.cn",
+#            "blizzard.cn",
 #            "blizzard.com",
-#            "callofduty.com"
+#            "blzstatic.com",
+#            "bnetcmsus-a.akamaihd.net",
+#            "callofduty.com",
+#            "callofdutywarzone.com",
+#            "codwarzone.com",
+#            "demonware.net",
+#            "diablo.com",
+#            "diablo4.com",
+#            "hearthstone.com",
+#            "infinityward.com",
+#            "overwatch2.com",
+#            "playoverwatch.com",
+#            "ravensoftware.com",
+#            "sledgehammergames.com",
+#            "treyarch.com",
+#            "uno.demonware.net",
+#            "worldofwarcraft.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "cdn.blizzard.com",
+#            "dist.blizzard.com",
+#            "edge.blizzard.com",
+#            "level3.blizzard.com",
+#            "llnw.blizzard.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "ubisoft",
@@ -16862,11 +17675,28 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "assassinscreed.com",
+#            "rainbow6.com",
+#            "thedivisiongame.com",
+#            "trackmania.com",
 #            "ubi.com",
-#            "ubisoft.com"
+#            "ubisoft.ca",
+#            "ubisoft.com",
+#            "ubisoftconnect.com",
+#            "uplay.com",
+#            "xdefiant.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "cdn.ubi.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "riot",
@@ -16876,12 +17706,34 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "app.launchdarkly.com",
+#            "clientstream.launchdarkly.com",
+#            "events.launchdarkly.com",
 #            "leagueoflegends.com",
+#            "lolesports.com",
+#            "play2xko.com",
+#            "playruneterra.com",
+#            "playvalorant.com",
+#            "rgpub.io",
+#            "riotcdn.net",
+#            "riotgames.co.kr",
 #            "riotgames.com",
-#            "valorant.com"
+#            "riotgames.com.tr",
+#            "riotgames.zendesk.com",
+#            "valorant.com",
+#            "valorantesports.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "dyn.riotcdn.net"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "rockstar",
@@ -16891,11 +17743,25 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "gtaonline.com",
+#            "reddeadonline.com",
 #            "rockstargames.com",
+#            "rockstargames.statuspage.io",
+#            "rockstarnorth.com",
+#            "rsg.sc",
 #            "take2games.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "patches.rockstargames.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "bethesda",
@@ -16905,10 +17771,12 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
-#            "bethesda.net"
+#            "bethesda.net",
+#            "bethsoft.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "gog",
@@ -16922,8 +17790,17 @@ exit 0
 #            "humblebundle.com",
 #            "itch.io"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "cdn.gog.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "roblox",
@@ -16933,11 +17810,23 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "rbx.com",
 #            "rbxcdn.com",
-#            "roblox.com"
+#            "roblox.cn",
+#            "roblox.com",
+#            "robloxlabs.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "setup.rbxcdn.com"
+#          ],
+#          "section": "downloads"
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "minecraft",
@@ -16952,7 +17841,8 @@ exit 0
 #            "mojang.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "pubgmobile",
@@ -16969,31 +17859,690 @@ exit 0
 #            "pubgmobile.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "bypass"
 #    },
 #    {
-#      "key": "othergames",
-#      "label": "بازی‌های دیگر",
+#      "key": "supercell",
+#      "label": "Supercell",
 #      "groups": [
 #        {
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
-#            "battlecode.org",
-#            "faceit.com",
-#            "garena.com",
-#            "hoyoverse.com",
-#            "incredibuild.com",
-#            "krafton.com",
-#            "mihoyo.com",
-#            "pubg.com",
+#            "boombeach.com",
+#            "brawlstars.com",
+#            "brawlstarsgame.com",
+#            "clashofclans.com",
+#            "clashroyale.com",
+#            "haydaygame.com",
+#            "squadbusters.game",
+#            "squadbustersgame.com",
 #            "supercell.com",
+#            "supercell.net",
+#            "supercellid.com"
+#          ]
+#        }
+#      ],
+#      "section": "games"
+#    },
+#    {
+#      "key": "shooters",
+#      "label": "Shooters & battle royale",
+#      "groups": [
+#        {
+#          "key": "arcraiders",
+#          "label": "ARC Raiders",
+#          "domains": [
+#            "arcraiders.com"
+#          ]
+#        },
+#        {
+#          "key": "arenabreakout",
+#          "label": "Arena Breakout",
+#          "domains": [
+#            "arenabreakout.com",
+#            "arenabreakoutinfinite.com"
+#          ]
+#        },
+#        {
+#          "key": "bohemia",
+#          "label": "Bohemia — Arma & DayZ",
+#          "domains": [
+#            "arma3.com",
+#            "bistudio.com",
+#            "bohemia.net",
+#            "dayz.com"
+#          ]
+#        },
+#        {
+#          "key": "helldivers",
+#          "label": "Helldivers 2",
+#          "domains": [
+#            "arrowheadgamestudios.com",
+#            "helldivers2.com"
+#          ]
+#        },
+#        {
+#          "key": "deadbydaylight",
+#          "label": "Dead by Daylight",
+#          "domains": [
+#            "bhvr.com",
+#            "deadbydaylight.com"
+#          ]
+#        },
+#        {
+#          "key": "bloodstrike",
+#          "label": "Blood Strike",
+#          "domains": [
+#            "bloodstrike.com"
+#          ]
+#        },
+#        {
+#          "key": "huntshowdown",
+#          "label": "Crytek — Hunt: Showdown",
+#          "domains": [
+#            "crytek.com",
+#            "huntshowdown.com"
+#          ]
+#        },
+#        {
+#          "key": "rust",
+#          "label": "Rust",
+#          "domains": [
+#            "facepunch.com",
+#            "rustafied.com"
+#          ]
+#        },
+#        {
+#          "key": "fragpunk",
+#          "label": "FragPunk",
+#          "domains": [
+#            "fragpunk.com"
+#          ]
+#        },
+#        {
+#          "key": "grayzone",
+#          "label": "Gray Zone Warfare",
+#          "domains": [
+#            "grayzonewarfare.com"
+#          ]
+#        },
+#        {
+#          "key": "hellletloose",
+#          "label": "Hell Let Loose",
+#          "domains": [
+#            "hellletloose.com"
+#          ]
+#        },
+#        {
+#          "key": "team17",
+#          "label": "Team17 — Worms & Dredge",
+#          "domains": [
+#            "team17.com"
+#          ]
+#        },
+#        {
+#          "key": "hirez",
+#          "label": "Hi-Rez — Paladins & SMITE",
+#          "domains": [
+#            "hirezstudios.com",
+#            "paladins.com",
+#            "roguecompany.com"
+#          ]
+#        },
+#        {
+#          "key": "squad",
+#          "label": "Squad",
+#          "domains": [
+#            "joinsquad.com",
+#            "offworldindustries.com"
+#          ]
+#        },
+#        {
+#          "key": "lostlight",
+#          "label": "Lost Light",
+#          "domains": [
+#            "lostlight.game"
+#          ]
+#        },
+#        {
+#          "key": "madfinger",
+#          "label": "Madfinger — Shadowgun",
+#          "domains": [
+#            "madfingergames.com"
+#          ]
+#        },
+#        {
+#          "key": "marvelrivals",
+#          "label": "Marvel Rivals",
+#          "domains": [
+#            "marvelrivals.com"
+#          ]
+#        },
+#        {
+#          "key": "insurgency",
+#          "label": "Insurgency",
+#          "domains": [
+#            "newworldinteractive.com"
+#          ]
+#        },
+#        {
+#          "key": "deltaforce",
+#          "label": "Delta Force",
+#          "domains": [
+#            "playdeltaforce.com"
+#          ]
+#        },
+#        {
+#          "key": "thefinals",
+#          "label": "THE FINALS",
+#          "domains": [
+#            "embark.games",
+#            "thefinals.com"
+#          ]
+#        },
+#        {
+#          "key": "tarkov",
+#          "label": "Escape from Tarkov",
+#          "domains": [
+#            "battlestategames.com",
+#            "escapefromtarkov.com"
+#          ]
+#        },
+#        {
+#          "key": "readyornot",
+#          "label": "Ready or Not",
+#          "domains": [
+#            "voidinteractive.net"
+#          ]
+#        }
+#      ],
+#      "section": "games"
+#    },
+#    {
+#      "key": "anime",
+#      "label": "Anime, gacha & MMO",
+#      "groups": [
+#        {
+#          "key": "albion",
+#          "label": "Albion Online",
+#          "domains": [
+#            "albiononline.com"
+#          ]
+#        },
+#        {
+#          "key": "bandainamco",
+#          "label": "Bandai Namco — Elden Ring, Tekken",
+#          "domains": [
+#            "bandainamco.co.jp",
+#            "bandainamcoent.com",
+#            "bandainamcoent.eu"
+#          ]
+#        },
+#        {
+#          "key": "hoyoverse",
+#          "label": "HoYoverse — Genshin, Honkai, ZZZ",
+#          "domains": [
+#            "bhsr.com",
+#            "honkaiimpact3.com",
+#            "honkaistarrail.com",
+#            "hoyolab.com",
+#            "hoyoverse.com",
+#            "mihoyo.com",
+#            "yuanshen.com",
+#            "zenlesszonezero.com"
+#          ]
+#        },
+#        {
+#          "key": "pearlabyss",
+#          "label": "Pearl Abyss — Black Desert",
+#          "domains": [
+#            "crimsondesert.com",
+#            "pearlabyss.com",
+#            "playblackdesert.com"
+#          ]
+#        },
+#        {
+#          "key": "cygames",
+#          "label": "Cygames — Uma Musume",
+#          "domains": [
+#            "cygames.co.jp",
+#            "umamusume.jp"
+#          ]
+#        },
+#        {
+#          "key": "warframe",
+#          "label": "Warframe & Soulframe",
+#          "domains": [
+#            "digitalextremes.com",
+#            "soulframe.com",
+#            "warframe.com"
+#          ]
+#        },
+#        {
+#          "key": "hypergryph",
+#          "label": "Hypergryph — Arknights",
+#          "domains": [
+#            "endfield.hypergryph.com",
+#            "gryphline.com",
+#            "hypergryph.com"
+#          ]
+#        },
+#        {
+#          "key": "fromsoftware",
+#          "label": "FromSoftware",
+#          "domains": [
+#            "fromsoftware.jp"
+#          ]
+#        },
+#        {
+#          "key": "pathofexile",
+#          "label": "Path of Exile 1 & 2",
+#          "domains": [
+#            "grindinggear.com",
+#            "pathofexile.com",
+#            "pathofexile2.com"
+#          ]
+#        },
+#        {
+#          "key": "kurogames",
+#          "label": "Kuro Games — Wuthering Waves",
+#          "domains": [
+#            "kurogame.com",
+#            "kurogames.com",
+#            "wutheringwaves.kurogames.com"
+#          ]
+#        },
+#        {
+#          "key": "newworld",
+#          "label": "New World",
+#          "domains": [
+#            "newworld.com"
+#          ]
+#        },
+#        {
+#          "key": "oncehuman",
+#          "label": "Once Human",
+#          "domains": [
+#            "oncehuman.game"
+#          ]
+#        },
+#        {
+#          "key": "smilegate",
+#          "label": "Smilegate — Lost Ark & STOVE",
+#          "domains": [
+#            "onstove.com",
+#            "playlostark.com",
+#            "smilegate.com"
+#          ]
+#        },
+#        {
+#          "key": "perfectworld",
+#          "label": "Perfect World",
+#          "domains": [
+#            "perfectworld.com",
+#            "pwrd.com"
+#          ]
+#        },
+#        {
+#          "key": "throneliberty",
+#          "label": "Throne and Liberty",
+#          "domains": [
+#            "playthroneandliberty.com"
+#          ]
+#        },
+#        {
+#          "key": "strinova",
+#          "label": "Strinova",
+#          "domains": [
+#            "strinova.com"
+#          ]
+#        },
+#        {
+#          "key": "toweroffantasy",
+#          "label": "Tower of Fantasy",
+#          "domains": [
+#            "toweroffantasy-global.com"
+#          ]
+#        }
+#      ],
+#      "section": "games"
+#    },
+#    {
+#      "key": "coop",
+#      "label": "Co-op, survival & strategy",
+#      "groups": [
+#        {
+#          "key": "ageofempires",
+#          "label": "Age of Empires",
+#          "domains": [
+#            "ageofempires.com"
+#          ]
+#        },
+#        {
+#          "key": "starcitizen",
+#          "label": "Star Citizen",
+#          "domains": [
+#            "cloudimperiumgames.com",
+#            "robertsspaceindustries.com"
+#          ]
+#        },
+#        {
+#          "key": "cnc",
+#          "label": "Command & Conquer",
+#          "domains": [
+#            "cncnet.org"
+#          ]
+#        },
+#        {
+#          "key": "funcom",
+#          "label": "Funcom — Conan & Dune",
+#          "domains": [
+#            "conanexiles.com",
+#            "dunegames.com",
+#            "funcom.com"
+#          ]
+#        },
+#        {
+#          "key": "zenimax",
+#          "label": "ZeniMax — Elder Scrolls Online",
+#          "domains": [
+#            "elderscrollsonline.com",
+#            "zenimax.com"
+#          ]
+#        },
+#        {
+#          "key": "gaijin",
+#          "label": "Gaijin — War Thunder & Enlisted",
+#          "domains": [
+#            "enlisted.net",
+#            "gaijin.net",
+#            "warthunder.com"
+#          ]
+#        },
+#        {
+#          "key": "fatshark",
+#          "label": "Fatshark — Darktide",
+#          "domains": [
+#            "fatsharkgames.com",
+#            "playdarktide.com"
+#          ]
+#        },
+#        {
+#          "key": "focus",
+#          "label": "Focus — A Plague Tale & Space Marine",
+#          "domains": [
+#            "focus-entmt.com"
+#          ]
+#        },
+#        {
+#          "key": "amongus",
+#          "label": "Among Us",
+#          "domains": [
+#            "innersloth.com"
+#          ]
+#        },
+#        {
+#          "key": "phasmophobia",
+#          "label": "Phasmophobia",
+#          "domains": [
+#            "kineticgames.co.uk"
+#          ]
+#        },
+#        {
+#          "key": "palworld",
+#          "label": "Palworld",
+#          "domains": [
+#            "palworldgame.com",
+#            "pocketpair.jp"
+#          ]
+#        },
+#        {
+#          "key": "payday",
+#          "label": "PAYDAY",
+#          "domains": [
+#            "paydaythegame.com",
+#            "starbreeze.com"
+#          ]
+#        },
+#        {
+#          "key": "terraria",
+#          "label": "Terraria",
+#          "domains": [
+#            "re-logic.com",
+#            "terraria.org"
+#          ]
+#        },
+#        {
+#          "key": "recroom",
+#          "label": "Rec Room",
+#          "domains": [
+#            "recroom.com"
+#          ]
+#        },
+#        {
+#          "key": "scopely",
+#          "label": "Scopely — Monopoly GO",
+#          "domains": [
+#            "scopely.com"
+#          ]
+#        },
+#        {
+#          "key": "straightback",
+#          "label": "Straightback Games",
+#          "domains": [
+#            "straightbackgames.com"
+#          ]
+#        },
+#        {
+#          "key": "ark",
+#          "label": "ARK: Survival",
+#          "domains": [
+#            "studiowildcard.com",
+#            "survivetheark.com"
+#          ]
+#        },
+#        {
+#          "key": "stumbleguys",
+#          "label": "Stumble Guys",
+#          "domains": [
+#            "stumbleguys.com"
+#          ]
+#        },
+#        {
+#          "key": "vrchat",
+#          "label": "VRChat",
+#          "domains": [
+#            "vrchat.com",
+#            "vrchat.net"
+#          ]
+#        },
+#        {
+#          "key": "wargaming",
+#          "label": "Wargaming — World of Tanks",
+#          "domains": [
+#            "wargaming.net",
+#            "worldoftanks.com",
+#            "worldoftanks.eu",
+#            "worldofwarships.com"
+#          ]
+#        }
+#      ],
+#      "section": "games"
+#    },
+#    {
+#      "key": "sports",
+#      "label": "Sports, fighting & racing",
+#      "groups": [
+#        {
+#          "key": "arcsystem",
+#          "label": "Arc System Works — Guilty Gear",
+#          "domains": [
+#            "arcsystemworks.com",
+#            "guiltygear.com"
+#          ]
+#        },
+#        {
+#          "key": "assettocorsa",
+#          "label": "Assetto Corsa",
+#          "domains": [
+#            "assettocorsa.net"
+#          ]
+#        },
+#        {
+#          "key": "brawlhalla",
+#          "label": "Brawlhalla",
+#          "domains": [
+#            "brawlhalla.com"
+#          ]
+#        },
+#        {
+#          "key": "capcom",
+#          "label": "Capcom — Street Fighter & Monster Hunter",
+#          "domains": [
+#            "capcom-games.com",
+#            "capcom.co.jp",
+#            "capcom.com",
+#            "monsterhunter.com",
+#            "streetfighter.com"
+#          ]
+#        },
+#        {
+#          "key": "konami",
+#          "label": "Konami — eFootball",
+#          "domains": [
+#            "efootball.com",
+#            "konami.com",
+#            "konami.net"
+#          ]
+#        },
+#        {
+#          "key": "wbgames",
+#          "label": "Warner — Mortal Kombat & MultiVersus",
+#          "domains": [
+#            "mortalkombat.com",
+#            "multiversus.com",
+#            "wbgames.com"
+#          ]
+#        },
+#        {
+#          "key": "eurotruck",
+#          "label": "SCS — Euro Truck & ATS",
+#          "domains": [
+#            "scssoft.com",
+#            "truckersmp.com",
+#            "worldoftrucks.com"
+#          ]
+#        },
+#        {
+#          "key": "ufl",
+#          "label": "UFL",
+#          "domains": [
+#            "uflgame.com"
+#          ]
+#        }
+#      ],
+#      "section": "games"
+#    },
+#    {
+#      "key": "gamebackend",
+#      "label": "Riot chat — PVP.net",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "opt_in": true,
+#          "note": "روشن کردنش چت و دوستان لیگ و والورانت را قطع می‌کند — این‌ها روی ۵۲۲۲ و ۵۲۲۳ و ۲۰۹۹ هستند و رله فقط ۸۰ و ۴۴۳ را می‌برد. اگر روزی این پورت‌ها روی رله باز شوند، این گروه می‌تواند روشن شود",
+#          "domains": [
+#            "pvp.net",
+#            "wr.pvp.net"
+#          ]
+#        }
+#      ],
+#      "section": "bypass"
+#    },
+#    {
+#      "key": "anticheat",
+#      "label": "Anti-cheat & shared backends",
+#      "section": "games",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "battleye.com",
+#            "eac-cdn.com",
+#            "easebar.com",
+#            "easyanticheat.net",
+#            "playfabapi.com"
+#          ]
+#        }
+#      ]
+#    },
+#    {
+#      "key": "othergames",
+#      "label": "Other games",
+#      "groups": [
+#        {
+#          "key": "cdprojekt",
+#          "label": "CD Projekt — Witcher & Cyberpunk",
+#          "domains": [
+#            "cdprojektred.com",
+#            "cyberpunk.net",
+#            "thewitcher.com"
+#          ]
+#        },
+#        {
+#          "key": "faceit",
+#          "label": "FACEIT",
+#          "domains": [
+#            "faceit.com"
+#          ]
+#        },
+#        {
+#          "key": "garena",
+#          "label": "Garena",
+#          "domains": [
+#            "garena.com"
+#          ]
+#        },
+#        {
+#          "key": "krafton",
+#          "label": "Krafton — PUBG on PC",
+#          "domains": [
+#            "krafton.com",
+#            "pubg.com"
+#          ]
+#        },
+#        {
+#          "key": "tencentgames",
+#          "label": "Tencent Games & GameLoop",
+#          "domains": [
+#            "gameloop.com",
+#            "tencentgames.com"
+#          ]
+#        },
+#        {
+#          "key": "unity",
+#          "label": "Unity engine",
+#          "domains": [
 #            "unity.com",
 #            "unity3d.com",
 #            "vuforia.com"
 #          ]
+#        },
+#        {
+#          "key": "misc",
+#          "label": "Odds and ends",
+#          "domains": [
+#            "battlecode.org",
+#            "gameranger.com",
+#            "incredibuild.com"
+#          ]
 #        }
-#      ]
+#      ],
+#      "section": "games"
 #    },
 #    {
 #      "key": "netflix",
@@ -17009,7 +18558,8 @@ exit 0
 #            "nflxvideo.net"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "media"
 #    },
 #    {
 #      "key": "twitch",
@@ -17019,11 +18569,14 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "jtvnw.net",
 #            "ttvnw.net",
-#            "twitch.tv"
+#            "twitch.tv",
+#            "twitchcdn.net"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "media"
 #    },
 #    {
 #      "key": "spotify",
@@ -17033,11 +18586,15 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "audio-ak-spotify-com.akamaized.net",
 #            "scdn.co",
-#            "spotify.com"
+#            "spoti.fi",
+#            "spotify.com",
+#            "spotifycdn.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "media"
 #    },
 #    {
 #      "key": "openai",
@@ -17053,7 +18610,8 @@ exit 0
 #            "openai.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "ai"
 #    },
 #    {
 #      "key": "anthropic",
@@ -17067,38 +18625,46 @@ exit 0
 #            "claude.ai"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "ai"
 #    },
 #    {
 #      "key": "otherai",
-#      "label": "هوش مصنوعی دیگر",
+#      "label": "Other AI",
 #      "groups": [
 #        {
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "bing.com",
 #            "codeium.com",
+#            "copilot.microsoft.com",
 #            "cursor.com",
 #            "cursor.sh",
 #            "deepmind.google",
 #            "deepseek.com",
+#            "grok.com",
 #            "groq.com",
 #            "hf.co",
 #            "huggingface.co",
 #            "kaggle.com",
 #            "kaggle.net",
 #            "kaggleusercontent.com",
+#            "midjourney.com",
 #            "mistral.ai",
 #            "ollama.com",
 #            "openrouter.ai",
 #            "perplexity.ai",
+#            "poe.com",
 #            "tensorflow.org",
 #            "together.ai",
 #            "windsurf.com",
-#            "x.ai"
+#            "x.ai",
+#            "you.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "ai"
 #    },
 #    {
 #      "key": "github",
@@ -17114,7 +18680,8 @@ exit 0
 #            "githubusercontent.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "gitlab",
@@ -17132,7 +18699,8 @@ exit 0
 #            "gitpod.io"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "docker",
@@ -17153,11 +18721,12 @@ exit 0
 #            "registry.k8s.io"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "packages",
-#      "label": "مخازن پکیج",
+#      "label": "Package registries",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17197,7 +18766,8 @@ exit 0
 #            "yarnpkg.org"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "microsoft",
@@ -17218,7 +18788,8 @@ exit 0
 #            "vscode.dev"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "jetbrains",
@@ -17231,7 +18802,8 @@ exit 0
 #            "jetbrains.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "adobe",
@@ -17245,7 +18817,8 @@ exit 0
 #            "adobelogin.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "nvidia",
@@ -17256,10 +18829,14 @@ exit 0
 #          "label": "همه",
 #          "domains": [
 #            "geforce.com",
-#            "nvidia.com"
+#            "geforcenow.com",
+#            "gfn.am",
+#            "nvidia.com",
+#            "nvidiagrid.net"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "other"
 #    },
 #    {
 #      "key": "apple",
@@ -17272,7 +18849,8 @@ exit 0
 #            "apple.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "other"
 #    },
 #    {
 #      "key": "google",
@@ -17338,7 +18916,8 @@ exit 0
 #            "withgoogle.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "infra"
 #    },
 #    {
 #      "key": "discord",
@@ -17348,13 +18927,22 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
+#            "dis.gd",
+#            "discord-activities.com",
+#            "discord.co",
 #            "discord.com",
 #            "discord.gg",
+#            "discord.gift",
+#            "discord.new",
 #            "discordapp.com",
-#            "discordapp.net"
+#            "discordapp.io",
+#            "discordapp.net",
+#            "discordcdn.com",
+#            "discordstatus.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "media"
 #    },
 #    {
 #      "key": "slackzoom",
@@ -17370,7 +18958,8 @@ exit 0
 #            "zoom.us"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "media"
 #    },
 #    {
 #      "key": "figma",
@@ -17391,11 +18980,12 @@ exit 0
 #            "zeplin.io"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "cloud",
-#      "label": "کلاود و هاستینگ",
+#      "label": "Cloud & hosting",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17436,11 +19026,12 @@ exit 0
 #            "zeit.co"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "infra"
 #    },
 #    {
 #      "key": "education",
-#      "label": "آموزش و مرجع",
+#      "label": "Learning & reference",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17490,11 +19081,12 @@ exit 0
 #            "wolframalpha.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "other"
 #    },
 #    {
 #      "key": "hardware",
-#      "label": "سخت‌افزار و درایور",
+#      "label": "Hardware & drivers",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17520,6 +19112,7 @@ exit 0
 #            "ni.com",
 #            "nirsoft.net",
 #            "qualcomm.com",
+#            "radeon.com",
 #            "raspberrypi.com",
 #            "softonic.com",
 #            "st.com",
@@ -17529,11 +19122,12 @@ exit 0
 #            "xilinx.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "other"
 #    },
 #    {
 #      "key": "finance",
-#      "label": "پرداخت و مالی",
+#      "label": "Payments & finance",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17551,11 +19145,12 @@ exit 0
 #            "upwork.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "other"
 #    },
 #    {
 #      "key": "webdev",
-#      "label": "ابزار وب و فریم‌ورک",
+#      "label": "Web tools & frameworks",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17651,11 +19246,12 @@ exit 0
 #            "web.dev"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "dev"
 #    },
 #    {
 #      "key": "assets",
-#      "label": "تصویر، فونت و قالب",
+#      "label": "Images, fonts & templates",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17682,11 +19278,12 @@ exit 0
 #            "wpastra.com"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "infra"
 #    },
 #    {
 #      "key": "analytics",
-#      "label": "تحلیل و تبلیغات",
+#      "label": "Analytics & ads",
 #      "groups": [
 #        {
 #          "key": "main",
@@ -17696,6 +19293,7 @@ exit 0
 #            "bugsnag.com",
 #            "count.ly",
 #            "crashlytics.com",
+#            "datadoghq.com",
 #            "expo.io",
 #            "fabric.io",
 #            "fbsbx.com",
@@ -17709,11 +19307,12 @@ exit 0
 #            "sentry.io"
 #          ]
 #        }
-#      ]
+#      ],
+#      "section": "infra"
 #    },
 #    {
 #      "key": "bypass",
-#      "label": "دور زده‌ها",
+#      "label": "Never routed",
 #      "groups": [
 #        {
 #          "key": "ea",
@@ -17770,12 +19369,1424 @@ exit 0
 #          "domains": [
 #            "core.windows.net"
 #          ]
+#        },
+#        {
+#          "key": "voice",
+#          "label": "Discord, Valorant & League voice",
+#          "opt_in": true,
+#          "note": "روشن کردنش صدا را قطع می‌کند — این‌ها روی UDP کار می‌کنند و رله فقط ۸۰ و ۴۴۳ را می‌برد. اسم discord.media همان چیزی است که کلاینت با آن فاصلهٔ هر منطقهٔ صوتی را می‌سنجد؛ رد کردنش باعث می‌شود همیشه منطقهٔ اشتباه انتخاب شود",
+#          "domains": [
+#            "discord.media",
+#            "vivox.com"
+#          ]
+#        },
+#        {
+#          "key": "steam",
+#          "label": "Steam — sign-in channel",
+#          "opt_in": true,
+#          "note": "روشن کردنش ورود استیم را کند می‌کند — کلاینت روی پورت‌های ۲۷۰۱۸ تا ۲۷۰۲۴ به این اسم وصل می‌شود و رله فقط ۸۰ و ۴۴۳ را می‌برد، پس منتظر می‌ماند و بعد به لیست آی‌پی‌ها برمی‌گردد. فروشگاه و انجمن استیم همچنان از سرور رد می‌شوند",
+#          "domains": [
+#            "steamserver.net"
+#          ]
 #        }
-#      ]
+#      ],
+#      "section": "bypass"
+#    }
+#  ],
+#  "sections": [
+#    {
+#      "key": "games",
+#      "label": "بازی‌ها"
+#    },
+#    {
+#      "key": "downloads",
+#      "label": "دانلودها"
+#    },
+#    {
+#      "key": "ai",
+#      "label": "هوش مصنوعی"
+#    },
+#    {
+#      "key": "media",
+#      "label": "رسانه و ارتباط"
+#    },
+#    {
+#      "key": "dev",
+#      "label": "برنامه‌نویسی و ابزار"
+#    },
+#    {
+#      "key": "infra",
+#      "label": "زیرساخت و شبکه"
+#    },
+#    {
+#      "key": "other",
+#      "label": "بقیه"
+#    },
+#    {
+#      "key": "bypass",
+#      "label": "دور زده‌ها"
 #    }
 #  ]
 #}
 #__END_SERVICES__
+
+#__BEGIN_GAMES__
+#{
+#  "sections": [
+#    {
+#      "key": "games",
+#      "label": "بازی‌ها"
+#    },
+#    {
+#      "key": "ai",
+#      "label": "هوش مصنوعی"
+#    },
+#    {
+#      "key": "media",
+#      "label": "رسانه و ارتباط"
+#    },
+#    {
+#      "key": "dev",
+#      "label": "برنامه‌نویسی و ابزار"
+#    },
+#    {
+#      "key": "infra",
+#      "label": "زیرساخت و شبکه"
+#    },
+#    {
+#      "key": "other",
+#      "label": "بقیه"
+#    },
+#    {
+#      "key": "bypass",
+#      "label": "دور زده‌ها"
+#    }
+#  ],
+#  "games": [
+#    {
+#      "key": "steam",
+#      "name": "استیم",
+#      "en": "Steam",
+#      "kind": "platform",
+#      "needs": [
+#        "steam/main",
+#        "steam/download"
+#      ],
+#      "note": "فروشگاه و لانچر. ورود و چت استیم مستقیم می‌ماند"
+#    },
+#    {
+#      "key": "epicstore",
+#      "name": "اپیک گیمز",
+#      "en": "Epic Games Store",
+#      "kind": "platform",
+#      "needs": [
+#        "epic/main",
+#        "epic/download"
+#      ]
+#    },
+#    {
+#      "key": "xbox",
+#      "name": "ایکس‌باکس و گیم‌پس",
+#      "en": "Xbox / Game Pass",
+#      "kind": "platform",
+#      "needs": [
+#        "xbox/online",
+#        "xbox/download"
+#      ]
+#    },
+#    {
+#      "key": "psn",
+#      "name": "پلی‌استیشن",
+#      "en": "PlayStation Network",
+#      "kind": "platform",
+#      "needs": [
+#        "playstation/online",
+#        "playstation/download"
+#      ]
+#    },
+#    {
+#      "key": "nintendo",
+#      "name": "نینتندو",
+#      "en": "Nintendo",
+#      "kind": "platform",
+#      "needs": [
+#        "nintendo/main"
+#      ]
+#    },
+#    {
+#      "key": "battlenet",
+#      "name": "بتل‌نت",
+#      "en": "Battle.net",
+#      "kind": "platform",
+#      "needs": [
+#        "blizzard/main",
+#        "blizzard/download"
+#      ]
+#    },
+#    {
+#      "key": "eaapp",
+#      "name": "EA App",
+#      "en": "EA App",
+#      "kind": "platform",
+#      "needs": [
+#        "ea/main",
+#        "ea/download"
+#      ]
+#    },
+#    {
+#      "key": "ubiconnect",
+#      "name": "یوبی‌سافت کانکت",
+#      "en": "Ubisoft Connect",
+#      "kind": "platform",
+#      "needs": [
+#        "ubisoft/main",
+#        "ubisoft/download"
+#      ]
+#    },
+#    {
+#      "key": "riotclient",
+#      "name": "کلاینت رایوت",
+#      "en": "Riot Client",
+#      "kind": "platform",
+#      "needs": [
+#        "riot/main",
+#        "riot/download"
+#      ]
+#    },
+#    {
+#      "key": "rockstarlauncher",
+#      "name": "راک‌استار",
+#      "en": "Rockstar Games",
+#      "kind": "platform",
+#      "needs": [
+#        "rockstar/main",
+#        "rockstar/download"
+#      ]
+#    },
+#    {
+#      "key": "gogstore",
+#      "name": "GOG و itch.io",
+#      "en": "GOG / itch.io",
+#      "kind": "platform",
+#      "needs": [
+#        "gog/main",
+#        "gog/download"
+#      ]
+#    },
+#    {
+#      "key": "bethesdanet",
+#      "name": "بتسدا",
+#      "en": "Bethesda",
+#      "kind": "platform",
+#      "needs": [
+#        "bethesda/main"
+#      ]
+#    },
+#    {
+#      "key": "garena",
+#      "name": "گارنا",
+#      "en": "Garena",
+#      "kind": "platform",
+#      "needs": [
+#        "othergames/garena"
+#      ]
+#    },
+#    {
+#      "key": "faceit",
+#      "name": "فیس‌ایت",
+#      "en": "FACEIT",
+#      "kind": "platform",
+#      "needs": [
+#        "othergames/faceit",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "gameloop",
+#      "name": "گیم‌لوپ تنسنت",
+#      "en": "GameLoop",
+#      "kind": "platform",
+#      "needs": [
+#        "othergames/tencentgames"
+#      ]
+#    },
+#    {
+#      "key": "unity",
+#      "name": "موتور Unity",
+#      "en": "Unity",
+#      "kind": "platform",
+#      "needs": [
+#        "othergames/unity"
+#      ]
+#    },
+#    {
+#      "key": "miscgames",
+#      "name": "متفرقه",
+#      "en": "Other game tools",
+#      "kind": "platform",
+#      "needs": [
+#        "othergames/misc"
+#      ]
+#    },
+#    {
+#      "key": "valorant",
+#      "name": "والورانت",
+#      "en": "Valorant",
+#      "kind": "game",
+#      "needs": [
+#        "riot/main",
+#        "riot/download"
+#      ],
+#      "note": "صدای بازی روی Vivox است و مستقیم می‌ماند"
+#    },
+#    {
+#      "key": "lol",
+#      "name": "لیگ آو لجندز",
+#      "en": "League of Legends",
+#      "kind": "game",
+#      "needs": [
+#        "riot/main",
+#        "riot/download"
+#      ],
+#      "note": "چت و لیست دوستانش روی pvp.net است — پورت ۵۲۲۳، که رله نمی‌برد. خود بازی کار می‌کند"
+#    },
+#    {
+#      "key": "tft",
+#      "name": "تفت",
+#      "en": "Teamfight Tactics",
+#      "kind": "game",
+#      "needs": [
+#        "riot/main",
+#        "riot/download"
+#      ]
+#    },
+#    {
+#      "key": "wildrift",
+#      "name": "وایلد ریفت",
+#      "en": "Wild Rift",
+#      "kind": "game",
+#      "needs": [
+#        "riot/main"
+#      ]
+#    },
+#    {
+#      "key": "2xko",
+#      "name": "2XKO",
+#      "en": "2XKO",
+#      "kind": "game",
+#      "needs": [
+#        "riot/main"
+#      ]
+#    },
+#    {
+#      "key": "cod",
+#      "name": "کال آو دیوتی",
+#      "en": "Call of Duty",
+#      "kind": "game",
+#      "needs": [
+#        "blizzard/main",
+#        "blizzard/download"
+#      ]
+#    },
+#    {
+#      "key": "overwatch",
+#      "name": "اورواچ ۲",
+#      "en": "Overwatch 2",
+#      "kind": "game",
+#      "needs": [
+#        "blizzard/main",
+#        "blizzard/download"
+#      ]
+#    },
+#    {
+#      "key": "diablo",
+#      "name": "دیابلو",
+#      "en": "Diablo",
+#      "kind": "game",
+#      "needs": [
+#        "blizzard/main",
+#        "blizzard/download"
+#      ]
+#    },
+#    {
+#      "key": "wow",
+#      "name": "ورلد آو وارکرفت",
+#      "en": "World of Warcraft",
+#      "kind": "game",
+#      "needs": [
+#        "blizzard/main",
+#        "blizzard/download"
+#      ]
+#    },
+#    {
+#      "key": "hearthstone",
+#      "name": "هارث‌استون",
+#      "en": "Hearthstone",
+#      "kind": "game",
+#      "needs": [
+#        "blizzard/main"
+#      ]
+#    },
+#    {
+#      "key": "starcraft",
+#      "name": "استارکرفت",
+#      "en": "StarCraft II",
+#      "kind": "game",
+#      "needs": [
+#        "blizzard/main",
+#        "blizzard/download"
+#      ]
+#    },
+#    {
+#      "key": "apex",
+#      "name": "ایپکس لجندز",
+#      "en": "Apex Legends",
+#      "kind": "game",
+#      "needs": [
+#        "ea/main",
+#        "ea/download",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "battlefield",
+#      "name": "بتلفیلد",
+#      "en": "Battlefield",
+#      "kind": "game",
+#      "needs": [
+#        "ea/main",
+#        "ea/download"
+#      ]
+#    },
+#    {
+#      "key": "fc",
+#      "name": "EA FC (فیفا)",
+#      "en": "EA Sports FC",
+#      "kind": "game",
+#      "needs": [
+#        "ea/main",
+#        "ea/download"
+#      ]
+#    },
+#    {
+#      "key": "sims",
+#      "name": "سیمز",
+#      "en": "The Sims",
+#      "kind": "game",
+#      "needs": [
+#        "ea/main",
+#        "ea/download"
+#      ]
+#    },
+#    {
+#      "key": "nfs",
+#      "name": "نید فور اسپید",
+#      "en": "Need for Speed",
+#      "kind": "game",
+#      "needs": [
+#        "ea/main"
+#      ]
+#    },
+#    {
+#      "key": "f1",
+#      "name": "F1",
+#      "en": "F1",
+#      "kind": "game",
+#      "needs": [
+#        "ea/main",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "fortnite",
+#      "name": "فورتنایت",
+#      "en": "Fortnite",
+#      "kind": "game",
+#      "needs": [
+#        "epic/main",
+#        "epic/download"
+#      ]
+#    },
+#    {
+#      "key": "rocketleague",
+#      "name": "راکت لیگ",
+#      "en": "Rocket League",
+#      "kind": "game",
+#      "needs": [
+#        "epic/main",
+#        "epic/download"
+#      ]
+#    },
+#    {
+#      "key": "fallguys",
+#      "name": "فال گایز",
+#      "en": "Fall Guys",
+#      "kind": "game",
+#      "needs": [
+#        "epic/main"
+#      ]
+#    },
+#    {
+#      "key": "r6",
+#      "name": "رینبو سیکس",
+#      "en": "Rainbow Six Siege",
+#      "kind": "game",
+#      "needs": [
+#        "ubisoft/main",
+#        "ubisoft/download"
+#      ]
+#    },
+#    {
+#      "key": "assassins",
+#      "name": "اساسینز کرید",
+#      "en": "Assassin's Creed",
+#      "kind": "game",
+#      "needs": [
+#        "ubisoft/main",
+#        "ubisoft/download"
+#      ]
+#    },
+#    {
+#      "key": "farcry",
+#      "name": "فارکرای",
+#      "en": "Far Cry",
+#      "kind": "game",
+#      "needs": [
+#        "ubisoft/main",
+#        "ubisoft/download"
+#      ]
+#    },
+#    {
+#      "key": "division",
+#      "name": "دیویژن",
+#      "en": "The Division",
+#      "kind": "game",
+#      "needs": [
+#        "ubisoft/main",
+#        "ubisoft/download"
+#      ]
+#    },
+#    {
+#      "key": "forhonor",
+#      "name": "فور آنر",
+#      "en": "For Honor",
+#      "kind": "game",
+#      "needs": [
+#        "ubisoft/main"
+#      ]
+#    },
+#    {
+#      "key": "brawlhalla",
+#      "name": "براول‌هالا",
+#      "en": "Brawlhalla",
+#      "kind": "game",
+#      "needs": [
+#        "sports/brawlhalla",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "gta",
+#      "name": "GTA Online",
+#      "en": "GTA Online",
+#      "kind": "game",
+#      "needs": [
+#        "rockstar/main",
+#        "rockstar/download",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "rdr",
+#      "name": "رد دد ردمپشن ۲",
+#      "en": "Red Dead Redemption 2",
+#      "kind": "game",
+#      "needs": [
+#        "rockstar/main",
+#        "rockstar/download"
+#      ]
+#    },
+#    {
+#      "key": "minecraft",
+#      "name": "ماینکرفت",
+#      "en": "Minecraft",
+#      "kind": "game",
+#      "needs": [
+#        "minecraft/main",
+#        "xbox/online"
+#      ]
+#    },
+#    {
+#      "key": "halo",
+#      "name": "هیلو",
+#      "en": "Halo",
+#      "kind": "game",
+#      "needs": [
+#        "xbox/online",
+#        "xbox/download"
+#      ]
+#    },
+#    {
+#      "key": "forza",
+#      "name": "فورزا",
+#      "en": "Forza",
+#      "kind": "game",
+#      "needs": [
+#        "xbox/online",
+#        "xbox/download"
+#      ]
+#    },
+#    {
+#      "key": "seaofthieves",
+#      "name": "سی آو ثیوز",
+#      "en": "Sea of Thieves",
+#      "kind": "game",
+#      "needs": [
+#        "xbox/online",
+#        "xbox/download"
+#      ]
+#    },
+#    {
+#      "key": "aoe",
+#      "name": "ایج آو امپایرز",
+#      "en": "Age of Empires",
+#      "kind": "game",
+#      "needs": [
+#        "coop/ageofempires",
+#        "xbox/online",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "roblox",
+#      "name": "روبلاکس",
+#      "en": "Roblox",
+#      "kind": "game",
+#      "needs": [
+#        "roblox/main",
+#        "roblox/download"
+#      ]
+#    },
+#    {
+#      "key": "clashofclans",
+#      "name": "کلش آو کلنز",
+#      "en": "Clash of Clans",
+#      "kind": "game",
+#      "needs": [
+#        "supercell/main"
+#      ]
+#    },
+#    {
+#      "key": "clashroyale",
+#      "name": "کلش رویال",
+#      "en": "Clash Royale",
+#      "kind": "game",
+#      "needs": [
+#        "supercell/main"
+#      ]
+#    },
+#    {
+#      "key": "brawlstars",
+#      "name": "براول استارز",
+#      "en": "Brawl Stars",
+#      "kind": "game",
+#      "needs": [
+#        "supercell/main"
+#      ]
+#    },
+#    {
+#      "key": "hayday",
+#      "name": "هی دی",
+#      "en": "Hay Day",
+#      "kind": "game",
+#      "needs": [
+#        "supercell/main"
+#      ]
+#    },
+#    {
+#      "key": "boombeach",
+#      "name": "بوم بیچ",
+#      "en": "Boom Beach",
+#      "kind": "game",
+#      "needs": [
+#        "supercell/main"
+#      ]
+#    },
+#    {
+#      "key": "squadbusters",
+#      "name": "اسکواد باسترز",
+#      "en": "Squad Busters",
+#      "kind": "game",
+#      "needs": [
+#        "supercell/main"
+#      ]
+#    },
+#    {
+#      "key": "pubgmobile",
+#      "name": "پابجی موبایل",
+#      "en": "PUBG Mobile",
+#      "kind": "game",
+#      "needs": [
+#        "pubgmobile/main"
+#      ],
+#      "note": "پیش‌فرض خاموش: روی بیشتر اپراتورها مستقیم بهتر کار می‌کند"
+#    },
+#    {
+#      "key": "pubgpc",
+#      "name": "پابجی رایانه",
+#      "en": "PUBG: Battlegrounds",
+#      "kind": "game",
+#      "needs": [
+#        "othergames/krafton",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "stumbleguys",
+#      "name": "استامبل گایز",
+#      "en": "Stumble Guys",
+#      "kind": "game",
+#      "needs": [
+#        "coop/stumbleguys"
+#      ]
+#    },
+#    {
+#      "key": "monopolygo",
+#      "name": "مونوپولی گو",
+#      "en": "Monopoly GO",
+#      "kind": "game",
+#      "needs": [
+#        "coop/scopely"
+#      ]
+#    },
+#    {
+#      "key": "arcraiders",
+#      "name": "ARC Raiders",
+#      "en": "ARC Raiders",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/arcraiders",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "arenabreakout",
+#      "name": "آرنا بریک‌اوت",
+#      "en": "Arena Breakout",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/arenabreakout"
+#      ]
+#    },
+#    {
+#      "key": "arma",
+#      "name": "آرما",
+#      "en": "Arma",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/bohemia",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "dayz",
+#      "name": "DayZ",
+#      "en": "DayZ",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/bohemia",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "helldivers",
+#      "name": "هل‌دایورز ۲",
+#      "en": "Helldivers 2",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/helldivers",
+#        "steam/main",
+#        "playstation/online"
+#      ],
+#      "note": "ورودش از حساب PSN می‌گذرد، پس پلی‌استیشن هم لازم است"
+#    },
+#    {
+#      "key": "dbd",
+#      "name": "دد بای دی‌لایت",
+#      "en": "Dead by Daylight",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/deadbydaylight",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "bloodstrike",
+#      "name": "بلاد استرایک",
+#      "en": "Blood Strike",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/bloodstrike"
+#      ]
+#    },
+#    {
+#      "key": "hunt",
+#      "name": "هانت شوداون",
+#      "en": "Hunt: Showdown",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/huntshowdown",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "rust",
+#      "name": "راست",
+#      "en": "Rust",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/rust",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "fragpunk",
+#      "name": "فرگ‌پانک",
+#      "en": "FragPunk",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/fragpunk",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "grayzone",
+#      "name": "گری زون وارفر",
+#      "en": "Gray Zone Warfare",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/grayzone",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "hll",
+#      "name": "هل لت لوز",
+#      "en": "Hell Let Loose",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/hellletloose",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "worms",
+#      "name": "ورمز و Dredge",
+#      "en": "Team17 games",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/team17",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "paladins",
+#      "name": "پلدینز و اسمایت",
+#      "en": "Paladins / SMITE",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/hirez",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "squadgame",
+#      "name": "اسکواد",
+#      "en": "Squad",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/squad",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "lostlight",
+#      "name": "لاست لایت",
+#      "en": "Lost Light",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/lostlight"
+#      ]
+#    },
+#    {
+#      "key": "shadowgun",
+#      "name": "شدوگان",
+#      "en": "Shadowgun",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/madfinger"
+#      ]
+#    },
+#    {
+#      "key": "marvelrivals",
+#      "name": "مارول رایولز",
+#      "en": "Marvel Rivals",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/marvelrivals",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "insurgency",
+#      "name": "اینسرجنسی",
+#      "en": "Insurgency",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/insurgency",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "deltaforce",
+#      "name": "دلتا فورس",
+#      "en": "Delta Force",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/deltaforce",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "thefinals",
+#      "name": "د فاینالز",
+#      "en": "THE FINALS",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/thefinals",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "readyornot",
+#      "name": "ردی اور نات",
+#      "en": "Ready or Not",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/readyornot",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "tarkov",
+#      "name": "اسکیپ فرام تارکوف",
+#      "en": "Escape from Tarkov",
+#      "kind": "game",
+#      "needs": [
+#        "shooters/tarkov"
+#      ]
+#    },
+#    {
+#      "key": "albion",
+#      "name": "آلبیون آنلاین",
+#      "en": "Albion Online",
+#      "kind": "game",
+#      "needs": [
+#        "anime/albion",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "eldenring",
+#      "name": "الدن رینگ",
+#      "en": "Elden Ring",
+#      "kind": "game",
+#      "needs": [
+#        "anime/bandainamco",
+#        "anime/fromsoftware",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "tekken",
+#      "name": "تکن",
+#      "en": "Tekken",
+#      "kind": "game",
+#      "needs": [
+#        "anime/bandainamco",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "genshin",
+#      "name": "گنشین ایمپکت",
+#      "en": "Genshin Impact",
+#      "kind": "game",
+#      "needs": [
+#        "anime/hoyoverse"
+#      ]
+#    },
+#    {
+#      "key": "starrail",
+#      "name": "هونکای استار ریل",
+#      "en": "Honkai: Star Rail",
+#      "kind": "game",
+#      "needs": [
+#        "anime/hoyoverse"
+#      ]
+#    },
+#    {
+#      "key": "zzz",
+#      "name": "زنلس زون زیرو",
+#      "en": "Zenless Zone Zero",
+#      "kind": "game",
+#      "needs": [
+#        "anime/hoyoverse"
+#      ]
+#    },
+#    {
+#      "key": "blackdesert",
+#      "name": "بلک دزرت",
+#      "en": "Black Desert",
+#      "kind": "game",
+#      "needs": [
+#        "anime/pearlabyss",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "umamusume",
+#      "name": "اوما موسومه",
+#      "en": "Uma Musume",
+#      "kind": "game",
+#      "needs": [
+#        "anime/cygames"
+#      ]
+#    },
+#    {
+#      "key": "warframe",
+#      "name": "وارفریم",
+#      "en": "Warframe",
+#      "kind": "game",
+#      "needs": [
+#        "anime/warframe",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "arknights",
+#      "name": "آرک‌نایتس",
+#      "en": "Arknights",
+#      "kind": "game",
+#      "needs": [
+#        "anime/hypergryph"
+#      ]
+#    },
+#    {
+#      "key": "poe",
+#      "name": "پث آو اگزایل",
+#      "en": "Path of Exile",
+#      "kind": "game",
+#      "needs": [
+#        "anime/pathofexile",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "wuwa",
+#      "name": "ووترینگ ویوز",
+#      "en": "Wuthering Waves",
+#      "kind": "game",
+#      "needs": [
+#        "anime/kurogames"
+#      ]
+#    },
+#    {
+#      "key": "newworld",
+#      "name": "نیو ورلد",
+#      "en": "New World",
+#      "kind": "game",
+#      "needs": [
+#        "anime/newworld",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "oncehuman",
+#      "name": "وانس هیومن",
+#      "en": "Once Human",
+#      "kind": "game",
+#      "needs": [
+#        "anime/oncehuman",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "lostark",
+#      "name": "لاست آرک",
+#      "en": "Lost Ark",
+#      "kind": "game",
+#      "needs": [
+#        "anime/smilegate",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "throneliberty",
+#      "name": "ثرون اند لیبرتی",
+#      "en": "Throne and Liberty",
+#      "kind": "game",
+#      "needs": [
+#        "anime/throneliberty",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "strinova",
+#      "name": "استرینووا",
+#      "en": "Strinova",
+#      "kind": "game",
+#      "needs": [
+#        "anime/strinova",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "tof",
+#      "name": "تاور آو فانتزی",
+#      "en": "Tower of Fantasy",
+#      "kind": "game",
+#      "needs": [
+#        "anime/toweroffantasy"
+#      ]
+#    },
+#    {
+#      "key": "perfectworld",
+#      "name": "پرفکت ورلد",
+#      "en": "Perfect World",
+#      "kind": "game",
+#      "needs": [
+#        "anime/perfectworld"
+#      ]
+#    },
+#    {
+#      "key": "starcitizen",
+#      "name": "استار سیتیزن",
+#      "en": "Star Citizen",
+#      "kind": "game",
+#      "needs": [
+#        "coop/starcitizen"
+#      ]
+#    },
+#    {
+#      "key": "cnc",
+#      "name": "کامند اند کانکر",
+#      "en": "Command & Conquer",
+#      "kind": "game",
+#      "needs": [
+#        "coop/cnc"
+#      ]
+#    },
+#    {
+#      "key": "conan",
+#      "name": "کونان اگزایلز و Dune",
+#      "en": "Conan Exiles / Dune",
+#      "kind": "game",
+#      "needs": [
+#        "coop/funcom",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "eso",
+#      "name": "الدر اسکرولز آنلاین",
+#      "en": "Elder Scrolls Online",
+#      "kind": "game",
+#      "needs": [
+#        "coop/zenimax",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "warthunder",
+#      "name": "وار ثاندر",
+#      "en": "War Thunder",
+#      "kind": "game",
+#      "needs": [
+#        "coop/gaijin",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "enlisted",
+#      "name": "انلیستد",
+#      "en": "Enlisted",
+#      "kind": "game",
+#      "needs": [
+#        "coop/gaijin"
+#      ]
+#    },
+#    {
+#      "key": "darktide",
+#      "name": "وارهمر دارک‌تاید",
+#      "en": "Warhammer: Darktide",
+#      "kind": "game",
+#      "needs": [
+#        "coop/fatshark",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "plaguetale",
+#      "name": "بازی‌های Focus",
+#      "en": "Focus Entertainment games",
+#      "kind": "game",
+#      "needs": [
+#        "coop/focus",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "amongus",
+#      "name": "اِمانگ آس",
+#      "en": "Among Us",
+#      "kind": "game",
+#      "needs": [
+#        "coop/amongus",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "phasmophobia",
+#      "name": "فاسموفوبیا",
+#      "en": "Phasmophobia",
+#      "kind": "game",
+#      "needs": [
+#        "coop/phasmophobia",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "palworld",
+#      "name": "پال‌ورلد",
+#      "en": "Palworld",
+#      "kind": "game",
+#      "needs": [
+#        "coop/palworld",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "payday",
+#      "name": "پی‌دی",
+#      "en": "PAYDAY",
+#      "kind": "game",
+#      "needs": [
+#        "coop/payday",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "terraria",
+#      "name": "ترراریا",
+#      "en": "Terraria",
+#      "kind": "game",
+#      "needs": [
+#        "coop/terraria",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "recroom",
+#      "name": "رک روم",
+#      "en": "Rec Room",
+#      "kind": "game",
+#      "needs": [
+#        "coop/recroom"
+#      ]
+#    },
+#    {
+#      "key": "ark",
+#      "name": "ارک",
+#      "en": "ARK: Survival",
+#      "kind": "game",
+#      "needs": [
+#        "coop/ark",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "vrchat",
+#      "name": "وی‌آرچت",
+#      "en": "VRChat",
+#      "kind": "game",
+#      "needs": [
+#        "coop/vrchat",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "wot",
+#      "name": "ورلد آو تنکس",
+#      "en": "World of Tanks",
+#      "kind": "game",
+#      "needs": [
+#        "coop/wargaming"
+#      ]
+#    },
+#    {
+#      "key": "wows",
+#      "name": "ورلد آو وارشیپس",
+#      "en": "World of Warships",
+#      "kind": "game",
+#      "needs": [
+#        "coop/wargaming"
+#      ]
+#    },
+#    {
+#      "key": "straightback",
+#      "name": "Straightback Games",
+#      "en": "Straightback Games",
+#      "kind": "game",
+#      "needs": [
+#        "coop/straightback",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "guiltygear",
+#      "name": "گیلتی گیر",
+#      "en": "Guilty Gear",
+#      "kind": "game",
+#      "needs": [
+#        "sports/arcsystem",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "assettocorsa",
+#      "name": "آستتو کورسا",
+#      "en": "Assetto Corsa",
+#      "kind": "game",
+#      "needs": [
+#        "sports/assettocorsa",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "streetfighter",
+#      "name": "استریت فایتر",
+#      "en": "Street Fighter",
+#      "kind": "game",
+#      "needs": [
+#        "sports/capcom",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "monsterhunter",
+#      "name": "مانستر هانتر",
+#      "en": "Monster Hunter",
+#      "kind": "game",
+#      "needs": [
+#        "sports/capcom",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "efootball",
+#      "name": "ای‌فوتبال",
+#      "en": "eFootball",
+#      "kind": "game",
+#      "needs": [
+#        "sports/konami",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "mortalkombat",
+#      "name": "مورتال کامبت",
+#      "en": "Mortal Kombat",
+#      "kind": "game",
+#      "needs": [
+#        "sports/wbgames",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "multiversus",
+#      "name": "مولتی‌ورسس",
+#      "en": "MultiVersus",
+#      "kind": "game",
+#      "needs": [
+#        "sports/wbgames",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "ets2",
+#      "name": "یورو تراک",
+#      "en": "Euro Truck Simulator",
+#      "kind": "game",
+#      "needs": [
+#        "sports/eurotruck",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "ufl",
+#      "name": "UFL",
+#      "en": "UFL",
+#      "kind": "game",
+#      "needs": [
+#        "sports/ufl"
+#      ]
+#    },
+#    {
+#      "key": "cyberpunk",
+#      "name": "سایبرپانک ۲۰۷۷",
+#      "en": "Cyberpunk 2077",
+#      "kind": "game",
+#      "needs": [
+#        "othergames/cdprojekt",
+#        "gog/main",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "witcher",
+#      "name": "ویچر",
+#      "en": "The Witcher",
+#      "kind": "game",
+#      "needs": [
+#        "othergames/cdprojekt",
+#        "gog/main",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "anticheat",
+#      "name": "ضدتقلب‌ها (EAC، BattlEye)",
+#      "en": "Anti-cheat (EAC, BattlEye)",
+#      "kind": "platform",
+#      "needs": [
+#        "anticheat/main"
+#      ],
+#      "note": "زیر ده‌ها بازی است؛ روی ۴۴۳ کار می‌کند و از سرور رد می‌شود"
+#    },
+#    {
+#      "key": "riotchat",
+#      "name": "چت رایوت",
+#      "en": "Riot chat (PVP.net)",
+#      "kind": "platform",
+#      "needs": [
+#        "gamebackend/main"
+#      ],
+#      "note": "پیش‌فرض خاموش: روی ۵۲۲۳ است، که رله نمی‌برد"
+#    }
+#  ]
+#}
+#__END_GAMES__
 
 #__BEGIN_FONT__
 #d09GMgABAAAAAbIwABQAAAADsWQAAbG6ACEAxQAAAAAAAAAAAAAAAAAAAAAAAAAAGotDG4HRKhy4

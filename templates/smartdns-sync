@@ -1133,6 +1133,7 @@ label.plan:has(input:checked){border-color:var(--btn)}
 label.plan input{width:auto;margin:5px 0 0;accent-color:var(--btn)}
 label.plan .p{font-weight:600}
 label.plan small{color:var(--muted)}
+label.plan small.games{color:var(--dim);line-height:2}
 .dns input[type=file]{width:100%;padding:10px;font-size:12px;
  border:1px dashed var(--line2);background:transparent;margin-bottom:4px}
 details.pw{margin-top:16px;border:1px solid var(--line);border-radius:12px;
@@ -1500,6 +1501,25 @@ def support_box(info):
             % (" — <span class='ok'>%d جواب تازه</span>" % answered if answered else ""))
 
 
+def plan_games(plan, most=14):
+    """The games a plan covers, for the customer choosing between plans.
+
+    Cut off after a handful: the full list of a complete plan is a hundred
+    names and would bury the price. The rest is said as a count, which is
+    what somebody skimming needs - "and 90 more" tells them it is everything.
+    """
+    games = plan.get("games") or []
+    if not games:
+        return ""
+    # One more name is shorter than saying there is one more.
+    shown = [html.escape(g) for g in (games if len(games) <= most + 1
+                                      else games[:most])]
+    rest = len(games) - len(shown)
+    if rest > 0:
+        shown.append("و %d بازی دیگر" % rest)
+    return "<br><small class='games'>%s</small>" % "، ".join(shown)
+
+
 def plan_line(p):
     """One plan as the customer reads it: what they get and what it costs."""
     size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] \
@@ -1579,8 +1599,9 @@ def receipt_box(info):
                 % (p["id"], " checked" if mine else "", html.escape(p["name"]),
                    " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
                    html.escape(plan_line(p)),
-                   "<br><small>%s</small>" % html.escape(p["note"])
-                   if p.get("note") else ""))
+                   plan_games(p) +
+                   ("<br><small>%s</small>" % html.escape(p["note"])
+                    if p.get("note") else "")))
         out.append("</div>")
         if held:
             out.append("<p class='note'>تمدید همان پلن، روزها و حجم را روی "
