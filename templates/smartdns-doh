@@ -296,13 +296,42 @@ def keep_for_report(key, query, reply, state):
 
 
 # ---------------------------------------------------------------- resolving
-def refused(query):
-    """The query, turned into an answer that says REFUSED and nothing else."""
+def error_answer(query, rcode):
+    """The query turned into an answer with this rcode and no records: its
+    question kept, so the client can tell which of its questions this is."""
     if len(query) < 12:
         return b""
     flags = struct.unpack("!H", query[2:4])[0]
-    flags = (flags | 0x8000 | 0x0080) & 0xFFF0 | 5     # QR, RA, RCODE=5
-    return query[:2] + struct.pack("!H", flags) + query[4:12]
+    flags = (flags | 0x8000 | 0x0080) & 0xFFF0 | rcode    # QR, RA, RCODE
+    end = 12
+    try:
+        if struct.unpack("!H", query[4:6])[0] == 1:
+            while query[end]:
+                if query[end] & 0xC0:
+                    raise IndexError
+                end += 1 + query[end]
+            end += 5
+            if end > len(query):
+                raise IndexError
+    except IndexError:
+        end = 12
+    qdcount = 1 if end > 12 else 0
+    return (query[:2] + struct.pack("!HHHHH", flags, qdcount, 0, 0, 0)
+            + query[12:end])
+
+
+def refused(query):
+    """REFUSED: not for you."""
+    return error_answer(query, 5)
+
+
+def servfail(query):
+    """SERVFAIL: the resolver behind us did not answer this time. A DNS
+    answer, not an HTTP error - a browser that gets a 502 from its DoH
+    server can decide the server is broken and go back to the operator's
+    plain DNS for a while, which is the thing the customer turned DoH on
+    to avoid. This one it just asks again."""
+    return error_answer(query, 2)
 
 
 def ask(query, port):
@@ -429,7 +458,7 @@ class DoH(http.server.BaseHTTPRequestHandler):
             reply = ask(query, port)
         except (OSError, ConnectionError) as e:
             log(WARN, "resolver on %d did not answer: %s" % (port, e))
-            return self.fail(502, "the resolver did not answer")
+            reply = servfail(query)
         if uid != "0" and state.logging("doh", uid):
             keep_for_report("doh:" + uid, query, reply, state)
         self.send_response(200)
@@ -482,7 +511,14 @@ class DoT(socketserver.BaseRequestHandler):
                 # is the second lock, for a relay whose gate is being changed.
                 if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
                     STATS.count("dot", ip)
-                    reply = ask(query, port)
+                    try:
+                        reply = ask(query, port)
+                    except (OSError, ConnectionError) as e:
+                        # As on DoH: an answer that says so. The
+                        # connection used to close here, and every other
+                        # question on it went with it.
+                        log(WARN, "resolver on %d did not answer: %s" % (port, e))
+                        reply = servfail(query)
                     if state.logging("dot", ip):
                         keep_for_report("dot:" + ip, query, reply, state)
                 else:
