@@ -5,6 +5,9 @@ usage: smartdns-watch               everybody, each line naming who asked
        smartdns-watch ali           one customer, by username
        smartdns-watch u12           ...or by the label smartdns-acl list shows
        smartdns-watch 5.200.12.34   ...or by address
+       smartdns-watch --json IP...  every answer to these addresses, a JSON
+                                    line each - how smartdns-sync keeps a
+                                    customer's report for support
 
 For finding what a service needs routed: have the customer open it until it
 fails, and watch. "via relay" is already routed. "direct" went around the
@@ -143,7 +146,9 @@ class Watcher:
     hands out a different address every few seconds, which is not news.
     """
 
-    def __init__(self, relay_ips, who, targets=None, out=None, clock=time.time):
+    def __init__(self, relay_ips, who, targets=None, out=None, clock=time.time,
+                 as_json=False):
+        self.as_json = as_json
         self.local = set(relay_ips)
         self.who = who
         self.targets = targets
@@ -199,6 +204,12 @@ class Watcher:
                 self.report(key[0], name, "no answer")
 
     def report(self, client, name, verdict):
+        if self.as_json:
+            # Every answer, not only the changes: the one keeping the report
+            # counts them, and a name asked again is news to it.
+            self.out(json.dumps({"t": int(self.clock()), "ip": client,
+                                 "name": name, "v": verdict}))
+            return
         kind = "direct" if verdict.startswith("direct") else verdict
         if self.shown.get((client, name)) == kind:
             return
@@ -303,7 +314,17 @@ def main(argv):
     if argv and argv[0] in ("-h", "--help"):
         print(usage)
         return 0
-    if len(argv) > 1 or (argv and argv[0].startswith("-")):
+    as_json = bool(argv) and argv[0] == "--json"
+    if as_json:
+        argv = argv[1:]
+        try:
+            wanted = {str(ipaddress.IPv4Address(a)) for a in argv}
+        except ValueError:
+            wanted = set()
+        if not wanted:
+            print("--json takes one address or more", file=sys.stderr)
+            return 2
+    if not as_json and (len(argv) > 1 or (argv and argv[0].startswith("-"))):
         print(usage, file=sys.stderr)
         return 2
     if os.geteuid() != 0:
@@ -317,7 +338,9 @@ def main(argv):
     users, allowed = load_users()
     who = display(users)
     targets = None
-    if argv:
+    if as_json:
+        targets = wanted
+    elif argv:
         targets = resolve(argv[0], users)
         if not targets:
             print("no customer or address matches %r - the registered ones:  "
@@ -332,14 +355,17 @@ def main(argv):
         print("cannot watch the network here: %s" % e, file=sys.stderr)
         return 1
 
-    if targets:
+    if as_json:
+        pass
+    elif targets:
         print("watching %s - ctrl-c to stop" % ", ".join(
             "%s (%s)" % (ip, who.get(ip, "not registered")) for ip in sorted(targets)))
     else:
         print("watching everybody - ctrl-c to stop")
-    print("  via relay = already goes through the exit   direct = goes around it"
-          "   filtered = blocked inside Iran\n", flush=True)
-    for ip in sorted(targets or ()):
+    if not as_json:
+        print("  via relay = already goes through the exit   direct = goes around it"
+              "   filtered = blocked inside Iran\n", flush=True)
+    for ip in sorted(targets or ()) if not as_json else ():
         if ip not in allowed:
             print("  note: %s is not allowed on this relay, so its questions are "
                   "dropped - they will show as 'no answer'\n" % ip, flush=True)
@@ -349,7 +375,7 @@ def main(argv):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stop)
 
-    w = Watcher(local_addresses(), who, targets)
+    w = Watcher(local_addresses(), who, targets, as_json=as_json)
     sock.settimeout(0.5)
     try:
         while True:
@@ -359,7 +385,8 @@ def main(argv):
                 pass
             w.tick()
     except KeyboardInterrupt:
-        print("\n" + w.summary())
+        if not as_json:
+            print("\n" + w.summary())
     return 0
 
 

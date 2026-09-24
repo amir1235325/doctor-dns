@@ -113,6 +113,16 @@ class State:
     def port_for(self, ip):
         return int((self.current().get("ips") or {}).get(ip) or MAIN_PORT)
 
+    def logging(self, kind, key):
+        """Whether this customer asked for their queries to be kept for
+        support: DoH by account, DoT by address."""
+        data = self.current()
+        return str(key) in set(map(str, data.get("qlog_uids" if kind == "doh" else "qlog_ips")
+                                   or ()))
+
+    def self_ips(self):
+        return set(self.current().get("self") or ())
+
     def is_allowed(self, ip):
         data = self.current()
         if not data.get("enforcing", True):
@@ -164,16 +174,31 @@ class Stats:
     def __init__(self):
         self.lock = threading.Lock()
         self.doh, self.dot = {}, {}
+        # For the customers who asked for it, and only them: which names,
+        # and where each answer sent them. {key: {"name\tverdict": [first,
+        # last, hits]}}, handed over like the counts.
+        self.qlog = {}
 
     def count(self, kind, key):
         with self.lock:
             table = self.doh if kind == "doh" else self.dot
             table[key] = table.get(key, 0) + 1
 
+    def note(self, key, name, verdict):
+        now = int(time.time())
+        with self.lock:
+            per = self.qlog.setdefault(key, {})
+            k = name + "\t" + verdict
+            if k in per:
+                per[k][1] = now
+                per[k][2] += 1
+            elif len(per) < 3000:
+                per[k] = [now, now, 1]
+
     def take(self):
         with self.lock:
-            out = {"doh": self.doh, "dot": self.dot}
-            self.doh, self.dot = {}, {}
+            out = {"doh": self.doh, "dot": self.dot, "qlog": self.qlog}
+            self.doh, self.dot, self.qlog = {}, {}, {}
         return out
 
 
@@ -182,7 +207,7 @@ STATS = Stats()
 
 def flush_stats(directory=STATS_DIR):
     got = STATS.take()
-    if not got["doh"] and not got["dot"]:
+    if not got["doh"] and not got["dot"] and not got["qlog"]:
         return
     os.makedirs(directory, exist_ok=True)
     name = os.path.join(directory, "%d-%d" % (time.time() * 1000, os.getpid()))
@@ -198,6 +223,76 @@ def flush_loop():
             flush_stats()
         except OSError as e:
             log(WARN, "counts not written: %s" % e)
+
+
+# ---------------------------------------------------------------- the report
+# Where an answer sent the customer, in the words smartdns-watch uses for
+# plain DNS, so the support report reads the same whichever way they asked.
+FILTERED = "10.10.34."
+
+
+def question(msg):
+    """(name, qtype) of a query, or None."""
+    try:
+        if len(msg) < 12 or struct.unpack("!H", msg[4:6])[0] != 1:
+            return None
+        labels, off = [], 12
+        while True:
+            n = msg[off]
+            if n == 0:
+                break
+            if n & 0xC0:
+                return None
+            labels.append(msg[off + 1:off + 1 + n].decode("ascii", "replace"))
+            off += 1 + n
+        return ".".join(labels).lower(), struct.unpack("!H", msg[off + 1:off + 3])[0]
+    except (IndexError, struct.error):
+        return None
+
+
+def skip_name(msg, off):
+    while True:
+        n = msg[off]
+        if n & 0xC0 == 0xC0:
+            return off + 2
+        if n == 0:
+            return off + 1
+        off += 1 + n
+
+
+def verdict(reply, relay):
+    """via relay, direct 1.2.3.4, filtered in Iran, no such name..."""
+    try:
+        rcode = reply[3] & 0x0F
+        if rcode == 3:
+            return "no such name"
+        if rcode:
+            return "refused (rcode %d)" % rcode
+        qd, an = struct.unpack("!HH", reply[4:8])
+        off = 12
+        for _ in range(qd):
+            off = skip_name(reply, off) + 4
+        addrs = []
+        for _ in range(an):
+            off = skip_name(reply, off)
+            rtype, _, _, rdlen = struct.unpack("!HHIH", reply[off:off + 10])
+            off += 10
+            if rtype == 1 and rdlen == 4:
+                addrs.append(socket.inet_ntoa(reply[off:off + 4]))
+            off += rdlen
+    except (IndexError, struct.error):
+        return "no address"
+    if any(a in relay for a in addrs):
+        return "via relay"
+    if any(a.startswith(FILTERED) for a in addrs):
+        return "filtered in Iran"
+    return ("direct " + addrs[0]) if addrs else "no address"
+
+
+def keep_for_report(key, query, reply, state):
+    q = question(query)
+    if q and q[1] == 1 and q[0]:      # A only, as smartdns-watch shows
+        STATS.note(key, q[0], verdict(reply, state.self_ips()))
 
 
 # ---------------------------------------------------------------- resolving
@@ -335,6 +430,8 @@ class DoH(http.server.BaseHTTPRequestHandler):
         except (OSError, ConnectionError) as e:
             log(WARN, "resolver on %d did not answer: %s" % (port, e))
             return self.fail(502, "the resolver did not answer")
+        if uid != "0" and state.logging("doh", uid):
+            keep_for_report("doh:" + uid, query, reply, state)
         self.send_response(200)
         self.send_header("Content-Type", "application/dns-message")
         self.send_header("Content-Length", str(len(reply)))
@@ -386,6 +483,8 @@ class DoT(socketserver.BaseRequestHandler):
                 if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
                     STATS.count("dot", ip)
                     reply = ask(query, port)
+                    if state.logging("dot", ip):
+                        keep_for_report("dot:" + ip, query, reply, state)
                 else:
                     reply = refused(query)
                 sock.sendall(struct.pack("!H", len(reply)) + reply)

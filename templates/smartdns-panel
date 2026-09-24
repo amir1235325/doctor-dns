@@ -217,6 +217,21 @@ CREATE TABLE IF NOT EXISTS usage (
 -- turned into a catalogue service here and dropped. So what survives says
 -- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
 -- after thirty days not even that. Only the customer is shown it.
+-- The DNS report a customer switched on for support: which names their
+-- devices asked, where the answer sent them and why, for 24 hours from the
+-- last time each was asked. Nothing is kept for anybody who did not ask.
+CREATE TABLE IF NOT EXISTS query_log (
+    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name     TEXT NOT NULL,
+    verdict  TEXT NOT NULL,
+    reason   TEXT NOT NULL DEFAULT '',
+    via      TEXT NOT NULL DEFAULT 'dns',
+    first_at TEXT NOT NULL,
+    last_at  TEXT NOT NULL,
+    hits     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, name, verdict)
+);
+
 -- DoH and DoT, per day: how many queries of each, and who used them at all -
 -- for the admin panel's figures. Counts only; nothing of what was asked.
 CREATE TABLE IF NOT EXISTS doh_daily (
@@ -475,6 +490,8 @@ MIGRATIONS = [
     ("ips", "dns_seen_at", "TEXT"),
     # When this account last used DoH or DoT.
     ("users", "doh_seen_at", "TEXT"),
+    # Until when the customer wants their DNS kept for support; NULL is off.
+    ("users", "qlog_until", "TEXT"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -2018,6 +2035,111 @@ def record_doh(store, stats):
             store.run("UPDATE users SET doh_seen_at = ? WHERE id = ?", (now(), uid))
 
 
+# ----------------------------------------------------------------- DNS report
+QLOG_HOURS = 24
+QLOG_MAX = 2000         # rows kept per customer; the oldest go first
+
+
+def qlog_on(store, user_id, on):
+    """Switch a customer's DNS report on for 24 hours, or off - which also
+    throws away what was kept, at once."""
+    if on:
+        until = (datetime.now(timezone.utc) + timedelta(hours=QLOG_HOURS)
+                 ).isoformat(timespec="seconds")
+        store.run("UPDATE users SET qlog_until = ? WHERE id = ?", (until, user_id))
+        return until
+    store.run("UPDATE users SET qlog_until = NULL WHERE id = ?", (user_id,))
+    store.run("DELETE FROM query_log WHERE user_id = ?", (user_id,))
+    return None
+
+
+def qlog_wanted(store):
+    """Who the relays should keep the report for: addresses and accounts."""
+    rows = store.q("SELECT id FROM users WHERE qlog_until > ?", (now(),))
+    uids = [r["id"] for r in rows]
+    ips = [r["ip"] for r in store.q(
+        "SELECT i.ip FROM ips i JOIN users u ON u.id = i.user_id WHERE u.qlog_until > ?",
+        (now(),))]
+    return {"uids": uids, "ips": ips}
+
+
+def qlog_reasoner(store, user, catalogue):
+    """Why a name went where it did, for this customer's template: routed by
+    it, un-ticked in it, left direct on purpose, or not ours at all."""
+    tid = user["template_id"] or DEFAULT_TEMPLATE[0]
+    routed = set(store.routed_for(tid, catalogue)) if tid else set()
+    bypass = set(store.bypass_for(tid, catalogue)) if tid else set()
+    index = service_index(catalogue)
+    label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
+    custom = set(store.custom_domains())
+
+    def reason(name):
+        parts = name.lower().rstrip(".").split(".")
+        tails = [".".join(parts[i:]) for i in range(len(parts) - 1)]
+        if any(t in custom for t in tails):
+            return "routed:دامنه‌های دلخواه ادمین"
+        for t in tails:                     # the longest rule wins, as in dnsmasq
+            if t in bypass:
+                return "bypass:" + label.get(index.get(t, ""), "")
+            if t in routed:
+                return "routed:" + label.get(index.get(t, ""), "")
+        for t in tails:
+            if t in index:
+                return "unticked:" + label.get(index[t], "")
+        return "outside:"
+    return reason
+
+
+def record_qlog(store, report, catalogue):
+    """A relay's report: {ip | "doh:uid" | "dot:ip": [[name, verdict, first,
+    last, hits], ...]}. Only for customers who have it on right now."""
+    if not isinstance(report, dict):
+        return
+    reasons = {}
+    for key, entries in list(report.items())[:500]:
+        key = str(key)
+        via = "dns"
+        if key.startswith("doh:"):
+            via, uid = "doh", key[4:]
+            user = store.one("SELECT * FROM users WHERE id = ?",
+                             (int(uid) if uid.isdigit() else 0,))
+        else:
+            if key.startswith("dot:"):
+                via, key = "dot", key[4:]
+            user = store.one("SELECT u.* FROM users u JOIN ips i ON i.user_id = u.id"
+                             " WHERE i.ip = ?", (key,))
+        if not user or not user["qlog_until"] or user["qlog_until"] <= now():
+            continue
+        if user["id"] not in reasons:
+            reasons[user["id"]] = qlog_reasoner(store, user, catalogue)
+        reason = reasons[user["id"]]
+        for e in (entries if isinstance(entries, list) else [])[:3000]:
+            try:
+                name, verdict, first, last, hits = str(e[0])[:253], str(e[1])[:60], \
+                    int(e[2]), int(e[3]), int(e[4])
+            except (IndexError, TypeError, ValueError):
+                continue
+            first = datetime.fromtimestamp(first, timezone.utc).isoformat(timespec="seconds")
+            last = datetime.fromtimestamp(last, timezone.utc).isoformat(timespec="seconds")
+            store.run("INSERT INTO query_log (user_id, name, verdict, reason, via, first_at,"
+                      " last_at, hits) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                      " ON CONFLICT(user_id, name, verdict) DO UPDATE SET"
+                      " last_at = max(last_at, excluded.last_at), hits = hits + excluded.hits,"
+                      " via = excluded.via, reason = excluded.reason",
+                      (user["id"], name, verdict, reason(name), via, first, last, hits))
+        over = store.one("SELECT count(*) c FROM query_log WHERE user_id = ?",
+                         (user["id"],))["c"] - QLOG_MAX
+        if over > 0:
+            store.run("DELETE FROM query_log WHERE rowid IN (SELECT rowid FROM query_log"
+                      " WHERE user_id = ? ORDER BY last_at LIMIT ?)", (user["id"], over))
+
+
+def qlog_rows(store, user_id, limit=150):
+    return [dict(r) for r in store.q(
+        "SELECT name, verdict, reason, via, first_at, last_at, hits FROM query_log"
+        " WHERE user_id = ? ORDER BY last_at DESC, name LIMIT ?", (user_id, limit))]
+
+
 def new_doh_token(store, user):
     """A fresh personal address; the old one stops at the relay's next sync."""
     token = secrets.token_urlsafe(16)
@@ -2035,6 +2157,11 @@ def prune_usage(store):
     store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
     cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
     store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
+    # The DNS report: 24 hours from the last time a name was asked, and the
+    # switch goes off by itself when its time is up.
+    store.run("DELETE FROM query_log WHERE last_at < ?",
+              ((now_t - timedelta(hours=QLOG_HOURS)).isoformat(timespec="seconds"),))
+    store.run("UPDATE users SET qlog_until = NULL WHERE qlog_until <= ?", (now(),))
     store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 
 
@@ -3240,6 +3367,10 @@ class API(http.server.BaseHTTPRequestHandler):
                 record_doh(self.store, body.get("doh_stats"))
             except Exception as e:
                 log_exception("DNS counts not recorded: %r" % e)
+            try:
+                record_qlog(self.store, body.get("qlog"), CATALOGUE)
+            except Exception as e:
+                log_exception("DNS report not recorded: %r" % e)
             # The relay's own recent logs, now and then, for the logs page.
             if isinstance(body.get("logs"), str):
                 tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
@@ -3316,6 +3447,8 @@ class API(http.server.BaseHTTPRequestHandler):
                                     # the relay checks them before it takes them.
                                     "upstream": (self.store.setting("dns_upstream")
                                                  or DEFAULT_UPSTREAM).split(),
+                                    # Whose DNS to keep for the support report.
+                                    "qlog": qlog_wanted(self.store),
                                     "templates": self.store.template_names(),
                                     "watch": watch_job(self.store),
                                     })
@@ -3349,6 +3482,15 @@ class API(http.server.BaseHTTPRequestHandler):
             view = usage_view(self.store, user, CATALOGUE)
             view["ok"] = True
             return self.reply(200, view)
+        if self.path == "/user-qlog":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            on = bool(body.get("on"))
+            qlog_on(self.store, user["id"], on)
+            return self.reply(200, {"ok": True, "message": (
+                "گزارش DNS روشن شد؛ تا ۲۴ ساعت نگه داشته می‌شود" if on else
+                "گزارش DNS خاموش و پاک شد")})
         if self.path == "/user-doh-reset":
             user = self._session_user(body.get("session"))
             if not user:
@@ -3670,6 +3812,12 @@ class API(http.server.BaseHTTPRequestHandler):
             "dns_seen_at": ips[0]["dns_seen_at"] if ips else None,
             "ip_added_at": ips[0]["added_at"] if ips else None,
             "doh_seen_at": user["doh_seen_at"],
+            # The DNS report, and what it holds, while it is on.
+            "qlog_until": user["qlog_until"] if (user["qlog_until"] or "") > now() else None,
+            "qlog": (qlog_rows(self.store, user["id"])
+                     if (user["qlog_until"] or "") > now()
+                     or self.store.one("SELECT 1 FROM query_log WHERE user_id = ? LIMIT 1",
+                                       (user["id"],)) else []),
         }
 
 

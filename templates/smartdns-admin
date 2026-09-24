@@ -605,6 +605,54 @@ def heat_chart(hours):
 
 
 
+QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
+                "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
+                "no address": "بدون آدرس"}
+QLOG_REASON = {"routed": "در قالبش از رله می‌رود",
+               "unticked": "در قالبش از رله نمی‌رود",
+               "bypass": "در قالبش از رله نمی‌رود",
+               "outside": "در فهرست سرویس‌ها نیست"}
+
+
+def qlog_card(user):
+    """The customer's DNS report, when they switched it on for support."""
+    try:
+        rows = STORE.q("SELECT name, verdict, reason, via, last_at, hits FROM query_log"
+                       " WHERE user_id = ? ORDER BY last_at DESC, name LIMIT 400",
+                       (user["id"],))
+    except sqlite3.OperationalError:
+        return ""
+    on = bool(user["qlog_until"]) and user["qlog_until"] > now() \
+        if "qlog_until" in user.keys() else False
+    if not rows and not on:
+        return ("<div class='card'><h2>گزارش DNS</h2><p class='muted'>خاموش است. اگر "
+                "مشتری مشکلی دارد، از او بخواهید در پنل خودش «گزارش DNS برای "
+                "پشتیبانی» را روشن کند و همان سرویس را دوباره باز کند؛ بعد این‌جا دیده "
+                "می‌شود. زنده دیدن در همان لحظه: <code>smartdns-watch</code> روی رله."
+                "</p></div>")
+    out = ["<div class='card'><h2>گزارش DNS — %s</h2>" % (
+        "روشن تا %s" % user["qlog_until"][:16].replace("T", " ") if on else "خاموش"),
+        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم ۲۴ ساعت بعد از آخرین بار پاک "
+        "می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا "
+        "اسم در فهرست نیست.</p>",
+        "<table><tr><th>اسم</th><th>کجا رفت</th><th>چرا</th><th>راه</th><th>بار</th>"
+        "<th>آخرین (UTC)</th></tr>"]
+    for r in rows:
+        v = r["verdict"]
+        verdict = ("↪ مستقیم " + html.escape(v[7:])) if v.startswith("direct") else \
+            ("رد شد" if v.startswith("refused") else html.escape(QLOG_VERDICT.get(v, v)))
+        kind, _, svc = (r["reason"] or "").partition(":")
+        why = QLOG_REASON.get(kind, "")
+        out.append("<tr><td dir='ltr'><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td>"
+                   "<td>%d</td><td>%s</td></tr>"
+                   % (html.escape(r["name"]), verdict,
+                      html.escape(("%s — %s" % (svc, why)) if svc else why),
+                      {"dns": "DNS", "doh": "DoH", "dot": "DoT"}.get(r["via"], r["via"]),
+                      r["hits"], r["last_at"][11:16]))
+    out.append("</table></div>")
+    return "".join(out)
+
+
 def doh_card():
     """DoH and DoT over the last week: queries of each, and how many
     customers used them at all. Counts only - nothing of what was asked."""
@@ -2705,6 +2753,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    % (legend(), speed_chart(view["five"])))
         out.append("<div class='card'><h2>ساعت‌های پرمصرف — ۷ روز اخیر</h2>%s</div>"
                    % heat_chart(view["hours"]))
+        out.append(qlog_card(user))
         table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
                         % (d.strftime("%Y-%m-%d"), human(dn), human(u))
                         for d, u, dn in reversed(rows) if u or dn)

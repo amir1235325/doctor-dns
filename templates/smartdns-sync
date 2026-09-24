@@ -920,6 +920,10 @@ ENFORCE_FILE = "/etc/nftables.d/30-smartdns-enforce.conf"
 MAIN_DNS_PORT = 53
 
 
+# Who asked for the DNS report, for smartdns-doh's part of it.
+QLOG_WANT = {"uids": [], "ips": []}
+
+
 def write_doh_state(tokens, ports, assignment, allowed):
     ips = {ip: ports[prof] for ip, prof in assignment.items() if prof in ports}
     state = {
@@ -931,6 +935,11 @@ def write_doh_state(tokens, ports, assignment, allowed):
         "ips": ips,
         "allowed": sorted(allowed),
         "enforcing": os.path.exists(ENFORCE_FILE),
+        # The DNS report: whose encrypted queries to keep, and this relay's
+        # own address, which is what "via relay" means.
+        "qlog_uids": sorted(QLOG_WANT["uids"]),
+        "qlog_ips": sorted(QLOG_WANT["ips"]),
+        "self": [CFG.get("SELF_IP")] if (CFG or {}).get("SELF_IP") else [],
     }
     text = json.dumps(state, sort_keys=True)
     try:
@@ -1086,6 +1095,69 @@ DOH_STATS_DIR = "/run/smartdns-doh-stats"
 DOH_PENDING = {"doh": {}, "dot": {}}
 
 
+# ---------------------------------------------------------------- DNS report
+# For a customer who switched on "keep my DNS for support" on their page: the
+# names their addresses ask, and where each answer sent them, for 24 hours.
+# Plain DNS is read off the wire by smartdns-watch, run here for as long as
+# anybody has it on; DoH and DoT come from smartdns-doh's counts. Kept here
+# as {key: {(name, verdict): [first, last, hits]}} until delivered.
+QLOG = {"proc": None, "targets": frozenset(), "pending": {}, "unsent": {},
+        "lock": threading.Lock()}
+
+
+def qlog_add(key, name, verdict, first, last=None, hits=1):
+    with QLOG["lock"]:
+        per = QLOG["pending"].setdefault(key, {})
+        e = per.get((name, verdict))
+        if e:
+            e[0], e[1], e[2] = min(e[0], first), max(e[1], last or first), e[2] + hits
+        elif len(per) < 3000:
+            per[(name, verdict)] = [first, last or first, hits]
+
+
+def qlog_reader(proc):
+    for line in proc.stdout:
+        try:
+            d = json.loads(line)
+            qlog_add(str(d["ip"]), str(d["name"])[:253], str(d["v"])[:60], int(d["t"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+
+
+def qlog_watch(ips):
+    """Keep smartdns-watch running for exactly these addresses."""
+    want = frozenset(i for i in ips or () if re.fullmatch(r"[0-9.]{7,15}", str(i)))
+    proc = QLOG["proc"]
+    if want == QLOG["targets"] and (not want or (proc and proc.poll() is None)):
+        return
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    QLOG["proc"], QLOG["targets"] = None, want
+    if want and os.path.exists(WATCH):
+        proc = subprocess.Popen([WATCH, "--json"] + sorted(want), stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        QLOG["proc"] = proc
+        threading.Thread(target=qlog_reader, args=(proc,), daemon=True).start()
+        log(INFO, "keeping the DNS report for %d address(es)" % len(want))
+
+
+def take_qlog():
+    """What to send: last time's unsent plus what came since."""
+    with QLOG["lock"]:
+        for key, per in QLOG["pending"].items():
+            dest = QLOG["unsent"].setdefault(key, {})
+            for k, e in per.items():
+                d = dest.get(k)
+                dest[k] = ([min(d[0], e[0]), max(d[1], e[1]), d[2] + e[2]] if d else e)
+        QLOG["pending"] = {}
+        return {key: [[n, v, e[0], e[1], e[2]] for (n, v), e in per.items()]
+                for key, per in QLOG["unsent"].items() if per}
+
+
 def take_doh_stats():
     try:
         names = sorted(n for n in os.listdir(DOH_STATS_DIR) if n.endswith(".json"))
@@ -1099,6 +1171,10 @@ def take_doh_stats():
             for kind in ("doh", "dot"):
                 for key, count in (got.get(kind) or {}).items():
                     DOH_PENDING[kind][key] = DOH_PENDING[kind].get(key, 0) + int(count)
+            for key, per in (got.get("qlog") or {}).items():
+                for k, (first, last, hits) in per.items():
+                    name, _, v = k.partition("\t")
+                    qlog_add(str(key), name, v, int(first), int(last), int(hits))
         except (OSError, ValueError) as e:
             log(WARN, "DoH counts not read: %s" % e)
         try:
@@ -1198,6 +1274,9 @@ def sync_once():
     doh_stats = take_doh_stats()
     if doh_stats["doh"] or doh_stats["dot"]:
         payload["doh_stats"] = doh_stats
+    qlog = take_qlog()
+    if qlog:
+        payload["qlog"] = qlog
     if logs_due():
         payload["logs"] = recent_logs()
         payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
@@ -1211,6 +1290,16 @@ def sync_once():
     if "doh_stats" in payload:
         DOH_PENDING["doh"].clear()
         DOH_PENDING["dot"].clear()
+    if "qlog" in payload:
+        with QLOG["lock"]:
+            QLOG["unsent"] = {}
+    try:
+        report = answer.get("qlog") or {}
+        qlog_watch(report.get("ips") or [])
+        QLOG_WANT.update(uids=[str(u) for u in report.get("uids") or []],
+                         ips=list(report.get("ips") or []))
+    except Exception as e:
+        log(WARN, "DNS report not kept: %s" % e)
     # Delivered: the panel has it, so it is not sent again.
     if finished and WATCH_DONE["result"] is finished:
         WATCH_DONE["result"] = None
@@ -1472,6 +1561,11 @@ svg.chart .axis{fill:var(--muted);font-size:13px;font-family:inherit}
 table.tbl{width:calc(100% - 32px);margin:0 16px 14px;border-collapse:collapse;font-size:12px}
 table.tbl th,table.tbl td{padding:6px 4px;border-bottom:1px solid var(--row);text-align:right}
 table.tbl th{color:var(--muted);font-weight:400}
+.qlog{margin:0 16px 14px}
+.qlog div{padding:7px 0;border-bottom:1px solid var(--row)}
+.qlog code{display:block;background:none;padding:0;font-size:12px;color:var(--fg);
+ word-break:break-all;text-align:left}
+.qlog small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
 .ping{padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);
  font-size:13px}
 .brand{text-align:center;margin:0 0 18px;direction:ltr;line-height:1.15}
@@ -2035,6 +2129,76 @@ def dns_check(info):
             "یا DNS را روی مودم یا کنسول نگذاشته‌اید، یا اپراتور اینترنتتان DNS را "
             "می‌رباید. در این صورت از «DNS رمزگذاری‌شده» پایین همین صفحه استفاده "
             "کنید.</div>" % (" (آخرین: %s)" % ago(plain) if plain is not None else ""))
+
+
+# How the report says where a name went, and why.
+QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
+                "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
+                "no address": "بدون آدرس"}
+QLOG_REASON = {"routed": "در قالب شما از رله می‌رود",
+               "unticked": "در قالب شما از رله نمی‌رود",
+               "bypass": "در قالب شما از رله نمی‌رود",
+               "outside": "در فهرست سرویس‌ها نیست"}
+
+
+def qlog_verdict(v):
+    if v.startswith("direct"):
+        return "↪ مستقیم " + html.escape(v[7:])
+    if v.startswith("refused"):
+        return "رد شد"
+    return html.escape(QLOG_VERDICT.get(v, v))
+
+
+def qlog_reason(r):
+    kind, _, svc = (r or "").partition(":")
+    text = QLOG_REASON.get(kind, "")
+    return html.escape(("%s — %s" % (svc, text)) if svc else text)
+
+
+def qlog_table(rows, limit=150):
+    """One line per name, what happened under it: a phone's width has no
+    room for five columns."""
+    out = ["<div class='qlog'>"]
+    for r in rows[:limit]:
+        last = seconds_since(r.get("last_at"))
+        out.append("<div><code dir='ltr'>%s</code><small>%s · %s · %d بار%s</small></div>"
+                   % (html.escape(r["name"]), qlog_verdict(r["verdict"]),
+                      qlog_reason(r.get("reason")), int(r.get("hits") or 0),
+                      " · " + ago(last) if last is not None else ""))
+    out.append("</div>")
+    return "".join(out)
+
+
+def qlog_box(info):
+    """The customer's switch for keeping their DNS for support, and what it
+    has kept. Their own page; the operator sees the same on theirs."""
+    if not info.get("ip"):
+        return ""
+    on = bool(info.get("qlog_until"))
+    rows = info.get("qlog") or []
+    left = ""
+    if on:
+        until = (datetime.fromisoformat(info["qlog_until"]) - datetime.now(timezone.utc))
+        left = " — %d ساعت دیگر خودش خاموش می‌شود" % max(1, int(until.total_seconds() // 3600))
+    body = ["<details class='pw'%s><summary>🔎 گزارش DNS برای پشتیبانی%s</summary>"
+            % (" open" if on else "", " (روشن)" if on else ""),
+            "<p class='note'>وقتی سرویسی باز نمی‌شود، این را روشن کنید و همان سرویس را "
+            "دوباره باز کنید: این‌جا می‌بینید دستگاه‌هایتان چه اسم‌هایی پرسیدند، هر کدام "
+            "از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا ۲۴ ساعت "
+            "نگه داشته می‌شود و خاموشش که کنید همان لحظه پاک می‌شود.</p>",
+            "<form method='post' action='/qlog' style='margin:0 16px 12px'>"
+            "<input type='hidden' name='on' value='%s'><button class='%s small'>%s</button>"
+            "</form>" % ("0" if on else "1", "ghost" if on else "",
+                         "خاموش کردن و پاک کردن" if on else "روشن کردن برای ۲۴ ساعت")]
+    if on:
+        body.append("<p class='note'>روشن است%s. جدول هر بار که صفحه را باز کنید تازه "
+                    "می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.</p>" % left)
+    if rows:
+        body.append(qlog_table(rows))
+    elif on:
+        body.append("<p class='note'>هنوز چیزی نرسیده.</p>")
+    body.append("</details>")
+    return "".join(body)
 
 
 def doh_url(info):
@@ -2789,6 +2953,14 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
             return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 
+        if path == "/qlog":
+            if not self.session():
+                return self.redirect("/login")
+            res = self.ask_panel("/user-qlog", {"on": self.form().get("on") == "1"})
+            if res is None:
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
         if path == "/doh-reset":
             if not self.session():
                 return self.redirect("/login")
@@ -3154,6 +3326,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
         body.append(dns_box())
         body.append(dns_check(info))
+        body.append(qlog_box(info))
 
         if not info["ip"]:
             body.append(

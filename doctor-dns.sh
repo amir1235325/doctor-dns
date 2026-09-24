@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.7.2"
+VERSION="0.7.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -3859,6 +3859,21 @@ exit 0
 #-- turned into a catalogue service here and dropped. So what survives says
 #-- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
 #-- after thirty days not even that. Only the customer is shown it.
+#-- The DNS report a customer switched on for support: which names their
+#-- devices asked, where the answer sent them and why, for 24 hours from the
+#-- last time each was asked. Nothing is kept for anybody who did not ask.
+#CREATE TABLE IF NOT EXISTS query_log (
+#    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    name     TEXT NOT NULL,
+#    verdict  TEXT NOT NULL,
+#    reason   TEXT NOT NULL DEFAULT '',
+#    via      TEXT NOT NULL DEFAULT 'dns',
+#    first_at TEXT NOT NULL,
+#    last_at  TEXT NOT NULL,
+#    hits     INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (user_id, name, verdict)
+#);
+#
 #-- DoH and DoT, per day: how many queries of each, and who used them at all -
 #-- for the admin panel's figures. Counts only; nothing of what was asked.
 #CREATE TABLE IF NOT EXISTS doh_daily (
@@ -4117,6 +4132,8 @@ exit 0
 #    ("ips", "dns_seen_at", "TEXT"),
 #    # When this account last used DoH or DoT.
 #    ("users", "doh_seen_at", "TEXT"),
+#    # Until when the customer wants their DNS kept for support; NULL is off.
+#    ("users", "qlog_until", "TEXT"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -5660,6 +5677,111 @@ exit 0
 #            store.run("UPDATE users SET doh_seen_at = ? WHERE id = ?", (now(), uid))
 #
 #
+## ----------------------------------------------------------------- DNS report
+#QLOG_HOURS = 24
+#QLOG_MAX = 2000         # rows kept per customer; the oldest go first
+#
+#
+#def qlog_on(store, user_id, on):
+#    """Switch a customer's DNS report on for 24 hours, or off - which also
+#    throws away what was kept, at once."""
+#    if on:
+#        until = (datetime.now(timezone.utc) + timedelta(hours=QLOG_HOURS)
+#                 ).isoformat(timespec="seconds")
+#        store.run("UPDATE users SET qlog_until = ? WHERE id = ?", (until, user_id))
+#        return until
+#    store.run("UPDATE users SET qlog_until = NULL WHERE id = ?", (user_id,))
+#    store.run("DELETE FROM query_log WHERE user_id = ?", (user_id,))
+#    return None
+#
+#
+#def qlog_wanted(store):
+#    """Who the relays should keep the report for: addresses and accounts."""
+#    rows = store.q("SELECT id FROM users WHERE qlog_until > ?", (now(),))
+#    uids = [r["id"] for r in rows]
+#    ips = [r["ip"] for r in store.q(
+#        "SELECT i.ip FROM ips i JOIN users u ON u.id = i.user_id WHERE u.qlog_until > ?",
+#        (now(),))]
+#    return {"uids": uids, "ips": ips}
+#
+#
+#def qlog_reasoner(store, user, catalogue):
+#    """Why a name went where it did, for this customer's template: routed by
+#    it, un-ticked in it, left direct on purpose, or not ours at all."""
+#    tid = user["template_id"] or DEFAULT_TEMPLATE[0]
+#    routed = set(store.routed_for(tid, catalogue)) if tid else set()
+#    bypass = set(store.bypass_for(tid, catalogue)) if tid else set()
+#    index = service_index(catalogue)
+#    label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
+#    custom = set(store.custom_domains())
+#
+#    def reason(name):
+#        parts = name.lower().rstrip(".").split(".")
+#        tails = [".".join(parts[i:]) for i in range(len(parts) - 1)]
+#        if any(t in custom for t in tails):
+#            return "routed:دامنه‌های دلخواه ادمین"
+#        for t in tails:                     # the longest rule wins, as in dnsmasq
+#            if t in bypass:
+#                return "bypass:" + label.get(index.get(t, ""), "")
+#            if t in routed:
+#                return "routed:" + label.get(index.get(t, ""), "")
+#        for t in tails:
+#            if t in index:
+#                return "unticked:" + label.get(index[t], "")
+#        return "outside:"
+#    return reason
+#
+#
+#def record_qlog(store, report, catalogue):
+#    """A relay's report: {ip | "doh:uid" | "dot:ip": [[name, verdict, first,
+#    last, hits], ...]}. Only for customers who have it on right now."""
+#    if not isinstance(report, dict):
+#        return
+#    reasons = {}
+#    for key, entries in list(report.items())[:500]:
+#        key = str(key)
+#        via = "dns"
+#        if key.startswith("doh:"):
+#            via, uid = "doh", key[4:]
+#            user = store.one("SELECT * FROM users WHERE id = ?",
+#                             (int(uid) if uid.isdigit() else 0,))
+#        else:
+#            if key.startswith("dot:"):
+#                via, key = "dot", key[4:]
+#            user = store.one("SELECT u.* FROM users u JOIN ips i ON i.user_id = u.id"
+#                             " WHERE i.ip = ?", (key,))
+#        if not user or not user["qlog_until"] or user["qlog_until"] <= now():
+#            continue
+#        if user["id"] not in reasons:
+#            reasons[user["id"]] = qlog_reasoner(store, user, catalogue)
+#        reason = reasons[user["id"]]
+#        for e in (entries if isinstance(entries, list) else [])[:3000]:
+#            try:
+#                name, verdict, first, last, hits = str(e[0])[:253], str(e[1])[:60], \
+#                    int(e[2]), int(e[3]), int(e[4])
+#            except (IndexError, TypeError, ValueError):
+#                continue
+#            first = datetime.fromtimestamp(first, timezone.utc).isoformat(timespec="seconds")
+#            last = datetime.fromtimestamp(last, timezone.utc).isoformat(timespec="seconds")
+#            store.run("INSERT INTO query_log (user_id, name, verdict, reason, via, first_at,"
+#                      " last_at, hits) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+#                      " ON CONFLICT(user_id, name, verdict) DO UPDATE SET"
+#                      " last_at = max(last_at, excluded.last_at), hits = hits + excluded.hits,"
+#                      " via = excluded.via, reason = excluded.reason",
+#                      (user["id"], name, verdict, reason(name), via, first, last, hits))
+#        over = store.one("SELECT count(*) c FROM query_log WHERE user_id = ?",
+#                         (user["id"],))["c"] - QLOG_MAX
+#        if over > 0:
+#            store.run("DELETE FROM query_log WHERE rowid IN (SELECT rowid FROM query_log"
+#                      " WHERE user_id = ? ORDER BY last_at LIMIT ?)", (user["id"], over))
+#
+#
+#def qlog_rows(store, user_id, limit=150):
+#    return [dict(r) for r in store.q(
+#        "SELECT name, verdict, reason, via, first_at, last_at, hits FROM query_log"
+#        " WHERE user_id = ? ORDER BY last_at DESC, name LIMIT ?", (user_id, limit))]
+#
+#
 #def new_doh_token(store, user):
 #    """A fresh personal address; the old one stops at the relay's next sync."""
 #    token = secrets.token_urlsafe(16)
@@ -5677,6 +5799,11 @@ exit 0
 #    store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
 #    cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
 #    store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
+#    # The DNS report: 24 hours from the last time a name was asked, and the
+#    # switch goes off by itself when its time is up.
+#    store.run("DELETE FROM query_log WHERE last_at < ?",
+#              ((now_t - timedelta(hours=QLOG_HOURS)).isoformat(timespec="seconds"),))
+#    store.run("UPDATE users SET qlog_until = NULL WHERE qlog_until <= ?", (now(),))
 #    store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 #
 #
@@ -6882,6 +7009,10 @@ exit 0
 #                record_doh(self.store, body.get("doh_stats"))
 #            except Exception as e:
 #                log_exception("DNS counts not recorded: %r" % e)
+#            try:
+#                record_qlog(self.store, body.get("qlog"), CATALOGUE)
+#            except Exception as e:
+#                log_exception("DNS report not recorded: %r" % e)
 #            # The relay's own recent logs, now and then, for the logs page.
 #            if isinstance(body.get("logs"), str):
 #                tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
@@ -6958,6 +7089,8 @@ exit 0
 #                                    # the relay checks them before it takes them.
 #                                    "upstream": (self.store.setting("dns_upstream")
 #                                                 or DEFAULT_UPSTREAM).split(),
+#                                    # Whose DNS to keep for the support report.
+#                                    "qlog": qlog_wanted(self.store),
 #                                    "templates": self.store.template_names(),
 #                                    "watch": watch_job(self.store),
 #                                    })
@@ -6991,6 +7124,15 @@ exit 0
 #            view = usage_view(self.store, user, CATALOGUE)
 #            view["ok"] = True
 #            return self.reply(200, view)
+#        if self.path == "/user-qlog":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            on = bool(body.get("on"))
+#            qlog_on(self.store, user["id"], on)
+#            return self.reply(200, {"ok": True, "message": (
+#                "گزارش DNS روشن شد؛ تا ۲۴ ساعت نگه داشته می‌شود" if on else
+#                "گزارش DNS خاموش و پاک شد")})
 #        if self.path == "/user-doh-reset":
 #            user = self._session_user(body.get("session"))
 #            if not user:
@@ -7312,6 +7454,12 @@ exit 0
 #            "dns_seen_at": ips[0]["dns_seen_at"] if ips else None,
 #            "ip_added_at": ips[0]["added_at"] if ips else None,
 #            "doh_seen_at": user["doh_seen_at"],
+#            # The DNS report, and what it holds, while it is on.
+#            "qlog_until": user["qlog_until"] if (user["qlog_until"] or "") > now() else None,
+#            "qlog": (qlog_rows(self.store, user["id"])
+#                     if (user["qlog_until"] or "") > now()
+#                     or self.store.one("SELECT 1 FROM query_log WHERE user_id = ? LIMIT 1",
+#                                       (user["id"],)) else []),
 #        }
 #
 #
@@ -9160,6 +9308,10 @@ exit 0
 #MAIN_DNS_PORT = 53
 #
 #
+## Who asked for the DNS report, for smartdns-doh's part of it.
+#QLOG_WANT = {"uids": [], "ips": []}
+#
+#
 #def write_doh_state(tokens, ports, assignment, allowed):
 #    ips = {ip: ports[prof] for ip, prof in assignment.items() if prof in ports}
 #    state = {
@@ -9171,6 +9323,11 @@ exit 0
 #        "ips": ips,
 #        "allowed": sorted(allowed),
 #        "enforcing": os.path.exists(ENFORCE_FILE),
+#        # The DNS report: whose encrypted queries to keep, and this relay's
+#        # own address, which is what "via relay" means.
+#        "qlog_uids": sorted(QLOG_WANT["uids"]),
+#        "qlog_ips": sorted(QLOG_WANT["ips"]),
+#        "self": [CFG.get("SELF_IP")] if (CFG or {}).get("SELF_IP") else [],
 #    }
 #    text = json.dumps(state, sort_keys=True)
 #    try:
@@ -9326,6 +9483,69 @@ exit 0
 #DOH_PENDING = {"doh": {}, "dot": {}}
 #
 #
+## ---------------------------------------------------------------- DNS report
+## For a customer who switched on "keep my DNS for support" on their page: the
+## names their addresses ask, and where each answer sent them, for 24 hours.
+## Plain DNS is read off the wire by smartdns-watch, run here for as long as
+## anybody has it on; DoH and DoT come from smartdns-doh's counts. Kept here
+## as {key: {(name, verdict): [first, last, hits]}} until delivered.
+#QLOG = {"proc": None, "targets": frozenset(), "pending": {}, "unsent": {},
+#        "lock": threading.Lock()}
+#
+#
+#def qlog_add(key, name, verdict, first, last=None, hits=1):
+#    with QLOG["lock"]:
+#        per = QLOG["pending"].setdefault(key, {})
+#        e = per.get((name, verdict))
+#        if e:
+#            e[0], e[1], e[2] = min(e[0], first), max(e[1], last or first), e[2] + hits
+#        elif len(per) < 3000:
+#            per[(name, verdict)] = [first, last or first, hits]
+#
+#
+#def qlog_reader(proc):
+#    for line in proc.stdout:
+#        try:
+#            d = json.loads(line)
+#            qlog_add(str(d["ip"]), str(d["name"])[:253], str(d["v"])[:60], int(d["t"]))
+#        except (ValueError, KeyError, TypeError):
+#            continue
+#
+#
+#def qlog_watch(ips):
+#    """Keep smartdns-watch running for exactly these addresses."""
+#    want = frozenset(i for i in ips or () if re.fullmatch(r"[0-9.]{7,15}", str(i)))
+#    proc = QLOG["proc"]
+#    if want == QLOG["targets"] and (not want or (proc and proc.poll() is None)):
+#        return
+#    if proc and proc.poll() is None:
+#        proc.terminate()
+#        try:
+#            proc.wait(5)
+#        except subprocess.TimeoutExpired:
+#            proc.kill()
+#    QLOG["proc"], QLOG["targets"] = None, want
+#    if want and os.path.exists(WATCH):
+#        proc = subprocess.Popen([WATCH, "--json"] + sorted(want), stdout=subprocess.PIPE,
+#                                stderr=subprocess.DEVNULL, text=True)
+#        QLOG["proc"] = proc
+#        threading.Thread(target=qlog_reader, args=(proc,), daemon=True).start()
+#        log(INFO, "keeping the DNS report for %d address(es)" % len(want))
+#
+#
+#def take_qlog():
+#    """What to send: last time's unsent plus what came since."""
+#    with QLOG["lock"]:
+#        for key, per in QLOG["pending"].items():
+#            dest = QLOG["unsent"].setdefault(key, {})
+#            for k, e in per.items():
+#                d = dest.get(k)
+#                dest[k] = ([min(d[0], e[0]), max(d[1], e[1]), d[2] + e[2]] if d else e)
+#        QLOG["pending"] = {}
+#        return {key: [[n, v, e[0], e[1], e[2]] for (n, v), e in per.items()]
+#                for key, per in QLOG["unsent"].items() if per}
+#
+#
 #def take_doh_stats():
 #    try:
 #        names = sorted(n for n in os.listdir(DOH_STATS_DIR) if n.endswith(".json"))
@@ -9339,6 +9559,10 @@ exit 0
 #            for kind in ("doh", "dot"):
 #                for key, count in (got.get(kind) or {}).items():
 #                    DOH_PENDING[kind][key] = DOH_PENDING[kind].get(key, 0) + int(count)
+#            for key, per in (got.get("qlog") or {}).items():
+#                for k, (first, last, hits) in per.items():
+#                    name, _, v = k.partition("\t")
+#                    qlog_add(str(key), name, v, int(first), int(last), int(hits))
 #        except (OSError, ValueError) as e:
 #            log(WARN, "DoH counts not read: %s" % e)
 #        try:
@@ -9438,6 +9662,9 @@ exit 0
 #    doh_stats = take_doh_stats()
 #    if doh_stats["doh"] or doh_stats["dot"]:
 #        payload["doh_stats"] = doh_stats
+#    qlog = take_qlog()
+#    if qlog:
+#        payload["qlog"] = qlog
 #    if logs_due():
 #        payload["logs"] = recent_logs()
 #        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
@@ -9451,6 +9678,16 @@ exit 0
 #    if "doh_stats" in payload:
 #        DOH_PENDING["doh"].clear()
 #        DOH_PENDING["dot"].clear()
+#    if "qlog" in payload:
+#        with QLOG["lock"]:
+#            QLOG["unsent"] = {}
+#    try:
+#        report = answer.get("qlog") or {}
+#        qlog_watch(report.get("ips") or [])
+#        QLOG_WANT.update(uids=[str(u) for u in report.get("uids") or []],
+#                         ips=list(report.get("ips") or []))
+#    except Exception as e:
+#        log(WARN, "DNS report not kept: %s" % e)
 #    # Delivered: the panel has it, so it is not sent again.
 #    if finished and WATCH_DONE["result"] is finished:
 #        WATCH_DONE["result"] = None
@@ -9712,6 +9949,11 @@ exit 0
 #table.tbl{width:calc(100% - 32px);margin:0 16px 14px;border-collapse:collapse;font-size:12px}
 #table.tbl th,table.tbl td{padding:6px 4px;border-bottom:1px solid var(--row);text-align:right}
 #table.tbl th{color:var(--muted);font-weight:400}
+#.qlog{margin:0 16px 14px}
+#.qlog div{padding:7px 0;border-bottom:1px solid var(--row)}
+#.qlog code{display:block;background:none;padding:0;font-size:12px;color:var(--fg);
+# word-break:break-all;text-align:left}
+#.qlog small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
 #.ping{padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);
 # font-size:13px}
 #.brand{text-align:center;margin:0 0 18px;direction:ltr;line-height:1.15}
@@ -10275,6 +10517,76 @@ exit 0
 #            "یا DNS را روی مودم یا کنسول نگذاشته‌اید، یا اپراتور اینترنتتان DNS را "
 #            "می‌رباید. در این صورت از «DNS رمزگذاری‌شده» پایین همین صفحه استفاده "
 #            "کنید.</div>" % (" (آخرین: %s)" % ago(plain) if plain is not None else ""))
+#
+#
+## How the report says where a name went, and why.
+#QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
+#                "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
+#                "no address": "بدون آدرس"}
+#QLOG_REASON = {"routed": "در قالب شما از رله می‌رود",
+#               "unticked": "در قالب شما از رله نمی‌رود",
+#               "bypass": "در قالب شما از رله نمی‌رود",
+#               "outside": "در فهرست سرویس‌ها نیست"}
+#
+#
+#def qlog_verdict(v):
+#    if v.startswith("direct"):
+#        return "↪ مستقیم " + html.escape(v[7:])
+#    if v.startswith("refused"):
+#        return "رد شد"
+#    return html.escape(QLOG_VERDICT.get(v, v))
+#
+#
+#def qlog_reason(r):
+#    kind, _, svc = (r or "").partition(":")
+#    text = QLOG_REASON.get(kind, "")
+#    return html.escape(("%s — %s" % (svc, text)) if svc else text)
+#
+#
+#def qlog_table(rows, limit=150):
+#    """One line per name, what happened under it: a phone's width has no
+#    room for five columns."""
+#    out = ["<div class='qlog'>"]
+#    for r in rows[:limit]:
+#        last = seconds_since(r.get("last_at"))
+#        out.append("<div><code dir='ltr'>%s</code><small>%s · %s · %d بار%s</small></div>"
+#                   % (html.escape(r["name"]), qlog_verdict(r["verdict"]),
+#                      qlog_reason(r.get("reason")), int(r.get("hits") or 0),
+#                      " · " + ago(last) if last is not None else ""))
+#    out.append("</div>")
+#    return "".join(out)
+#
+#
+#def qlog_box(info):
+#    """The customer's switch for keeping their DNS for support, and what it
+#    has kept. Their own page; the operator sees the same on theirs."""
+#    if not info.get("ip"):
+#        return ""
+#    on = bool(info.get("qlog_until"))
+#    rows = info.get("qlog") or []
+#    left = ""
+#    if on:
+#        until = (datetime.fromisoformat(info["qlog_until"]) - datetime.now(timezone.utc))
+#        left = " — %d ساعت دیگر خودش خاموش می‌شود" % max(1, int(until.total_seconds() // 3600))
+#    body = ["<details class='pw'%s><summary>🔎 گزارش DNS برای پشتیبانی%s</summary>"
+#            % (" open" if on else "", " (روشن)" if on else ""),
+#            "<p class='note'>وقتی سرویسی باز نمی‌شود، این را روشن کنید و همان سرویس را "
+#            "دوباره باز کنید: این‌جا می‌بینید دستگاه‌هایتان چه اسم‌هایی پرسیدند، هر کدام "
+#            "از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا ۲۴ ساعت "
+#            "نگه داشته می‌شود و خاموشش که کنید همان لحظه پاک می‌شود.</p>",
+#            "<form method='post' action='/qlog' style='margin:0 16px 12px'>"
+#            "<input type='hidden' name='on' value='%s'><button class='%s small'>%s</button>"
+#            "</form>" % ("0" if on else "1", "ghost" if on else "",
+#                         "خاموش کردن و پاک کردن" if on else "روشن کردن برای ۲۴ ساعت")]
+#    if on:
+#        body.append("<p class='note'>روشن است%s. جدول هر بار که صفحه را باز کنید تازه "
+#                    "می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.</p>" % left)
+#    if rows:
+#        body.append(qlog_table(rows))
+#    elif on:
+#        body.append("<p class='note'>هنوز چیزی نرسیده.</p>")
+#    body.append("</details>")
+#    return "".join(body)
 #
 #
 #def doh_url(info):
@@ -11029,6 +11341,14 @@ exit 0
 #                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
 #            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 #
+#        if path == "/qlog":
+#            if not self.session():
+#                return self.redirect("/login")
+#            res = self.ask_panel("/user-qlog", {"on": self.form().get("on") == "1"})
+#            if res is None:
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
 #        if path == "/doh-reset":
 #            if not self.session():
 #                return self.redirect("/login")
@@ -11394,6 +11714,7 @@ exit 0
 #        body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
 #        body.append(dns_box())
 #        body.append(dns_check(info))
+#        body.append(qlog_box(info))
 #
 #        if not info["ip"]:
 #            body.append(
@@ -11720,6 +12041,16 @@ exit 0
 #    def port_for(self, ip):
 #        return int((self.current().get("ips") or {}).get(ip) or MAIN_PORT)
 #
+#    def logging(self, kind, key):
+#        """Whether this customer asked for their queries to be kept for
+#        support: DoH by account, DoT by address."""
+#        data = self.current()
+#        return str(key) in set(map(str, data.get("qlog_uids" if kind == "doh" else "qlog_ips")
+#                                   or ()))
+#
+#    def self_ips(self):
+#        return set(self.current().get("self") or ())
+#
 #    def is_allowed(self, ip):
 #        data = self.current()
 #        if not data.get("enforcing", True):
@@ -11771,16 +12102,31 @@ exit 0
 #    def __init__(self):
 #        self.lock = threading.Lock()
 #        self.doh, self.dot = {}, {}
+#        # For the customers who asked for it, and only them: which names,
+#        # and where each answer sent them. {key: {"name\tverdict": [first,
+#        # last, hits]}}, handed over like the counts.
+#        self.qlog = {}
 #
 #    def count(self, kind, key):
 #        with self.lock:
 #            table = self.doh if kind == "doh" else self.dot
 #            table[key] = table.get(key, 0) + 1
 #
+#    def note(self, key, name, verdict):
+#        now = int(time.time())
+#        with self.lock:
+#            per = self.qlog.setdefault(key, {})
+#            k = name + "\t" + verdict
+#            if k in per:
+#                per[k][1] = now
+#                per[k][2] += 1
+#            elif len(per) < 3000:
+#                per[k] = [now, now, 1]
+#
 #    def take(self):
 #        with self.lock:
-#            out = {"doh": self.doh, "dot": self.dot}
-#            self.doh, self.dot = {}, {}
+#            out = {"doh": self.doh, "dot": self.dot, "qlog": self.qlog}
+#            self.doh, self.dot, self.qlog = {}, {}, {}
 #        return out
 #
 #
@@ -11789,7 +12135,7 @@ exit 0
 #
 #def flush_stats(directory=STATS_DIR):
 #    got = STATS.take()
-#    if not got["doh"] and not got["dot"]:
+#    if not got["doh"] and not got["dot"] and not got["qlog"]:
 #        return
 #    os.makedirs(directory, exist_ok=True)
 #    name = os.path.join(directory, "%d-%d" % (time.time() * 1000, os.getpid()))
@@ -11805,6 +12151,76 @@ exit 0
 #            flush_stats()
 #        except OSError as e:
 #            log(WARN, "counts not written: %s" % e)
+#
+#
+## ---------------------------------------------------------------- the report
+## Where an answer sent the customer, in the words smartdns-watch uses for
+## plain DNS, so the support report reads the same whichever way they asked.
+#FILTERED = "10.10.34."
+#
+#
+#def question(msg):
+#    """(name, qtype) of a query, or None."""
+#    try:
+#        if len(msg) < 12 or struct.unpack("!H", msg[4:6])[0] != 1:
+#            return None
+#        labels, off = [], 12
+#        while True:
+#            n = msg[off]
+#            if n == 0:
+#                break
+#            if n & 0xC0:
+#                return None
+#            labels.append(msg[off + 1:off + 1 + n].decode("ascii", "replace"))
+#            off += 1 + n
+#        return ".".join(labels).lower(), struct.unpack("!H", msg[off + 1:off + 3])[0]
+#    except (IndexError, struct.error):
+#        return None
+#
+#
+#def skip_name(msg, off):
+#    while True:
+#        n = msg[off]
+#        if n & 0xC0 == 0xC0:
+#            return off + 2
+#        if n == 0:
+#            return off + 1
+#        off += 1 + n
+#
+#
+#def verdict(reply, relay):
+#    """via relay, direct 1.2.3.4, filtered in Iran, no such name..."""
+#    try:
+#        rcode = reply[3] & 0x0F
+#        if rcode == 3:
+#            return "no such name"
+#        if rcode:
+#            return "refused (rcode %d)" % rcode
+#        qd, an = struct.unpack("!HH", reply[4:8])
+#        off = 12
+#        for _ in range(qd):
+#            off = skip_name(reply, off) + 4
+#        addrs = []
+#        for _ in range(an):
+#            off = skip_name(reply, off)
+#            rtype, _, _, rdlen = struct.unpack("!HHIH", reply[off:off + 10])
+#            off += 10
+#            if rtype == 1 and rdlen == 4:
+#                addrs.append(socket.inet_ntoa(reply[off:off + 4]))
+#            off += rdlen
+#    except (IndexError, struct.error):
+#        return "no address"
+#    if any(a in relay for a in addrs):
+#        return "via relay"
+#    if any(a.startswith(FILTERED) for a in addrs):
+#        return "filtered in Iran"
+#    return ("direct " + addrs[0]) if addrs else "no address"
+#
+#
+#def keep_for_report(key, query, reply, state):
+#    q = question(query)
+#    if q and q[1] == 1 and q[0]:      # A only, as smartdns-watch shows
+#        STATS.note(key, q[0], verdict(reply, state.self_ips()))
 #
 #
 ## ---------------------------------------------------------------- resolving
@@ -11942,6 +12358,8 @@ exit 0
 #        except (OSError, ConnectionError) as e:
 #            log(WARN, "resolver on %d did not answer: %s" % (port, e))
 #            return self.fail(502, "the resolver did not answer")
+#        if uid != "0" and state.logging("doh", uid):
+#            keep_for_report("doh:" + uid, query, reply, state)
 #        self.send_response(200)
 #        self.send_header("Content-Type", "application/dns-message")
 #        self.send_header("Content-Length", str(len(reply)))
@@ -11993,6 +12411,8 @@ exit 0
 #                if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
 #                    STATS.count("dot", ip)
 #                    reply = ask(query, port)
+#                    if state.logging("dot", ip):
+#                        keep_for_report("dot:" + ip, query, reply, state)
 #                else:
 #                    reply = refused(query)
 #                sock.sendall(struct.pack("!H", len(reply)) + reply)
@@ -12827,6 +13247,54 @@ exit 0
 #    return "".join(out)
 #
 #
+#
+#
+#QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
+#                "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
+#                "no address": "بدون آدرس"}
+#QLOG_REASON = {"routed": "در قالبش از رله می‌رود",
+#               "unticked": "در قالبش از رله نمی‌رود",
+#               "bypass": "در قالبش از رله نمی‌رود",
+#               "outside": "در فهرست سرویس‌ها نیست"}
+#
+#
+#def qlog_card(user):
+#    """The customer's DNS report, when they switched it on for support."""
+#    try:
+#        rows = STORE.q("SELECT name, verdict, reason, via, last_at, hits FROM query_log"
+#                       " WHERE user_id = ? ORDER BY last_at DESC, name LIMIT 400",
+#                       (user["id"],))
+#    except sqlite3.OperationalError:
+#        return ""
+#    on = bool(user["qlog_until"]) and user["qlog_until"] > now() \
+#        if "qlog_until" in user.keys() else False
+#    if not rows and not on:
+#        return ("<div class='card'><h2>گزارش DNS</h2><p class='muted'>خاموش است. اگر "
+#                "مشتری مشکلی دارد، از او بخواهید در پنل خودش «گزارش DNS برای "
+#                "پشتیبانی» را روشن کند و همان سرویس را دوباره باز کند؛ بعد این‌جا دیده "
+#                "می‌شود. زنده دیدن در همان لحظه: <code>smartdns-watch</code> روی رله."
+#                "</p></div>")
+#    out = ["<div class='card'><h2>گزارش DNS — %s</h2>" % (
+#        "روشن تا %s" % user["qlog_until"][:16].replace("T", " ") if on else "خاموش"),
+#        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم ۲۴ ساعت بعد از آخرین بار پاک "
+#        "می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا "
+#        "اسم در فهرست نیست.</p>",
+#        "<table><tr><th>اسم</th><th>کجا رفت</th><th>چرا</th><th>راه</th><th>بار</th>"
+#        "<th>آخرین (UTC)</th></tr>"]
+#    for r in rows:
+#        v = r["verdict"]
+#        verdict = ("↪ مستقیم " + html.escape(v[7:])) if v.startswith("direct") else \
+#            ("رد شد" if v.startswith("refused") else html.escape(QLOG_VERDICT.get(v, v)))
+#        kind, _, svc = (r["reason"] or "").partition(":")
+#        why = QLOG_REASON.get(kind, "")
+#        out.append("<tr><td dir='ltr'><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td>"
+#                   "<td>%d</td><td>%s</td></tr>"
+#                   % (html.escape(r["name"]), verdict,
+#                      html.escape(("%s — %s" % (svc, why)) if svc else why),
+#                      {"dns": "DNS", "doh": "DoH", "dot": "DoT"}.get(r["via"], r["via"]),
+#                      r["hits"], r["last_at"][11:16]))
+#    out.append("</table></div>")
+#    return "".join(out)
 #
 #
 #def doh_card():
@@ -14929,6 +15397,7 @@ exit 0
 #                   % (legend(), speed_chart(view["five"])))
 #        out.append("<div class='card'><h2>ساعت‌های پرمصرف — ۷ روز اخیر</h2>%s</div>"
 #                   % heat_chart(view["hours"]))
+#        out.append(qlog_card(user))
 #        table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
 #                        % (d.strftime("%Y-%m-%d"), human(dn), human(u))
 #                        for d, u, dn in reversed(rows) if u or dn)
@@ -17606,6 +18075,9 @@ exit 0
 #       smartdns-watch ali           one customer, by username
 #       smartdns-watch u12           ...or by the label smartdns-acl list shows
 #       smartdns-watch 5.200.12.34   ...or by address
+#       smartdns-watch --json IP...  every answer to these addresses, a JSON
+#                                    line each - how smartdns-sync keeps a
+#                                    customer's report for support
 #
 #For finding what a service needs routed: have the customer open it until it
 #fails, and watch. "via relay" is already routed. "direct" went around the
@@ -17744,7 +18216,9 @@ exit 0
 #    hands out a different address every few seconds, which is not news.
 #    """
 #
-#    def __init__(self, relay_ips, who, targets=None, out=None, clock=time.time):
+#    def __init__(self, relay_ips, who, targets=None, out=None, clock=time.time,
+#                 as_json=False):
+#        self.as_json = as_json
 #        self.local = set(relay_ips)
 #        self.who = who
 #        self.targets = targets
@@ -17800,6 +18274,12 @@ exit 0
 #                self.report(key[0], name, "no answer")
 #
 #    def report(self, client, name, verdict):
+#        if self.as_json:
+#            # Every answer, not only the changes: the one keeping the report
+#            # counts them, and a name asked again is news to it.
+#            self.out(json.dumps({"t": int(self.clock()), "ip": client,
+#                                 "name": name, "v": verdict}))
+#            return
 #        kind = "direct" if verdict.startswith("direct") else verdict
 #        if self.shown.get((client, name)) == kind:
 #            return
@@ -17904,7 +18384,17 @@ exit 0
 #    if argv and argv[0] in ("-h", "--help"):
 #        print(usage)
 #        return 0
-#    if len(argv) > 1 or (argv and argv[0].startswith("-")):
+#    as_json = bool(argv) and argv[0] == "--json"
+#    if as_json:
+#        argv = argv[1:]
+#        try:
+#            wanted = {str(ipaddress.IPv4Address(a)) for a in argv}
+#        except ValueError:
+#            wanted = set()
+#        if not wanted:
+#            print("--json takes one address or more", file=sys.stderr)
+#            return 2
+#    if not as_json and (len(argv) > 1 or (argv and argv[0].startswith("-"))):
 #        print(usage, file=sys.stderr)
 #        return 2
 #    if os.geteuid() != 0:
@@ -17918,7 +18408,9 @@ exit 0
 #    users, allowed = load_users()
 #    who = display(users)
 #    targets = None
-#    if argv:
+#    if as_json:
+#        targets = wanted
+#    elif argv:
 #        targets = resolve(argv[0], users)
 #        if not targets:
 #            print("no customer or address matches %r - the registered ones:  "
@@ -17933,14 +18425,17 @@ exit 0
 #        print("cannot watch the network here: %s" % e, file=sys.stderr)
 #        return 1
 #
-#    if targets:
+#    if as_json:
+#        pass
+#    elif targets:
 #        print("watching %s - ctrl-c to stop" % ", ".join(
 #            "%s (%s)" % (ip, who.get(ip, "not registered")) for ip in sorted(targets)))
 #    else:
 #        print("watching everybody - ctrl-c to stop")
-#    print("  via relay = already goes through the exit   direct = goes around it"
-#          "   filtered = blocked inside Iran\n", flush=True)
-#    for ip in sorted(targets or ()):
+#    if not as_json:
+#        print("  via relay = already goes through the exit   direct = goes around it"
+#              "   filtered = blocked inside Iran\n", flush=True)
+#    for ip in sorted(targets or ()) if not as_json else ():
 #        if ip not in allowed:
 #            print("  note: %s is not allowed on this relay, so its questions are "
 #                  "dropped - they will show as 'no answer'\n" % ip, flush=True)
@@ -17950,7 +18445,7 @@ exit 0
 #        raise KeyboardInterrupt
 #    signal.signal(signal.SIGTERM, stop)
 #
-#    w = Watcher(local_addresses(), who, targets)
+#    w = Watcher(local_addresses(), who, targets, as_json=as_json)
 #    sock.settimeout(0.5)
 #    try:
 #        while True:
@@ -17960,7 +18455,8 @@ exit 0
 #                pass
 #            w.tick()
 #    except KeyboardInterrupt:
-#        print("\n" + w.summary())
+#        if not as_json:
+#            print("\n" + w.summary())
 #    return 0
 #
 #
