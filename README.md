@@ -145,6 +145,13 @@ newest rows. `--version` prints what a file is without installing anything,
 and `ASSUME_YES=1` takes the default — yes for an upgrade, no for a
 downgrade — for anyone scripting it.
 
+Customers' receipts and ticket pictures are kept sealed, with a key in
+`/etc/smart-dns/db.key` on the exit — not in the database, so neither is a
+backup of it. **Keep that file** somewhere apart from your backups (the admin
+panel's settings page has a button to download it): restoring onto another
+machine needs it too, and without it the pictures do not come back, though
+everything else does.
+
 ### Requirements
 
 Two machines with Debian or Ubuntu and a public address each:

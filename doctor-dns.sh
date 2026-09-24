@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.7.1"
+VERSION="0.7.2"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -1611,6 +1611,13 @@ EOF
     payload SMARTDNS_API_GUARD > /usr/local/bin/smartdns-api-guard
     chmod +x /usr/local/bin/smartdns-api-guard
     install_payload PANEL_SERVICE /etc/systemd/system/smartdns-panel.service || true
+    # The key that seals customers' receipts and ticket pictures. Made here,
+    # as root: the panel's sandbox keeps /etc read-only. Never over a missing
+    # key while sealed pictures are in the database - that only warns. Not
+    # noted for uninstall: a database left behind is no use without it.
+    if /usr/local/bin/smartdns-panel --make-key; then :; else
+        warn "the pictures' sealing key is missing - see the admin panel's settings"
+    fi
     systemctl daemon-reload
     enable_service smartdns-panel.service
     systemctl restart smartdns-panel.service
@@ -4573,6 +4580,10 @@ exit 0
 #        self.db.row_factory = sqlite3.Row
 #        self.db.execute("PRAGMA foreign_keys = ON")
 #        self.db.execute("PRAGMA journal_mode = WAL")
+#        # What is deleted or overwritten is zeroed, not left in the file's
+#        # free pages: a receipt dropped after its decision, or a picture's
+#        # unsealed bytes once it is sealed, must not be readable from a copy.
+#        self.db.execute("PRAGMA secure_delete = ON")
 #        with self.lock:
 #            self.db.executescript(SCHEMA)
 #            relax_telegram_id(self.db, path)
@@ -5266,7 +5277,7 @@ exit 0
 #            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
 #            "  status, created_at, plan_id)"
 #            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?, ?)",
-#            (user["id"], amount, blob, kind,
+#            (user["id"], amount, seal(blob), kind,
 #             (body.get("note") or "").strip()[:200], now(),
 #             plan["id"] if plan else None))
 #        store.db.commit()
@@ -5300,6 +5311,210 @@ exit 0
 #    store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
 #              (user_id, ip, now()))
 #    return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+#
+#
+## ---------------------------------------------------------------- at rest
+## The pictures customers send - bank slips, and screenshots in tickets - are
+## kept sealed with AES-256-GCM, so a copied database or a backup that got
+## loose does not hand over somebody's bank slip. The key is a file of its own
+## beside the config, never in the database, so a backup is sealed too.
+##
+## AES comes from the OpenSSL this machine already has (Python's own ssl
+## module is built on it), called through ctypes: there is no pip step, and
+## the standard library has no cipher of its own.
+##
+## A sealed value starts with SEALED; anything else is from before sealing
+## and is read as it is - and sealed where it lies, at the panel's start.
+#KEY_FILE = "/etc/smart-dns/db.key"
+#SEALED = b"DDS1"
+#_NONCE, _TAG = 12, 16
+#_LIBCRYPTO = []
+#
+#
+#def libcrypto():
+#    """OpenSSL's libcrypto, loaded once; None when there is none to load."""
+#    if _LIBCRYPTO:
+#        return _LIBCRYPTO[0]
+#    import ctypes
+#    import ctypes.util
+#    import glob
+#    names = ["libcrypto.so.3", "libcrypto.so.1.1", ctypes.util.find_library("crypto")]
+#    if os.name == "nt":      # the tests, on Windows: Python's own copy
+#        names = glob.glob(os.path.join(sys.base_prefix, "DLLs", "libcrypto-*.dll")) + names
+#    lib = None
+#    for name in names:
+#        if not name:
+#            continue
+#        try:
+#            lib = ctypes.CDLL(name)
+#            lib.EVP_aes_256_gcm
+#            break
+#        except (OSError, AttributeError):
+#            lib = None
+#    if lib is not None:
+#        p, i, c = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p
+#        lib.EVP_CIPHER_CTX_new.restype = p
+#        lib.EVP_CIPHER_CTX_free.argtypes = [p]
+#        lib.EVP_aes_256_gcm.restype = p
+#        for f in ("EVP_EncryptInit_ex", "EVP_DecryptInit_ex"):
+#            getattr(lib, f).argtypes = [p, p, p, c, c]
+#        for f in ("EVP_EncryptUpdate", "EVP_DecryptUpdate"):
+#            getattr(lib, f).argtypes = [p, c, ctypes.POINTER(i), c, i]
+#        for f in ("EVP_EncryptFinal_ex", "EVP_DecryptFinal_ex"):
+#            getattr(lib, f).argtypes = [p, c, ctypes.POINTER(i)]
+#        lib.EVP_CIPHER_CTX_ctrl.argtypes = [p, i, i, p]
+#    _LIBCRYPTO.append(lib)
+#    return lib
+#
+#
+#def _gcm(encrypt, key, nonce, data, tag=None):
+#    import ctypes
+#    lib = libcrypto()
+#    if lib is None:
+#        raise RuntimeError("no libcrypto on this machine")
+#    ctx = lib.EVP_CIPHER_CTX_new()
+#    try:
+#        init = lib.EVP_EncryptInit_ex if encrypt else lib.EVP_DecryptInit_ex
+#        if init(ctx, lib.EVP_aes_256_gcm(), None, key, nonce) != 1:
+#            raise RuntimeError("cipher did not start")
+#        out = ctypes.create_string_buffer(len(data) + 16)
+#        n = ctypes.c_int(0)
+#        update = lib.EVP_EncryptUpdate if encrypt else lib.EVP_DecryptUpdate
+#        if update(ctx, out, ctypes.byref(n), data, len(data)) != 1:
+#            raise RuntimeError("cipher failed")
+#        body = out.raw[:n.value]
+#        if not encrypt:
+#            want = ctypes.create_string_buffer(tag, _TAG)
+#            lib.EVP_CIPHER_CTX_ctrl(ctx, 0x11, _TAG, ctypes.cast(want, ctypes.c_void_p))
+#        final = lib.EVP_EncryptFinal_ex if encrypt else lib.EVP_DecryptFinal_ex
+#        if final(ctx, out, ctypes.byref(n)) != 1:
+#            raise ValueError("does not open with this key")
+#        if encrypt:
+#            got = ctypes.create_string_buffer(_TAG)
+#            lib.EVP_CIPHER_CTX_ctrl(ctx, 0x10, _TAG, ctypes.cast(got, ctypes.c_void_p))
+#            return body, got.raw
+#        return body
+#    finally:
+#        lib.EVP_CIPHER_CTX_free(ctx)
+#
+#
+#def db_key(create=True):
+#    """The sealing key, made the first time it is needed.
+#
+#    Never made while something sealed is already in the database: that data
+#    was sealed with a key that is gone, and a new one would only look like
+#    it had come back. Then new pictures are kept unsealed, and the admin
+#    panel says the key is missing, until the old file is put back.
+#    """
+#    try:
+#        with open(KEY_FILE) as fh:
+#            key = bytes.fromhex(fh.read().strip())
+#        return key if len(key) == 32 else None
+#    except FileNotFoundError:
+#        pass
+#    except (OSError, ValueError):
+#        return None
+#    if not create or sealed_count() or libcrypto() is None:
+#        return None
+#    # Written whole under another name and then linked into place, which
+#    # fails if the file is there: the panel and the admin panel start
+#    # together, and the one that loses must never read a half-written key.
+#    tmp = "%s.%d.%s.tmp" % (KEY_FILE, os.getpid(), os.urandom(4).hex())
+#    try:
+#        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+#        with os.fdopen(fd, "w") as fh:
+#            fh.write(os.urandom(32).hex() + "\n")
+#        os.link(tmp, KEY_FILE)
+#    except FileExistsError:
+#        pass                              # the other panel made it first
+#    except OSError:
+#        return None
+#    finally:
+#        try:
+#            os.unlink(tmp)
+#        except OSError:
+#            pass
+#    return db_key(create=False)
+#
+#
+#def seal(data):
+#    """A picture as it is kept: sealed when there is a key, as it is when not."""
+#    if data is None:
+#        return None
+#    data = bytes(data)
+#    key = db_key()
+#    if key is None or data.startswith(SEALED):
+#        return data
+#    nonce = os.urandom(_NONCE)
+#    body, tag = _gcm(True, key, nonce, data)
+#    return SEALED + nonce + body + tag
+#
+#
+#def unseal(data):
+#    """A kept picture, readable again; None when it is sealed and cannot be
+#    opened here - no key, or another machine's."""
+#    if data is None:
+#        return None
+#    data = bytes(data)
+#    if not data.startswith(SEALED):
+#        return data
+#    key = db_key(create=False)
+#    if key is None:
+#        return None
+#    head = len(SEALED)
+#    try:
+#        return _gcm(False, key, data[head:head + _NONCE], data[head + _NONCE:-_TAG],
+#                    data[-_TAG:])
+#    except (ValueError, RuntimeError):
+#        return None
+#
+#
+## Whether anything in the database is sealed already - db_key() asks before
+## it makes a key. Set once the database is open.
+#SEALED_CHECK = []
+#
+#
+#def sealed_count():
+#    return SEALED_CHECK[0]() if SEALED_CHECK else 0
+#
+#
+#def count_sealed(db):
+#    """How many pictures in this database are sealed."""
+#    n = 0
+#    for table, col in SEALED_COLUMNS:
+#        try:
+#            n += db.execute("SELECT count(*) FROM %s WHERE substr(%s, 1, 4) = ?"
+#                            % (table, col), (SEALED,)).fetchone()[0]
+#        except Exception:
+#            pass
+#    return n
+#
+#
+## Where the pictures are kept.
+#SEALED_COLUMNS = (("transactions", "receipt_blob"), ("ticket_messages", "image_blob"))
+#
+#
+#def seal_existing(store):
+#    """Seal the pictures kept from before sealing, where they lie. Once, at
+#    start; afterwards everything is sealed as it is written."""
+#    if db_key() is None:
+#        return 0
+#    done = 0
+#    for table, col in SEALED_COLUMNS:
+#        rows = store.q("SELECT id FROM %s WHERE %s IS NOT NULL AND length(%s) > 0"
+#                       " AND substr(%s, 1, 4) != ?" % (table, col, col, col), (SEALED,))
+#        for r in rows:
+#            row = store.one("SELECT %s AS b FROM %s WHERE id = ?" % (col, table), (r["id"],))
+#            if row and row["b"] is not None:
+#                store.run("UPDATE %s SET %s = ? WHERE id = ?" % (table, col),
+#                          (seal(row["b"]), r["id"]))
+#                done += 1
+#    if done:
+#        # And off the write-ahead log too, which still held the pages as they
+#        # were before.
+#        store.q("PRAGMA wal_checkpoint(TRUNCATE)")
+#        print("sealed %d pictures kept from before" % done, flush=True)
+#    return done
 #
 #
 ## ----------------------------------------------------------------- usage
@@ -5651,7 +5866,7 @@ exit 0
 #        tid = cur.lastrowid
 #        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
 #                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-#                         (tid, text, blob, kind, stamp))
+#                         (tid, text, seal(blob), kind, stamp))
 #        store.db.commit()
 #    print("ticket #%d opened by user %d" % (tid, user["id"]), flush=True)
 #    emit_admin(store, "ticket.opened", {
@@ -5688,7 +5903,7 @@ exit 0
 #    with store.lock:
 #        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
 #                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-#                         (ticket["id"], text, blob, kind, stamp))
+#                         (ticket["id"], text, seal(blob), kind, stamp))
 #        # Whatever it was, it is the operator's turn now - a closed ticket
 #        # written into is open again.
 #        store.db.execute("UPDATE tickets SET status = 'open', updated_at = ?"
@@ -5748,8 +5963,11 @@ exit 0
 #                    " WHERE m.id = ? AND t.user_id = ?", (mid, user["id"]))
 #    if not row or row["image_blob"] is None:
 #        return refused("image_not_found", "این عکس پیدا نشد")
+#    image = unseal(row["image_blob"])
+#    if image is None:
+#        return refused("image_sealed", "این عکس روی این سرور باز نمی‌شود")
 #    return {"ok": True, "image_type": row["image_type"],
-#            "image_data": base64.b64encode(bytes(row["image_blob"])).decode("ascii")}
+#            "image_data": base64.b64encode(image).decode("ascii")}
 #
 #
 #def prune_ticket_images(store):
@@ -6272,7 +6490,7 @@ exit 0
 #    stamp = now()
 #    store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
 #              " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-#              (tid, text, blob, kind, stamp))
+#              (tid, text, seal(blob), kind, stamp))
 #    store.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
 #              (stamp, tid))
 #    user = store.one("SELECT * FROM users WHERE id = ?", (ticket["user_id"],))
@@ -7260,8 +7478,11 @@ exit 0
 #        if not row or row["receipt_blob"] is None:
 #            return 404, refused("image_not_found", "عکس این رسید نیست (یا بعد از "
 #                                                   "تصمیم پاک شده)")
+#        image = unseal(row["receipt_blob"])
+#        if image is None:
+#            return 409, refused("image_sealed", "این رسید روی این سرور باز نمی‌شود")
 #        return 200, {"ok": True, "content_type": row["receipt_type"],
-#                     "data": base64.b64encode(bytes(row["receipt_blob"])).decode("ascii")}
+#                     "data": base64.b64encode(image).decode("ascii")}
 #
 #    def api_admin_decide(self, body, rid, verb):
 #        res = decide_receipt(self.store, int(rid),
@@ -7923,11 +8144,44 @@ exit 0
 #DEFAULT_TEMPLATE = [0]
 #
 #
+#def make_key():
+#    """`smartdns-panel --make-key`: the installer's way to make the sealing
+#    key, as root and before the panel starts. The panel itself cannot - its
+#    sandbox keeps /etc read-only - so without this the pictures kept from
+#    before would wait for a second start to be sealed."""
+#    os.makedirs(os.path.dirname(DB), exist_ok=True)
+#    store = Store(DB)
+#    SEALED_CHECK.append(lambda: count_sealed(store.db))
+#    if db_key() is not None:
+#        print("sealing key: %s" % KEY_FILE)
+#        return 0
+#    if libcrypto() is None:
+#        print("no libcrypto on this machine - pictures are kept unsealed")
+#        return 0
+#    print("the key %s is missing, and %d pictures in the database were sealed with it"
+#          " - put the file back; no new key was made" % (KEY_FILE, sealed_count()))
+#    return 1
+#
+#
 #def main():
 #    global CATALOGUE
+#    if sys.argv[1:] == ["--make-key"]:
+#        sys.exit(make_key())
 #    cfg = load_config()
 #    os.makedirs(os.path.dirname(DB), exist_ok=True)
 #    store = Store(DB)
+#    SEALED_CHECK.append(lambda: count_sealed(store.db))
+#    try:
+#        if db_key() is None:
+#            print("<3>the pictures are kept unsealed: %s" % (
+#                "no libcrypto to seal with" if libcrypto() is None else
+#                "the key %s is missing, and %d pictures sealed with it are in the "
+#                "database - put the file back" % (KEY_FILE, sealed_count())
+#                if sealed_count() else "the key %s could not be made" % KEY_FILE),
+#                flush=True)
+#        seal_existing(store)
+#    except Exception as e:
+#        print("<3>sealing failed: %r" % e, flush=True)
 #    CATALOGUE = load_catalogue() + [CUSTOM_SERVICE]
 #    GAMES[:] = load_games()
 #    follow_catalogue_split(store, CATALOGUE)
@@ -12146,6 +12400,8 @@ exit 0
 #        self.db.row_factory = sqlite3.Row
 #        self.db.execute("PRAGMA foreign_keys = ON")
 #        self.db.execute("PRAGMA journal_mode = WAL")
+#        # As in the panel: what is deleted is zeroed, not left in free pages.
+#        self.db.execute("PRAGMA secure_delete = ON")
 #
 #        # Created here as well as in the panel's schema: this process can be
 #        # the first to open the database on a machine where the panel has not
@@ -12329,8 +12585,21 @@ exit 0
 #        if missing:
 #            raise ValueError("not a panel backup - missing %s"
 #                             % ", ".join(sorted(missing)))
-#        return {t: db.execute("SELECT count(*) FROM " + t).fetchone()[0]
-#                for t in ("users", "ips", "templates", "transactions")}
+#        out = {t: db.execute("SELECT count(*) FROM " + t).fetchone()[0]
+#               for t in ("users", "ips", "templates", "transactions")}
+#        # Whether its pictures open with this machine's key: a backup from
+#        # another machine needs that machine's key file as well.
+#        out["sealed"] = count_sealed(db)
+#        out["sealed_opens"] = True
+#        for table, col in SEALED_COLUMNS:
+#            try:
+#                row = db.execute("SELECT %s FROM %s WHERE substr(%s, 1, 4) = ? LIMIT 1"
+#                                 % (col, table, col), (SEALED,)).fetchone()
+#            except sqlite3.Error:
+#                row = None
+#            if row is not None and unseal(row[0]) is None:
+#                out["sealed_opens"] = False
+#        return out
 #    finally:
 #        db.close()
 #
@@ -12612,6 +12881,187 @@ exit 0
 #            "days": series("1d", now_t - timedelta(days=30), "%Y-%m-%d")}
 #
 #
+## ---------------------------------------------------------------- at rest
+## The pictures customers send - bank slips, and screenshots in tickets - are
+## kept sealed with AES-256-GCM, so a copied database or a backup that got
+## loose does not hand over somebody's bank slip. The key is a file of its own
+## beside the config, never in the database, so a backup is sealed too.
+##
+## AES comes from the OpenSSL this machine already has (Python's own ssl
+## module is built on it), called through ctypes: there is no pip step, and
+## the standard library has no cipher of its own.
+##
+## A sealed value starts with SEALED; anything else is from before sealing
+## and is read as it is - and sealed where it lies, at the panel's start.
+#KEY_FILE = "/etc/smart-dns/db.key"
+#SEALED = b"DDS1"
+#_NONCE, _TAG = 12, 16
+#_LIBCRYPTO = []
+#
+#
+#def libcrypto():
+#    """OpenSSL's libcrypto, loaded once; None when there is none to load."""
+#    if _LIBCRYPTO:
+#        return _LIBCRYPTO[0]
+#    import ctypes
+#    import ctypes.util
+#    import glob
+#    names = ["libcrypto.so.3", "libcrypto.so.1.1", ctypes.util.find_library("crypto")]
+#    if os.name == "nt":      # the tests, on Windows: Python's own copy
+#        names = glob.glob(os.path.join(sys.base_prefix, "DLLs", "libcrypto-*.dll")) + names
+#    lib = None
+#    for name in names:
+#        if not name:
+#            continue
+#        try:
+#            lib = ctypes.CDLL(name)
+#            lib.EVP_aes_256_gcm
+#            break
+#        except (OSError, AttributeError):
+#            lib = None
+#    if lib is not None:
+#        p, i, c = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p
+#        lib.EVP_CIPHER_CTX_new.restype = p
+#        lib.EVP_CIPHER_CTX_free.argtypes = [p]
+#        lib.EVP_aes_256_gcm.restype = p
+#        for f in ("EVP_EncryptInit_ex", "EVP_DecryptInit_ex"):
+#            getattr(lib, f).argtypes = [p, p, p, c, c]
+#        for f in ("EVP_EncryptUpdate", "EVP_DecryptUpdate"):
+#            getattr(lib, f).argtypes = [p, c, ctypes.POINTER(i), c, i]
+#        for f in ("EVP_EncryptFinal_ex", "EVP_DecryptFinal_ex"):
+#            getattr(lib, f).argtypes = [p, c, ctypes.POINTER(i)]
+#        lib.EVP_CIPHER_CTX_ctrl.argtypes = [p, i, i, p]
+#    _LIBCRYPTO.append(lib)
+#    return lib
+#
+#
+#def _gcm(encrypt, key, nonce, data, tag=None):
+#    import ctypes
+#    lib = libcrypto()
+#    if lib is None:
+#        raise RuntimeError("no libcrypto on this machine")
+#    ctx = lib.EVP_CIPHER_CTX_new()
+#    try:
+#        init = lib.EVP_EncryptInit_ex if encrypt else lib.EVP_DecryptInit_ex
+#        if init(ctx, lib.EVP_aes_256_gcm(), None, key, nonce) != 1:
+#            raise RuntimeError("cipher did not start")
+#        out = ctypes.create_string_buffer(len(data) + 16)
+#        n = ctypes.c_int(0)
+#        update = lib.EVP_EncryptUpdate if encrypt else lib.EVP_DecryptUpdate
+#        if update(ctx, out, ctypes.byref(n), data, len(data)) != 1:
+#            raise RuntimeError("cipher failed")
+#        body = out.raw[:n.value]
+#        if not encrypt:
+#            want = ctypes.create_string_buffer(tag, _TAG)
+#            lib.EVP_CIPHER_CTX_ctrl(ctx, 0x11, _TAG, ctypes.cast(want, ctypes.c_void_p))
+#        final = lib.EVP_EncryptFinal_ex if encrypt else lib.EVP_DecryptFinal_ex
+#        if final(ctx, out, ctypes.byref(n)) != 1:
+#            raise ValueError("does not open with this key")
+#        if encrypt:
+#            got = ctypes.create_string_buffer(_TAG)
+#            lib.EVP_CIPHER_CTX_ctrl(ctx, 0x10, _TAG, ctypes.cast(got, ctypes.c_void_p))
+#            return body, got.raw
+#        return body
+#    finally:
+#        lib.EVP_CIPHER_CTX_free(ctx)
+#
+#
+#def db_key(create=True):
+#    """The sealing key, made the first time it is needed.
+#
+#    Never made while something sealed is already in the database: that data
+#    was sealed with a key that is gone, and a new one would only look like
+#    it had come back. Then new pictures are kept unsealed, and the admin
+#    panel says the key is missing, until the old file is put back.
+#    """
+#    try:
+#        with open(KEY_FILE) as fh:
+#            key = bytes.fromhex(fh.read().strip())
+#        return key if len(key) == 32 else None
+#    except FileNotFoundError:
+#        pass
+#    except (OSError, ValueError):
+#        return None
+#    if not create or sealed_count() or libcrypto() is None:
+#        return None
+#    # Written whole under another name and then linked into place, which
+#    # fails if the file is there: the panel and the admin panel start
+#    # together, and the one that loses must never read a half-written key.
+#    tmp = "%s.%d.%s.tmp" % (KEY_FILE, os.getpid(), os.urandom(4).hex())
+#    try:
+#        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+#        with os.fdopen(fd, "w") as fh:
+#            fh.write(os.urandom(32).hex() + "\n")
+#        os.link(tmp, KEY_FILE)
+#    except FileExistsError:
+#        pass                              # the other panel made it first
+#    except OSError:
+#        return None
+#    finally:
+#        try:
+#            os.unlink(tmp)
+#        except OSError:
+#            pass
+#    return db_key(create=False)
+#
+#
+#def seal(data):
+#    """A picture as it is kept: sealed when there is a key, as it is when not."""
+#    if data is None:
+#        return None
+#    data = bytes(data)
+#    key = db_key()
+#    if key is None or data.startswith(SEALED):
+#        return data
+#    nonce = os.urandom(_NONCE)
+#    body, tag = _gcm(True, key, nonce, data)
+#    return SEALED + nonce + body + tag
+#
+#
+#def unseal(data):
+#    """A kept picture, readable again; None when it is sealed and cannot be
+#    opened here - no key, or another machine's."""
+#    if data is None:
+#        return None
+#    data = bytes(data)
+#    if not data.startswith(SEALED):
+#        return data
+#    key = db_key(create=False)
+#    if key is None:
+#        return None
+#    head = len(SEALED)
+#    try:
+#        return _gcm(False, key, data[head:head + _NONCE], data[head + _NONCE:-_TAG],
+#                    data[-_TAG:])
+#    except (ValueError, RuntimeError):
+#        return None
+#
+#
+## Whether anything in the database is sealed already - db_key() asks before
+## it makes a key. Set once the database is open.
+#SEALED_CHECK = []
+#
+#
+#def sealed_count():
+#    return SEALED_CHECK[0]() if SEALED_CHECK else 0
+#
+#
+#def count_sealed(db):
+#    """How many pictures in this database are sealed."""
+#    n = 0
+#    for table, col in SEALED_COLUMNS:
+#        try:
+#            n += db.execute("SELECT count(*) FROM %s WHERE substr(%s, 1, 4) = ?"
+#                            % (table, col), (SEALED,)).fetchone()[0]
+#        except Exception:
+#            pass
+#    return n
+#
+#
+## Where the pictures are kept.
+#SEALED_COLUMNS = (("transactions", "receipt_blob"), ("ticket_messages", "image_blob"))
+#
+#
 ## ---------------------------------------------------------------- resolvers
 ## The public resolvers the operator can pick: what the relays ask for every
 ## name they do not route, and what this machine's nginx asks to find the
@@ -12697,6 +13147,26 @@ exit 0
 #    with open(UPSTREAM_FILE, "w") as fh:
 #        fh.write(" ".join(picks) + "\n")
 #    return ""
+#
+#
+#def sealing_note(p):
+#    """What the backup card says about the sealed pictures and their key."""
+#    key = db_key(create=False)
+#    if key is None and sealed_count():
+#        return ("<div class='msg err'>کلید رمزگذاری عکس‌ها (<code>%s</code>) روی این "
+#                "سرور نیست، ولی %d عکس با آن رمزگذاری شده و الان باز نمی‌شود. فایل را "
+#                "از نسخهٔ پشتیبانش برگردانید. تا آن موقع عکس‌های تازه بدون رمز نگه "
+#                "داشته می‌شوند.</div>" % (KEY_FILE, sealed_count()))
+#    if key is None:
+#        return ("<p class='muted'>عکس‌ها رمزگذاری نمی‌شوند: کتابخانهٔ OpenSSL روی این "
+#                "سرور پیدا نشد.</p>")
+#    return ("<h2 style='margin-top:22px'>کلید رمزگذاری عکس‌ها</h2>"
+#            "<p class='muted'>عکس رسیدها و تیکت‌ها رمزگذاری شده نگه داشته می‌شوند و "
+#            "کلیدشان در <code>%s</code> است، نه در دیتابیس — پس نسخهٔ پشتیبان هم "
+#            "رمزگذاری‌شده است. برای بازگردانی روی سرور دیگری این کلید را هم لازم دارید؛ "
+#            "کنار نسخهٔ پشتیبان ولی جدا از آن نگهش دارید. کلید گم شود، عکس‌ها برنمی‌گردند "
+#            "(بقیهٔ اطلاعات چرا).</p><p><a class='dl' href='/%s/db.key'>دانلود کلید</a></p>"
+#            % (KEY_FILE, p))
 #
 #
 #def upstream_card():
@@ -13974,6 +14444,16 @@ exit 0
 #            "Content-Disposition":
 #                'attachment; filename="smartdns-backup-%s.db"' % stamp})
 #
+#    def send_key(self):
+#        """The sealing key, for keeping beside a backup. Behind the session
+#        like the backup itself."""
+#        key = db_key(create=False)
+#        if key is None:
+#            return self.redirect("settings?m=!کلیدی روی این سرور نیست")
+#        return self.send((key.hex() + "\n").encode(), 200, {
+#            "Content-Type": "application/octet-stream",
+#            "Content-Disposition": 'attachment; filename="db.key"'})
+#
 #    # -- receipts ---------------------------------------------------------
 #    def send_receipt(self, ident):
 #        """Hand back the stored image itself, for the <img> on the page.
@@ -13987,7 +14467,10 @@ exit 0
 #                        " WHERE id = ?", (int(ident) if ident.isdigit() else 0,))
 #        if not row or not row["receipt_blob"]:
 #            return self.send("<h1>404</h1>", 404)
-#        return self.send(bytes(row["receipt_blob"]), 200, {
+#        image = unseal(row["receipt_blob"])
+#        if image is None:
+#            return self.send("<h1>sealed with another key</h1>", 409)
+#        return self.send(image, 200, {
 #            "Content-Type": row["receipt_type"] or "application/octet-stream",
 #            # Not inline for a PDF: opening one in the panel's own origin is a
 #            # needless way to run somebody else's file next to the session.
@@ -14119,6 +14602,12 @@ exit 0
 #            body.append("<tr><td>%s</td><td%s>%d</td><td>%d</td></tr>"
 #                        % (label, cls, new, old))
 #        body.append("</table>")
+#        if c.get("sealed") and not c.get("sealed_opens", True):
+#            body.append(
+#                "<div class='msg err' style='margin-top:18px'>%d عکس (رسید و تیکت) در این "
+#                "فایل با کلید سرور دیگری رمزگذاری شده و این‌جا باز نمی‌شود. اگر از سرور "
+#                "دیگری آورده‌اید، فایل <code>%s</code> همان سرور را هم این‌جا بگذارید. "
+#                "بقیهٔ اطلاعات بی‌مشکل برمی‌گردد.</div>" % (c["sealed"], KEY_FILE))
 #        body.append(
 #            "<div class='msg err' style='margin-top:18px'>بازگردانی، دیتابیس "
 #            "فعلی را کامل جایگزین می‌کند. از وضعیت فعلی قبلش یک نسخه کنار "
@@ -14281,6 +14770,8 @@ exit 0
 #            return self.send(login_page(CFG))
 #        if rest == "backup.db":
 #            return self.send_backup()
+#        if rest == "db.key":
+#            return self.send_key()
 #        if rest.startswith("receipt/"):
 #            return self.send_receipt(rest.split("/", 1)[1])
 #        if rest.startswith("ticket-image/"):
@@ -14654,7 +15145,10 @@ exit 0
 #                        (int(ident) if ident.isdigit() else 0,))
 #        if not row or row["image_blob"] is None:
 #            return self.send("<h1>404</h1>", 404)
-#        return self.send(bytes(row["image_blob"]), 200, {
+#        image = unseal(row["image_blob"])
+#        if image is None:
+#            return self.send("<h1>sealed with another key</h1>", 409)
+#        return self.send(image, 200, {
 #            "Content-Type": row["image_type"] or "application/octet-stream",
 #            "Content-Disposition": "inline; filename=ticket-%s" % ident})
 #
@@ -15255,7 +15749,7 @@ exit 0
 #            "class='row'><input type='file' name='file' accept='.db' required>"
 #            "<button class='ghost'>بررسی فایل</button></form>"
 #            "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
-#            "تأیید می‌خواهد.</p></div>" % (p, p))
+#            "تأیید می‌خواهد.</p>%s</div>" % (p, p, sealing_note(p)))
 #
 #        need = STORE.one("SELECT value FROM settings WHERE key = 'require_telegram'")
 #        bot = STORE.one("SELECT 1 FROM api_tokens WHERE revoked_at IS NULL"
@@ -15621,7 +16115,7 @@ exit 0
 #            stamp = now()
 #            STORE.run("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
 #                      " image_blob, image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-#                      (tid, text, blob, kind, stamp))
+#                      (tid, text, seal(blob) if blob else blob, kind, stamp))
 #            STORE.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
 #                      (stamp, tid))
 #            ticket = STORE.one("SELECT user_id, subject FROM tickets WHERE id = ?", (tid,))
@@ -16153,6 +16647,11 @@ exit 0
 #    GAMES[:] = load_games()
 #    SECTIONS[:] = load_sections()
 #    STORE = Store(DB)
+#    SEALED_CHECK.append(lambda: count_sealed(STORE.db))
+#    try:
+#        db_key()
+#    except Exception as e:
+#        log(ERROR, "sealing key not made: %r" % e)
 #
 #    port = int(CFG["ADMIN_PORT"])
 #    cert = CFG.get("ADMIN_CERT")

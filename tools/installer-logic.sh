@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.7.1"
+VERSION="0.7.2"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -1611,6 +1611,13 @@ EOF
     payload SMARTDNS_API_GUARD > /usr/local/bin/smartdns-api-guard
     chmod +x /usr/local/bin/smartdns-api-guard
     install_payload PANEL_SERVICE /etc/systemd/system/smartdns-panel.service || true
+    # The key that seals customers' receipts and ticket pictures. Made here,
+    # as root: the panel's sandbox keeps /etc read-only. Never over a missing
+    # key while sealed pictures are in the database - that only warns. Not
+    # noted for uninstall: a database left behind is no use without it.
+    if /usr/local/bin/smartdns-panel --make-key; then :; else
+        warn "the pictures' sealing key is missing - see the admin panel's settings"
+    fi
     systemctl daemon-reload
     enable_service smartdns-panel.service
     systemctl restart smartdns-panel.service
