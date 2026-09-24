@@ -167,7 +167,13 @@ def api_endpoints():
     customer's receipt timed out every time, the exit logging a read that
     never finished, and the same bytes went through the tunnel untouched.
     """
-    direct = (CFG["PANEL_HOST"], API_PORT)
+    # PANEL_PORT only on a single machine, whose sync API is on loopback
+    # beside the customer panel's 8443.
+    try:
+        port = int(CFG.get("PANEL_PORT") or API_PORT)
+    except ValueError:
+        port = API_PORT
+    direct = (CFG["PANEL_HOST"], port)
     if (CFG.get("TUNNEL") or "off") != "backpack":
         return [direct]
     return [("127.0.0.1", API_TUNNEL_PORT), direct]
@@ -515,8 +521,136 @@ def describe_change(old_text, new_text, me):
 
 
 def template_label(key, names):
+    if key == DEFAULT_PROFILE:
+        return "default template (with its blocks and forwards)"
     name = (names or {}).get(str(key))
     return "template %s (%s)" % (key, name) if name else "template %s" % key
+
+
+def is_overridden(name, domains):
+    """Whether `name` is one of `domains` or under one."""
+    parts = name.lower().rstrip(".").split(".")
+    return any(".".join(parts[i:]) in domains for i in range(len(parts)))
+
+
+def drop_overridden(lines, blocked):
+    """Rule lines with every name the operator took over - blocked, or sent
+    to a resolver of their own - taken out.
+
+    That has to be done by absence. dnsmasq answers a name from the longest
+    rule that covers it and, at a tie, from an address= with an address over
+    everything else - measured on 2.91: no form of "no such name", not even
+    a hosts file, beats address=/x/relay for the same x. So a name the
+    service routes, or anything under a blocked domain that has a rule of its
+    own, would go on answering however the block is written, unless its rule
+    is simply not there. The same goes for a forward: server=/x/ip loses to
+    address=/x/relay, and a bypass under x would send its name elsewhere.
+    """
+    if not blocked:
+        return list(lines)
+    out = []
+    for line in lines:
+        m = RULE_LINE.match(line.strip())
+        if not m:
+            out.append(line)
+            continue
+        kind, domains, target = m.groups()
+        keep = [d for d in domains.split("/") if d and not is_overridden(d, blocked)]
+        if keep:
+            out.append("%s=/%s/%s" % (kind, "/".join(keep), target))
+    return out
+
+
+def rule_lines(path):
+    try:
+        with open(path) as fh:
+            return [l.strip() for l in fh if RULE_LINE.match(l.strip())]
+    except OSError:
+        return []
+
+
+# The default template's own resolver, when it has blocks or forwards. Those
+# are per template, so they cannot go in /etc/dnsmasq.d, which every resolver
+# reads; and the main resolver on :53 reads the installer's own files - the
+# hijack list, the bypasses, Epic's pins - which are not this program's to
+# edit, and whose rules for a name would beat a block or a forward of it. So
+# the default template's customers are moved to a resolver of their own with
+# the same rules less those names, and go back to :53 when it has none.
+DEFAULT_PROFILE = "default"
+
+
+def default_profile(rules, custom):
+    """That resolver's spec, or None when the main one does the job."""
+    rules = rules if isinstance(rules, dict) else {}
+    if not rules.get("blocked") and not rules.get("forwards"):
+        return None
+    return {"raw": rule_lines(HIJACK_CONF) + rule_lines(BYPASS_CONF), "custom": list(custom),
+            "pins": True, "blocked": rules.get("blocked") or [],
+            "forwards": rules.get("forwards") or {}}
+
+
+def template_rules(spec):
+    """A template's blocks and forwards, checked: the blocked domains, the
+    forwards less any under a block - the block wins - and every name the
+    two take over, whose other rules this template's resolver must not have."""
+    blocked = sorted({d for d in spec.get("blocked") or [] if is_domain(d)})
+    forwards = {d: v for d, v in clean_forwards(spec.get("forwards")).items()
+                if not is_overridden(d, set(blocked))}
+    return blocked, forwards, set(blocked) | set(forwards)
+
+
+def is_domain(d):
+    return isinstance(d, str) and bool(re.fullmatch(r"[a-z0-9.-]{1,253}", d)) \
+        and "." in d.strip(".")
+
+
+def clean_forwards(forwards):
+    """{domain: [resolver, ...]} as the panel sent it, less anything that is
+    not a domain or an IPv4 address with an optional #port."""
+    out = {}
+    for d, servers in (forwards.items() if isinstance(forwards, dict) else ()):
+        ok = [s for s in servers or [] if isinstance(s, str) and re.fullmatch(
+            r"(\d{1,3}\.){3}\d{1,3}(#\d{1,5})?", s)][:4]
+        if is_domain(d) and ok:
+            out[d] = ok
+    return out
+
+
+# Whether each forward's resolver answers from here: every ten minutes, and at
+# once when the list changes. An answer of "no such name" still counts - the
+# resolver is there and talking; a refusal or silence does not.
+FWD_CHECK = {"ms": {}, "at": 0, "key": None, "running": False}
+
+
+def all_forwards(profiles):
+    """Every resolver some template forwards some domain to, for the check."""
+    out = {}
+    for spec in profiles.values():
+        for d, servers in template_rules(spec)[1].items():
+            out[d] = sorted(set(out.get(d, [])) | set(servers))
+    return out
+
+
+def maybe_check_forwards(forwards):
+    key = json.dumps(forwards, sort_keys=True)
+    if not forwards:
+        FWD_CHECK.update(ms={}, key=key)
+        return False
+    if FWD_CHECK["running"] or (key == FWD_CHECK["key"]
+                                and time.time() - FWD_CHECK["at"] < BENCH_EVERY):
+        return False
+    FWD_CHECK.update(running=True, key=key)
+
+    def run():
+        try:
+            FWD_CHECK["ms"] = {d: {s: dns_probe(s, name=d, any_answer=True) for s in servers}
+                               for d, servers in forwards.items()}
+        except Exception as e:
+            log(WARN, "forwards not checked: %s" % e)
+        finally:
+            FWD_CHECK.update(at=time.time(), running=False)
+    threading.Thread(target=run, daemon=True).start()
+    return True
 
 
 def apply_custom_domains(domains):
@@ -607,22 +741,33 @@ def apply_profiles(profiles, assignment, restart=False, names=None):
         # it resolves normally and the client goes straight to it - which is
         # what an un-ticked service is supposed to mean.
         me = CFG.get("SELF_IP") or ""
+        # The operator's blocks and forwards for this template. Every other
+        # rule for a name they cover is left out below: see drop_overridden.
+        blocked, forwards, taken = template_rules(spec)
+        body += ["address=/%s/" % d for d in blocked]
+        body += ["server=/%s/%s" % (d, v) for d in sorted(forwards) for v in forwards[d]]
         body += ["address=/%s/%s" % (d, me)
-                 for d in sorted(set(spec.get("routed") or []))]
+                 for d in sorted(set(spec.get("routed") or []))
+                 if not is_overridden(d, taken)]
         body += ["address=/%s/%s" % (d, me)
-                 for d in sorted(set(spec.get("custom") or []))]
+                 for d in sorted(set(spec.get("custom") or []))
+                 if not is_overridden(d, taken)]
+        # The default template's stand-in: the main resolver's own rules, as
+        # read from its files.
+        body += drop_overridden(spec.get("raw") or [], taken)
         # Names whose parent this profile routes, that it must not route
         # itself - gosredirector.ea.com under a routed ea.com, say. Here the
         # subtraction does work: the profile's rule names a longer host than
         # the one hijacking the parent, so longest match prefers it.
         # "#" is dnsmasq's "the usual resolvers": whatever upstream.conf says.
-        body += ["server=/%s/#" % d for d in spec.get("bypass", [])]
+        body += ["server=/%s/#" % d for d in spec.get("bypass", [])
+                 if not is_overridden(d, taken)]
         # Epic's pins, unless this template asked to route that backend. They
         # come last and are address= rules, so where they appear they win -
         # which is the point: a bypass sends the name to a public resolver,
         # while a pin sends it to an address checked to answer from here.
         if spec.get("pins", True):
-            body += epic_pins
+            body += drop_overridden(epic_pins, taken)
         conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
         text = "\n".join(body) + "\n"
         old = None
@@ -930,7 +1075,8 @@ def write_doh_state(tokens, ports, assignment, allowed):
         # A customer whose template has no resolver running yet - nobody on it
         # had an address until now - is answered by the main one meanwhile.
         "tokens": {h: {"uid": t.get("uid"),
-                       "port": ports.get(t.get("profile") or "", MAIN_DNS_PORT)}
+                       "port": ports.get(t.get("profile") or "",
+                                         ports.get(DEFAULT_PROFILE, MAIN_DNS_PORT))}
                    for h, t in (tokens or {}).items()},
         "ips": ips,
         "allowed": sorted(allowed),
@@ -967,10 +1113,14 @@ UPSTREAM_RETRY = 600
 UPSTREAM = {"want": None, "tested": {}, "error": "", "at": 0.0}
 
 
-def dns_probe(server, name="cloudflare.com", timeout=2.0):
+def dns_probe(server, name="cloudflare.com", timeout=2.0, any_answer=False):
     """How long `server` takes to answer an A query for `name`, in
     milliseconds; None when it does not answer, or answers with an error.
-    Twice, so one lost packet does not condemn a resolver."""
+    Twice, so one lost packet does not condemn a resolver. `server` may carry
+    a port, 1.2.3.4#5353, the way dnsmasq writes it. With `any_answer`, an
+    answer of "no such name" or with no records counts too: the question is
+    then whether the resolver is there, not whether the name is."""
+    server, _, port = server.partition("#")
     qid = os.urandom(2)
     query = (qid + bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
              + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
@@ -980,12 +1130,14 @@ def dns_probe(server, name="cloudflare.com", timeout=2.0):
         s.settimeout(timeout)
         try:
             t0 = time.monotonic()
-            s.sendto(query, (server, 53))
+            s.sendto(query, (server, int(port or 53)))
             while True:
                 data, _ = s.recvfrom(4096)
                 if len(data) >= 12 and data[:2] == qid:
                     break
             # An answer, no error, and at least one record in it.
+            if data[2] & 0x80 and any_answer and data[3] & 0x0F in (0, 3):
+                return max(1, int((time.monotonic() - t0) * 1000))
             if data[2] & 0x80 and data[3] & 0x0F == 0 and (data[6] or data[7]):
                 return max(1, int((time.monotonic() - t0) * 1000))
             return None
@@ -1067,6 +1219,52 @@ def apply_upstream(raw):
     return True
 
 
+# The resolvers the admin panel offers, timed from here every ten minutes -
+# from here because this is where customers' questions leave from, and a
+# resolver that is 5 ms from Frankfurt can be 150 ms from Tehran - or at once
+# when the operator asks for it again.
+BENCH_EVERY = 600
+BENCH_STATE = {"ms": {}, "at": 0, "asked": None, "running": False}
+
+def bench(ips, tries=3, workers=8):
+    """How long each resolver takes to answer from here: the median of a few
+    real DNS questions, in milliseconds, or None for one that did not answer.
+    A DNS question rather than a ping, because a ping is not what a resolver
+    is for - some answer no pings, and some route them another way."""
+    import concurrent.futures
+
+    def one(ip):
+        times = sorted(t for t in (dns_probe(ip) for _ in range(tries)) if t is not None)
+        return ip, (times[len(times) // 2] if times else None)
+
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        return dict(pool.map(one, ips))
+
+
+def maybe_bench(wanted):
+    """Start timing the resolvers the panel listed, in a thread of its own -
+    it takes seconds, and the syncs go on - when it is due or was asked for."""
+    if not isinstance(wanted, dict) or BENCH_STATE["running"]:
+        return False
+    ips = [str(i) for i in wanted.get("ips") or [] if re.fullmatch(r"[0-9.]{7,15}", str(i))][:32]
+    asked = str(wanted.get("now") or "")
+    if not ips:
+        return False
+    if time.time() - BENCH_STATE["at"] < BENCH_EVERY and asked == BENCH_STATE["asked"]:
+        return False
+    BENCH_STATE.update(running=True, asked=asked)
+
+    def run():
+        try:
+            BENCH_STATE["ms"] = bench(ips)
+        except Exception as e:
+            log(WARN, "resolvers not timed: %s" % e)
+        finally:
+            BENCH_STATE.update(at=time.time(), running=False)
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 def upstream_report():
     return {"want": UPSTREAM["want"], "applied": current_upstream(),
             "tested": UPSTREAM["tested"], "error": UPSTREAM["error"]}
@@ -1097,7 +1295,7 @@ DOH_PENDING = {"doh": {}, "dot": {}}
 
 # ---------------------------------------------------------------- DNS report
 # For a customer who switched on "keep my DNS for support" on their page: the
-# names their addresses ask, and where each answer sent them, for 24 hours.
+# names their addresses ask, and where each answer sent them, for an hour.
 # Plain DNS is read off the wire by smartdns-watch, run here for as long as
 # anybody has it on; DoH and DoT come from smartdns-doh's counts. Kept here
 # as {key: {(name, verdict): [first, last, hits]}} until delivered.
@@ -1254,12 +1452,18 @@ def sync_once():
                "panel_url": url,
                # The name a bot should give out for DoH and DoT, once this
                # relay has the certificate for it; empty until then.
-               "doh_host": (CFG.get("PANEL_DOMAIN") or "") if os.path.exists(DOH_FLAG) else "",
+               "doh_host": doh_public_name(),
+               # How the admin panel's name for DoH is going here.
+               "doh_name": doh_name_report(),
                # Upload and download apart, for the customer's charts. The
                # total above is still what the bill is made from.
                "split": {r["ip"]: [r.get("up", 0), r.get("down", 0)] for r in rows},
                # Which resolvers this relay asks, and how the last pick went.
                "upstream": upstream_report()}
+    if BENCH_STATE["ms"]:
+        payload["resolver_bench"] = {"at": int(BENCH_STATE["at"]), "ms": BENCH_STATE["ms"]}
+    if FWD_CHECK["ms"]:
+        payload["forward_check"] = {"at": int(FWD_CHECK["at"]), "ms": FWD_CHECK["ms"]}
     try:
         services = take_usage()
     except Exception as e:
@@ -1324,15 +1528,34 @@ def sync_once():
     # allowlist below, so an address is pointed at the right resolver no later
     # than the moment it is let in.
     try:
+        apply_doh_name(answer.get("doh_name"))
+    except Exception as e:
+        log(WARN, "DoH name not applied: %s" % e)
+    try:
+        maybe_bench(answer.get("bench"))
+    except Exception as e:
+        log(WARN, "resolvers not timed: %s" % e)
+    try:
         new_upstream = apply_upstream(answer.get("upstream"))
     except Exception as e:
         new_upstream = False
         log_exception("resolvers not applied: %s" % e)
     try:
-        changed = apply_custom_domains(answer.get("extra_domains") or [])
+        custom = answer.get("extra_domains") or []
+        changed = apply_custom_domains(custom)
         assignment = {a["ip"]: a.get("profile", "")
                       for a in answer.get("allowed", []) if a.get("profile")}
-        ports = apply_profiles(answer.get("profiles") or {}, assignment,
+        profiles = dict(answer.get("profiles") or {})
+        stand_in = default_profile(answer.get("default_rules"), custom)
+        if stand_in:
+            profiles[DEFAULT_PROFILE] = stand_in
+            for ip in want:
+                assignment.setdefault(ip, DEFAULT_PROFILE)
+        try:
+            maybe_check_forwards(all_forwards(profiles))
+        except Exception as e:
+            log(WARN, "forwards not checked: %s" % e)
+        ports = apply_profiles(profiles, assignment,
                                restart=changed or new_upstream,
                                names=(answer.get("templates") or {}).get("names"))
     except Exception as e:
@@ -2074,12 +2297,6 @@ def human_fa(n):
 
 
 # ---------------------------------------------------------------- DoH page
-# How recent a query has to be to count as "reaching us". Long enough that a
-# console left on is not flagged between two lookups, short enough that a
-# relay the customer has lost says so the same evening.
-DNS_FRESH = 3600
-
-
 def seconds_since(ts):
     try:
         t = datetime.fromisoformat(str(ts))
@@ -2100,42 +2317,13 @@ def ago(seconds):
     return "%d روز پیش" % (seconds // 86400)
 
 
-def dns_check(info):
-    """Whether the registered internet's DNS reaches this relay.
-
-    Not a test the page runs - a browser cannot put a DNS query to anybody,
-    let alone see who answered - but what the relay itself has seen: the
-    kernel counts each registered address's queries on port 53, and
-    smartdns-doh counts the encrypted ones. Nothing arriving means the DNS
-    was never set, or the operator answers it before it gets here.
-    """
-    if not info.get("ip"):
-        return ""
-    plain = seconds_since(info.get("dns_seen_at"))
-    safe = seconds_since(info.get("doh_seen_at"))
-    added = seconds_since(info.get("ip_added_at"))
-    if plain is not None and plain < DNS_FRESH:
-        return ("<p class='note'>✅ DNS اینترنت ثبت‌شده‌تان به ما می‌رسد — آخرین "
-                "درخواست %s.</p>" % ago(plain))
-    if safe is not None and safe < DNS_FRESH:
-        return ("<p class='note'>✅ از DNS رمزگذاری‌شده استفاده می‌کنید — آخرین "
-                "درخواست %s.</p>" % ago(safe))
-    if plain is None and added is not None and added < 900:
-        return ("<p class='note'>⏳ هنوز درخواست DNS از اینترنت ثبت‌شده‌تان نرسیده. "
-                "DNS را روی مودم یا کنسول بگذارید؛ چند دقیقه بعد این‌جا تأیید "
-                "می‌شود.</p>")
-    return ("<div class='msg warnbox'>⚠️ در یک ساعت اخیر هیچ درخواست DNS از اینترنت "
-            "ثبت‌شده‌تان به ما نرسیده%s. اگر دستگاهتان روشن است و سرویس کار نمی‌کند: "
-            "یا DNS را روی مودم یا کنسول نگذاشته‌اید، یا اپراتور اینترنتتان DNS را "
-            "می‌رباید. در این صورت از «DNS رمزگذاری‌شده» پایین همین صفحه استفاده "
-            "کنید.</div>" % (" (آخرین: %s)" % ago(plain) if plain is not None else ""))
-
-
 # How the report says where a name went, and why.
 QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
                 "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
                 "no address": "بدون آدرس"}
-QLOG_REASON = {"routed": "در قالب شما از رله می‌رود",
+QLOG_REASON = {"blocked": "در سرویس مسدود شده",
+               "forward": "از DNS مخصوص این دامنه پرسیده می‌شود",
+               "routed": "در قالب شما از رله می‌رود",
                "unticked": "در قالب شما از رله نمی‌رود",
                "bypass": "در قالب شما از رله نمی‌رود",
                "outside": "در فهرست سرویس‌ها نیست"}
@@ -2179,17 +2367,17 @@ def qlog_box(info):
     left = ""
     if on:
         until = (datetime.fromisoformat(info["qlog_until"]) - datetime.now(timezone.utc))
-        left = " — %d ساعت دیگر خودش خاموش می‌شود" % max(1, int(until.total_seconds() // 3600))
+        left = " — %d دقیقهٔ دیگر خودش خاموش می‌شود" % max(1, int(until.total_seconds() // 60))
     body = ["<details class='pw'%s><summary>🔎 گزارش DNS برای پشتیبانی%s</summary>"
             % (" open" if on else "", " (روشن)" if on else ""),
             "<p class='note'>وقتی سرویسی باز نمی‌شود، این را روشن کنید و همان سرویس را "
             "دوباره باز کنید: این‌جا می‌بینید دستگاه‌هایتان چه اسم‌هایی پرسیدند، هر کدام "
-            "از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا ۲۴ ساعت "
+            "از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا یک ساعت "
             "نگه داشته می‌شود و خاموشش که کنید همان لحظه پاک می‌شود.</p>",
             "<form method='post' action='/qlog' style='margin:0 16px 12px'>"
             "<input type='hidden' name='on' value='%s'><button class='%s small'>%s</button>"
             "</form>" % ("0" if on else "1", "ghost" if on else "",
-                         "خاموش کردن و پاک کردن" if on else "روشن کردن برای ۲۴ ساعت")]
+                         "خاموش کردن و پاک کردن" if on else "روشن کردن برای یک ساعت")]
     if on:
         body.append("<p class='note'>روشن است%s. جدول هر بار که صفحه را باز کنید تازه "
                     "می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.</p>" % left)
@@ -2204,8 +2392,8 @@ def qlog_box(info):
 def doh_url(info):
     """The customer's personal DNS-over-HTTPS address, on this relay's name."""
     token = info.get("doh_token") or ""
-    host = CFG.get("PANEL_DOMAIN") or ""
-    if not token or not host or not os.path.exists(DOH_FLAG):
+    host = doh_public_name()
+    if not token or not host:
         return ""
     return "https://%s/dns-query/%s" % (host, token)
 
@@ -2223,6 +2411,166 @@ def doh_token_known(token):
 
 # Present when the installer turned DoH on for this relay.
 DOH_FLAG = "/etc/smart-dns/doh"
+
+# ---------------------------------------------------------------- DoH's name
+# DoH and DoT answer on this relay's own name until the admin panel gives them
+# another - for the day that name is filtered, which would take every
+# customer's encrypted DNS down with it. The new name gets a certificate with
+# the old one beside it, while the old still passes Let's Encrypt's check, so
+# a device set up the old way goes on working; nginx takes the certificate
+# and the names from two small files it includes, which the installer writes
+# with the relay's own name and this program rewrites.
+DOH_NAME_FILE = "/etc/smart-dns/doh-name"
+DOH_DEFAULT_CERT = "/etc/smart-dns/doh-cert.default"
+DOH_CERT_CONF = "/etc/nginx/smartdns-doh-cert.conf"
+DOH_NAMES_MAP = "/etc/nginx/smartdns-doh-names.map"
+LE_LIVE = "/etc/letsencrypt/live"
+CERT_TOOL = "/usr/local/bin/smartdns-cert"
+# How long a name that could not be had is left before it is tried again: a
+# certificate try opens port 80 to Let's Encrypt, and stalls console downloads
+# while it does.
+DOH_NAME_RETRY = 900
+DOH_NAME = {"want": None, "error": "", "next": 0.0, "running": False}
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def active_doh_name():
+    return (read_text(DOH_NAME_FILE) or "").strip()
+
+
+def doh_public_name():
+    """The name customers are given for DoH and DoT: the admin panel's, once
+    this relay has it working, and its own until then."""
+    if not os.path.exists(DOH_FLAG):
+        return ""
+    return active_doh_name() or (CFG or {}).get("PANEL_DOMAIN") or ""
+
+
+def cert_dns_names(path):
+    out = subprocess.run(["openssl", "x509", "-noout", "-ext", "subjectAltName", "-in", path],
+                         capture_output=True, text=True, timeout=20).stdout
+    return re.findall(r"DNS:([A-Za-z0-9.-]+)", out)
+
+
+def point_doh_nginx(cert_text, names):
+    """nginx's DoH on this certificate and these names, checked by nginx
+    before it is reloaded and put back as it was if refused."""
+    new = {DOH_CERT_CONF: cert_text,
+           DOH_NAMES_MAP: "".join("%s 127.0.0.1:8453;\n" % n for n in names)}
+    old = {path: read_text(path) for path in new}
+    if old == new:
+        return True
+    for path, text in new.items():
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    if sh("nginx", "-t").returncode != 0:
+        for path, text in old.items():
+            if text is None:
+                os.unlink(path)
+            else:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+        return False
+    sh("systemctl", "reload", "nginx")
+    return True
+
+
+def lineage_text(lineage):
+    d = os.path.join(LE_LIVE, lineage)
+    return ("ssl_certificate     %s/fullchain.pem;\nssl_certificate_key %s/privkey.pem;\n"
+            % (d, d))
+
+
+def forget_lineage(name):
+    if name:
+        subprocess.run(["certbot", "delete", "--non-interactive", "--cert-name", "doh-" + name],
+                       capture_output=True, text=True, timeout=120)
+
+
+def take_doh_name(want, own):
+    """In a thread of its own - certbot takes a while: a certificate for
+    `want`, with this relay's own name in it too if that still passes, and
+    nginx moved onto it."""
+    lineage = "doh-" + want
+    try:
+        def issue(*names):
+            return subprocess.run([CERT_TOOL, "--names", lineage] + list(names),
+                                  capture_output=True, text=True, timeout=600)
+        got = issue(want, own) if own else None
+        if got is None or got.returncode != 0:
+            got = issue(want)
+        if got.returncode != 0:
+            tail = (got.stderr or got.stdout or "").strip().splitlines()[-2:]
+            raise RuntimeError("no certificate for %s: %s" % (want, " ".join(tail)[:300]))
+        names = [n for n in cert_dns_names(os.path.join(LE_LIVE, lineage, "fullchain.pem"))
+                 if n in (want, own)] or [want]
+        # What the installer wrote, kept for the day the admin panel goes back.
+        if not os.path.exists(DOH_DEFAULT_CERT) and read_text(DOH_CERT_CONF):
+            with open(DOH_DEFAULT_CERT, "w", encoding="utf-8") as fh:
+                fh.write(read_text(DOH_CERT_CONF))
+        if not point_doh_nginx(lineage_text(lineage), names):
+            raise RuntimeError("nginx refused the certificate for %s" % want)
+        before = active_doh_name()
+        tmp = DOH_NAME_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(want + "\n")
+        os.replace(tmp, DOH_NAME_FILE)
+        if before and before != want:
+            forget_lineage(before)
+        DOH_NAME.update(error="")
+        print("DoH now on %s (answering %s)" % (want, " ".join(names)), flush=True)
+    except Exception as e:
+        DOH_NAME.update(error=str(e)[:400], next=time.time() + DOH_NAME_RETRY)
+        log(ERROR, "DoH name not changed: %s" % e)
+    finally:
+        DOH_NAME["running"] = False
+
+
+def give_back_doh_name(own):
+    """Back to the relay's own name and the installer's certificate."""
+    before = active_doh_name()
+    cert = read_text(DOH_DEFAULT_CERT) or lineage_text(own)
+    if not point_doh_nginx(cert, [own]):
+        DOH_NAME.update(error="nginx refused this relay's own certificate")
+        return
+    os.unlink(DOH_NAME_FILE)
+    forget_lineage(before)
+    DOH_NAME.update(error="")
+    print("DoH back on %s" % own, flush=True)
+
+
+def apply_doh_name(want):
+    """Move DoH to the name the admin panel asks for, or back to this relay's."""
+    if not os.path.exists(DOH_FLAG) or DOH_NAME["running"]:
+        return
+    own = (CFG or {}).get("PANEL_DOMAIN") or ""
+    want = str(want or "").strip().lower().strip(".")
+    if not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", want) or want == own:
+        want = ""
+    if DOH_NAME["want"] != want:
+        DOH_NAME.update(want=want, error="", next=0.0)
+    active = active_doh_name()
+    if want == active:
+        return
+    if not want:
+        give_back_doh_name(own)
+        return
+    if time.time() < DOH_NAME["next"]:
+        return
+    DOH_NAME["running"] = True
+    threading.Thread(target=take_doh_name, args=(want, own), daemon=True).start()
+
+
+def doh_name_report():
+    return {"want": DOH_NAME["want"] or "", "active": active_doh_name(),
+            "error": DOH_NAME["error"], "working": DOH_NAME["running"]}
 
 
 def copy_field(value, label):
@@ -2253,7 +2601,7 @@ def doh_box(info, profile="/doh.mobileconfig", setup=False):
     url = doh_url(info)
     if not url:
         return ""
-    host = CFG.get("PANEL_DOMAIN") or ""
+    host = doh_public_name()
     return (
         "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده — وقتی اپراتور DNS را "
         "دست‌کاری می‌کند</summary>" % (" open" if setup else "") +
@@ -3325,7 +3673,6 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         body.append(gauge)
         body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
         body.append(dns_box())
-        body.append(dns_check(info))
         body.append(qlog_box(info))
 
         if not info["ip"]:

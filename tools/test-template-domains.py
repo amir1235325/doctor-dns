@@ -275,19 +275,15 @@ store.run("INSERT OR IGNORE INTO template_services"
           " (template_id, service_key, group_key) VALUES (?, 'custom', 'main')",
           (tid2,))
 html_out = Page().templates()
-drawer = html_out[html_out.index("value='custom.main'"):]
-drawer = drawer[:drawer.index("</details>")]
-check("the template page lists them",
-      "kmplayer.com" in drawer and "example.org" in drawer, drawer[:400])
+check("they are not a row among the services any more", "value='custom.main'" not in html_out)
+foot = html_out[html_out.index("دامنه‌های دلخواه، مسدودها"):]
+check("the template page lists them at its foot, with the blocks and forwards",
+      "kmplayer.com" in foot and "example.org" in foot, foot[:400])
 check("ticked, since the template routes them",
-      "value='kmplayer.com' checked" in drawer, drawer[:400])
-check("and counted", "2 از 2 دامنه" in drawer, drawer[:400])
+      "name='c' value='kmplayer.com' checked" in foot, foot[:400])
 
 rec3 = Recorder()
-rec3.action("template-save", {
-    "id": [str(tid2)], "g": ["spotify.main", "custom.main"],
-    "d": ["scdn.co", "spotify.com", "spotifycdn.com", "example.org"],
-})
+rec3.action("template-rules", {"id": [str(tid2)], "c": ["example.org"]})
 check("un-ticking one is stored like any other exception",
       store.template_domains_off(tid2) == {"kmplayer.com"},
       str(store.template_domains_off(tid2)))
@@ -297,6 +293,11 @@ check("and the relay is not told to route it", "kmplayer.com" not in custom,
       str(custom))
 check("while the one left ticked still routes", "example.org" in custom,
       str(custom))
+rec3.action("template-save", {"id": [str(tid2)], "g": ["spotify.main"],
+                              "d": ["scdn.co", "spotify.com", "spotifycdn.com"]})
+check("saving the services leaves them as they were",
+      store.template_domains_off(tid2) == {"kmplayer.com"}
+      and ("custom", "main") in store.template_groups(tid2), str(store.template_domains_off(tid2)))
 
 store.run("INSERT INTO custom_domains (domain, added_at) VALUES (?, ?)",
           ("added-later.net", panel.now()))
@@ -306,11 +307,11 @@ check("one added later routes without re-saving the template",
       str(profs[str(tid2)]["custom"]))
 
 rec4 = Recorder()
-rec4.action("template-save", {"id": [str(tid2)], "g": ["spotify.main"],
-                              "d": ["scdn.co", "spotify.com", "spotifycdn.com"]})
+rec4.action("template-rules", {"id": [str(tid2)]})
 _, profs = store.profiles(CATALOGUE, default)
-check("the whole service un-ticked routes none of them",
-      profs[str(tid2)]["custom"] == [], str(profs[str(tid2)]["custom"]))
+check("none ticked routes none of them",
+      profs[str(tid2)]["custom"] == [] and ("custom", "main") not in store.template_groups(tid2),
+      str(profs[str(tid2)]["custom"]))
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

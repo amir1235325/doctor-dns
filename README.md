@@ -114,6 +114,32 @@ Safe to re-run — configs are backed up, and a step that would change nothing
 does nothing. `sudo bash doctor-dns.sh --uninstall` puts the machine back,
 undoing only what this script did.
 
+### On one server (single)
+
+Choose **3) single** at the first question, or run
+`sudo ROLE=single bash doctor-dns.sh`. The relay, the exit and the panels all
+go on one server abroad: no pairing token, no tunnel, and no second machine to
+keep running. Give it a domain when it asks, as a relay would want - the
+customer panel, DoH and DoT need its certificate.
+
+⚠️ **The trade is the direct path.** Customers in Iran reach this server
+straight from their own ISP, and that path - Iran to a server abroad - is
+exactly what gets filtered and slowed; a relay inside Iran exists so customers
+never take it. A single server is for trying the service out, or for a server
+whose direct path from Iran happens to be good. The installer says so too.
+
+Open these in the firewall (on a cloud provider, in its own firewall as well):
+
+| | |
+|---|---|
+| **tcp** | 22, 53, 80, 443, 853, 1119, 4070, 8443, and the admin panel's port (9443 by default) |
+| **udp** | 53, 3478 |
+
+The sync API, which a two-server exit answers on 8443, is on **8449** here and
+on loopback only: its only relay is itself. Do not open it. On a cloud machine
+behind NAT - the public address not on any interface, as on AWS - the installer
+notices and listens on the private address it is mapped to; nothing to set.
+
 ### Upgrading
 
 Download the new file and run it. Before it touches anything it compares its

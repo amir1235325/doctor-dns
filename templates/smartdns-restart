@@ -20,21 +20,26 @@ esac
 # Services only. The timers are clocks with nothing to unstick, and nftables is
 # left alone on purpose: restarting it reloads the rules from disk, which throws
 # away the allowlist and the usage counted since the last save.
+# A single machine has both: the panel first, which the sync agent talks to.
+units=""; role=""
+if [ -f "$ETC/panel.env" ]; then
+    role=exit
+    units="smartdns-panel smartdns-admin"
+fi
 if [ -f "$ETC/sync.env" ]; then
-    role=relay
+    [ "$role" = exit ] && role=single || role=relay
     resolvers=""
     for f in "$PROFILES"/*.conf; do
         [ -e "$f" ] || continue
         resolvers="$resolvers smartdns-dns@$(basename "$f" .conf)"
     done
-    units="smartdns-sync$resolvers dnsmasq coturn smartdns-tunnel nginx"
-elif [ -f "$ETC/panel.env" ]; then
-    role=exit
-    units="smartdns-panel smartdns-admin smartdns-tunnel nginx"
-else
+    units="$units smartdns-sync smartdns-doh$resolvers dnsmasq coturn"
+fi
+if [ -z "$role" ]; then
     echo "doctor dns is not installed on this machine" >&2
     exit 1
 fi
+units="${units# } smartdns-tunnel nginx"
 
 installed() { [ "$(systemctl show -p LoadState --value "$1" 2>/dev/null)" = loaded ]; }
 
@@ -46,7 +51,7 @@ restart() {
 }
 
 echo "restarting doctor dns - $role"
-[ "$role" = relay ] && echo "customers' open connections drop for a moment and come straight back"
+[ "$role" != exit ] && echo "customers' open connections drop for a moment and come straight back"
 echo
 
 skipped=""

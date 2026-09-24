@@ -137,6 +137,8 @@ class Resolver:
         return "dnsmasq" if self.key == "main" else "smartdns-dns@%s" % self.key
 
     def label(self):
+        if self.key == "default":
+            return "default template, with the operator's blocks and forwards"
         if self.key == "main":
             return "%s (default)" % self.name if self.name else "default template"
         return self.name or "template %s" % self.key

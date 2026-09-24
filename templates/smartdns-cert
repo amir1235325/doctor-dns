@@ -3,6 +3,10 @@
 #
 # usage: smartdns-cert <domain>        get or renew a certificate
 #        smartdns-cert --renew         renew everything due (the timer's job)
+#        smartdns-cert --names <cert-name> <domain>...
+#                                      one certificate for several names - the
+#                                      DoH name the admin panel set, and the
+#                                      one before it, so both keep working
 #
 # Port 80 is the problem this script exists to work around. Let's Encrypt's
 # HTTP-01 challenge needs it, and on a relay port 80 is forwarded whole to the
@@ -51,8 +55,17 @@ close_port80() {
     return 0
 }
 
+# The names a certificate is for, from the certificate itself - so a renewal
+# asks for what was asked for the first time, several names included.
+cert_names() {
+    openssl x509 -noout -ext subjectAltName -in "$1" 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/^ *DNS://p'
+}
+
 issue() {
-    local domain="$1"
+    local domain="$1"; shift
+    local names=() d
+    for d in "${@:-$domain}"; do names+=(-d "$d"); done
     if [ -f "$CF_CONF" ]; then
         # The operator supplied a DNS token, so prove it that way and leave
         # port 80 alone entirely.
@@ -60,7 +73,7 @@ issue() {
             --dns-cloudflare-credentials "$CF_CONF" \
             --dns-cloudflare-propagation-seconds 30 \
             --register-unsafely-without-email --agree-tos \
-            --non-interactive --quiet --cert-name "$domain" -d "$domain"
+            --non-interactive --quiet --cert-name "$domain" "${names[@]}"
         return $?
     fi
 
@@ -69,7 +82,7 @@ issue() {
     open_port80 || die "could not redirect port 80 for the challenge"
     certbot certonly --standalone --http-01-port "$ACME_PORT" \
         --register-unsafely-without-email --agree-tos \
-        --non-interactive --quiet --cert-name "$domain" -d "$domain"
+        --non-interactive --quiet --cert-name "$domain" "${names[@]}"
     local rc=$?
     close_port80
     trap - EXIT INT TERM
@@ -87,8 +100,18 @@ case "${1:-}" in
         openssl x509 -checkend $((30 * 86400)) -noout \
             -in "$path/fullchain.pem" >/dev/null 2>&1 && continue
         printf 'renewing %s\n' "$domain"
-        issue "$domain" && systemctl reload nginx 2>/dev/null
+        # shellcheck disable=SC2046 - one name per word, as certbot wants them
+        issue "$domain" $(cert_names "$path/fullchain.pem") && systemctl reload nginx 2>/dev/null
     done
+    exit 0
+    ;;
+--names)
+    [ $# -ge 3 ] || die "usage: smartdns-cert --names <cert-name> <domain>..."
+    shift
+    NAME="$1"; shift
+    printf '    getting a certificate for %s\n' "$*"
+    issue "$NAME" "$@" || die "certbot could not get a certificate for $*"
+    printf '%s    certificate installed:%s %s\n' "$G" "$N" "$LIVE/$NAME/fullchain.pem"
     exit 0
     ;;
 "")

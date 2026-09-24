@@ -218,7 +218,7 @@ CREATE TABLE IF NOT EXISTS usage (
 -- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
 -- after thirty days not even that. Only the customer is shown it.
 -- The DNS report a customer switched on for support: which names their
--- devices asked, where the answer sent them and why, for 24 hours from the
+-- devices asked, where the answer sent them and why, for an hour from the
 -- last time each was asked. Nothing is kept for anybody who did not ask.
 CREATE TABLE IF NOT EXISTS query_log (
     user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -261,6 +261,38 @@ CREATE TABLE IF NOT EXISTS custom_domains (
     domain   TEXT PRIMARY KEY,
     note     TEXT,
     added_at TEXT NOT NULL
+);
+
+-- Domains the operator wants closed: answered "no such name", subdomains
+-- and all, on every relay - including a name the service itself routes.
+-- For every template, `all_templates`, which includes templates made later;
+-- or for those listed in blocked_templates.
+CREATE TABLE IF NOT EXISTS blocked_domains (
+    domain        TEXT PRIMARY KEY,
+    note          TEXT,
+    added_at      TEXT NOT NULL,
+    all_templates INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS blocked_templates (
+    domain      TEXT NOT NULL REFERENCES blocked_domains(domain) ON DELETE CASCADE,
+    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    PRIMARY KEY (domain, template_id)
+);
+
+-- Domains the operator wants asked of a resolver of their choosing - the
+-- domain and everything under it. `servers` is one or more IPv4 addresses,
+-- space-separated, each with an optional #port. Which templates, as above.
+CREATE TABLE IF NOT EXISTS dns_forwards (
+    domain        TEXT PRIMARY KEY,
+    servers       TEXT NOT NULL,
+    note          TEXT,
+    added_at      TEXT NOT NULL,
+    all_templates INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS forward_templates (
+    domain      TEXT NOT NULL REFERENCES dns_forwards(domain) ON DELETE CASCADE,
+    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    PRIMARY KEY (domain, template_id)
 );
 
 -- Host health, one row per sample per machine. Written every thirty seconds
@@ -434,6 +466,9 @@ METRICS_KEEP_HOURS = 24
 # Columns added after the first release. sqlite has no ADD COLUMN IF NOT
 # EXISTS, so these are applied only when the column is genuinely missing.
 MIGRATIONS = [
+    # Blocks and forwards per template; the ones made before that are for all.
+    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
+    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     # Which warning thresholds this user has already been told about, so a
     # sync every thirty seconds does not send the same warning a hundred times.
     ("users", "warned", "INTEGER NOT NULL DEFAULT 0"),
@@ -538,6 +573,21 @@ DEFAULT_SETTINGS = {
 # The public resolvers until the operator picks others: neither sends the
 # asker's subnet on, which Google does and Tencent's games refuse Iran by.
 DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
+# The resolvers the admin panel offers, for the relays to time. The admin
+# panel names them; a test holds the two lists to each other.
+BENCH_RESOLVERS = ["1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
+                   "9.9.9.9", "149.112.112.112", "8.8.8.8", "8.8.4.4",
+                   "208.67.222.222", "208.67.220.220", "94.140.14.14", "94.140.15.15"]
+
+
+def bench_wanted(store):
+    """What the relays should time: the list, and the operator's own pick if
+    it is not on it; "now" changes when the operator asks to time them again."""
+    ips = list(BENCH_RESOLVERS)
+    for ip in (store.setting("dns_upstream") or "").split():
+        if ip not in ips:
+            ips.append(ip)
+    return {"ips": ips, "now": store.setting("bench_now") or ""}
 
 # Fractions of the quota at which the user is warned, and the bit each one
 # sets in users.warned.
@@ -1268,11 +1318,40 @@ class Store:
                 # them, and keeps them everywhere else.
                 "pins": ("bypass", "epic") not in self.template_groups(tid),
             }
+            # The operator's blocks and forwards for this template, which the
+            # relay writes into its resolver alone.
+            profiles[str(tid)].update(self.template_rules(tid))
         return by_ip, profiles
 
     def custom_domains(self):
         return [r["domain"] for r in self.q(
             "SELECT domain FROM custom_domains ORDER BY domain")]
+
+    def blocked_domains(self):
+        return [r["domain"] for r in self.q(
+            "SELECT domain FROM blocked_domains ORDER BY domain")]
+
+    def dns_forwards(self):
+        return {r["domain"]: r["servers"].split() for r in self.q(
+            "SELECT domain, servers FROM dns_forwards ORDER BY domain")}
+
+    def template_rules(self, template_id):
+        """The blocks and forwards one template has: those for every template
+        and those ticked for it. A forward under one of its blocks is left out
+        - the block wins - so the relay is never handed the two to settle."""
+        blocked = [r["domain"] for r in self.q(
+            "SELECT domain FROM blocked_domains b WHERE all_templates = 1 OR EXISTS"
+            " (SELECT 1 FROM blocked_templates t WHERE t.domain = b.domain"
+            " AND t.template_id = ?) ORDER BY domain", (template_id,))]
+        closed = set(blocked)
+        forwards = {}
+        for r in self.q("SELECT domain, servers FROM dns_forwards f WHERE all_templates = 1"
+                        " OR EXISTS (SELECT 1 FROM forward_templates t WHERE t.domain = f.domain"
+                        " AND t.template_id = ?) ORDER BY domain", (template_id,)):
+            parts = r["domain"].split(".")
+            if not any(".".join(parts[i:]) in closed for i in range(len(parts))):
+                forwards[r["domain"]] = r["servers"].split()
+        return {"blocked": blocked, "forwards": forwards}
 
     def template_names(self):
         """Every template's name by id, and which is the default - so the
@@ -2036,12 +2115,14 @@ def record_doh(store, stats):
 
 
 # ----------------------------------------------------------------- DNS report
-QLOG_HOURS = 24
+# An hour: long enough to open the service that fails and look, short
+# enough that nobody's browsing sits in a table for a day.
+QLOG_HOURS = 1
 QLOG_MAX = 2000         # rows kept per customer; the oldest go first
 
 
 def qlog_on(store, user_id, on):
-    """Switch a customer's DNS report on for 24 hours, or off - which also
+    """Switch a customer's DNS report on for an hour, or off - which also
     throws away what was kept, at once."""
     if on:
         until = (datetime.now(timezone.utc) + timedelta(hours=QLOG_HOURS)
@@ -2072,10 +2153,18 @@ def qlog_reasoner(store, user, catalogue):
     index = service_index(catalogue)
     label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
     custom = set(store.custom_domains())
+    rules = store.template_rules(tid)
+    blocked = set(rules["blocked"])
+    forwards = rules["forwards"]
 
     def reason(name):
         parts = name.lower().rstrip(".").split(".")
         tails = [".".join(parts[i:]) for i in range(len(parts) - 1)]
+        if any(t in blocked for t in tails):
+            return "blocked:"
+        for t in tails:
+            if t in forwards:
+                return "forward:" + " ".join(forwards[t])
         if any(t in custom for t in tails):
             return "routed:دامنه‌های دلخواه ادمین"
         for t in tails:                     # the longest rule wins, as in dnsmasq
@@ -2147,6 +2236,16 @@ def new_doh_token(store, user):
     return token
 
 
+def prune_qlog(store):
+    """The DNS report: gone an hour after a name was last asked, and the
+    switch off by itself when its hour is up. Run on every sync, not with
+    the hourly pruning - an hour's keeping must not become two."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=QLOG_HOURS)
+              ).isoformat(timespec="seconds")
+    store.run("DELETE FROM query_log WHERE last_at < ?", (cutoff,))
+    store.run("UPDATE users SET qlog_until = NULL WHERE qlog_until <= ?", (now(),))
+
+
 def prune_usage(store):
     """Drop what is older than each grain is kept for."""
     now_t = datetime.now(timezone.utc)
@@ -2157,11 +2256,7 @@ def prune_usage(store):
     store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
     cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
     store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
-    # The DNS report: 24 hours from the last time a name was asked, and the
-    # switch goes off by itself when its time is up.
-    store.run("DELETE FROM query_log WHERE last_at < ?",
-              ((now_t - timedelta(hours=QLOG_HOURS)).isoformat(timespec="seconds"),))
-    store.run("UPDATE users SET qlog_until = NULL WHERE qlog_until <= ?", (now(),))
+    prune_qlog(store)
     store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 
 
@@ -3401,6 +3496,31 @@ class API(http.server.BaseHTTPRequestHandler):
                 self.store.set_setting("doh_host", doh_host)
             # Which resolvers the relay asks and how the admin's last pick
             # went there, for the settings page. Written only when it changes.
+            # How the admin panel's name for DoH is going on this relay.
+            state = body.get("doh_name")
+            if isinstance(state, dict):
+                text = json.dumps({k: str(state.get(k) or "")[:400]
+                                   for k in ("want", "active", "error")}
+                                  | {"working": bool(state.get("working"))}, sort_keys=True)
+                if self.store.setting("doh_name_state:" + who) != text:
+                    self.store.set_setting("doh_name_state:" + who, text)
+            checked = body.get("forward_check")
+            if isinstance(checked, dict) and isinstance(checked.get("ms"), dict):
+                text = json.dumps({"at": int(checked.get("at") or 0), "ms": {
+                    str(d)[:253]: {str(s)[:21]: (int(v) if isinstance(v, (int, float)) else None)
+                                   for s, v in list(servers.items())[:4]}
+                    for d, servers in list(checked["ms"].items())[:200]
+                    if isinstance(servers, dict)}}, sort_keys=True)
+                if self.store.setting("forward_check:" + who) != text:
+                    self.store.set_setting("forward_check:" + who, text)
+            timed = body.get("resolver_bench")
+            if isinstance(timed, dict) and isinstance(timed.get("ms"), dict):
+                text = json.dumps({"at": int(timed.get("at") or 0),
+                                   "ms": {str(k)[:15]: (int(v) if isinstance(v, (int, float)) else None)
+                                          for k, v in list(timed["ms"].items())[:32]}},
+                                  sort_keys=True)
+                if self.store.setting("resolver_bench:" + who) != text:
+                    self.store.set_setting("resolver_bench:" + who, text)
             report = body.get("upstream")
             if isinstance(report, dict):
                 text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
@@ -3415,6 +3535,10 @@ class API(http.server.BaseHTTPRequestHandler):
                 enforce_quotas(self.store)
             except Exception as e:
                 log_exception("quota pass failed: %r" % e)
+            try:
+                prune_qlog(self.store)
+            except Exception as e:
+                log_exception("DNS report prune failed: %r" % e)
             # Once an hour is plenty for throwing away what is past keeping.
             if time.time() - PRUNED[0] > 3600:
                 PRUNED[0] = time.time()
@@ -3443,12 +3567,22 @@ class API(http.server.BaseHTTPRequestHandler):
                 log_exception("DoH tokens not built: %r" % e)
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
                                     "extra_domains": extra, "doh": doh,
+                                    # Closed for everybody; the relay takes
+                                    # them out of every rule that routes them.
+                                    # The default template's blocks and
+                                    # forwards; the others' are in their profiles.
+                                    "default_rules": self.store.template_rules(
+                                        DEFAULT_TEMPLATE[0]),
                                     # The public resolvers the operator picked;
                                     # the relay checks them before it takes them.
                                     "upstream": (self.store.setting("dns_upstream")
                                                  or DEFAULT_UPSTREAM).split(),
                                     # Whose DNS to keep for the support report.
                                     "qlog": qlog_wanted(self.store),
+                                    # The name the admin panel gave DoH, if any.
+                                    "doh_name": self.store.setting("doh_name") or "",
+                                    # The resolvers to time, and when last asked.
+                                    "bench": bench_wanted(self.store),
                                     "templates": self.store.template_names(),
                                     "watch": watch_job(self.store),
                                     })
@@ -3489,7 +3623,7 @@ class API(http.server.BaseHTTPRequestHandler):
             on = bool(body.get("on"))
             qlog_on(self.store, user["id"], on)
             return self.reply(200, {"ok": True, "message": (
-                "گزارش DNS روشن شد؛ تا ۲۴ ساعت نگه داشته می‌شود" if on else
+                "گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود" if on else
                 "گزارش DNS خاموش و پاک شد")})
         if self.path == "/user-doh-reset":
             user = self._session_user(body.get("session"))
@@ -3821,6 +3955,17 @@ class API(http.server.BaseHTTPRequestHandler):
         }
 
 
+def api_address(cfg):
+    """Where the sync API listens: everywhere on 8443, as the relays expect -
+    or, on a single machine (ROLE=single), on loopback and another port,
+    because there 8443 is the customer panel and the only relay is itself."""
+    try:
+        port = int(cfg.get("API_PORT") or API_PORT)
+    except ValueError:
+        port = API_PORT
+    return (cfg.get("API_BIND") or "0.0.0.0", port)
+
+
 def serve_api(cfg, store):
     API.store = store
     API.secret = cfg["SYNC_SECRET"]
@@ -3828,11 +3973,13 @@ def serve_api(cfg, store):
     API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)
-    make_api_server(ctx).serve_forever()
+    make_api_server(ctx, address=api_address(cfg)).serve_forever()
 
 
-def make_api_server(ctx, port=None):
-    return TLSServer(("0.0.0.0", API_PORT if port is None else port), API, ctx)
+def make_api_server(ctx, port=None, address=None):
+    if address is None:
+        address = ("0.0.0.0", API_PORT if port is None else port)
+    return TLSServer(address, API, ctx)
 
 
 # ---------------------------------------------------------------- bot API
@@ -4704,7 +4851,7 @@ def main():
     signal.signal(signal.SIGINT, bye)
     threading.Thread(target=serve_bot_api, args=(cfg, store), daemon=True).start()
     threading.Thread(target=webhook_worker, args=(store,), daemon=True).start()
-    print("panel up: api on :%d" % API_PORT, flush=True)
+    print("panel up: api on %s:%d" % api_address(cfg), flush=True)
     # In the foreground now. The Telegram loop used to be what kept this
     # process alive and the API rode along on a daemon thread behind it; with
     # the bot gone the API is the whole job, so it holds the process itself.

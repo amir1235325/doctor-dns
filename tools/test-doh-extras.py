@@ -249,19 +249,8 @@ check("and the page is told whether the DNS reaches us",
 # ---------------------------------------------------------------- the pages
 print("the customer's page")
 iso = lambda s: (datetime.now(timezone.utc) - timedelta(seconds=s)).isoformat(timespec="seconds")
-check("no address, no line", sync.dns_check({"ip": None}) == "")
-line = sync.dns_check({"ip": "203.0.113.5", "dns_seen_at": iso(120), "ip_added_at": iso(9000)})
-check("recent DNS: it reaches us, and when", "✅" in line and "۲ دقیقه" not in line and "دقیقه پیش" in line, line)
-line = sync.dns_check({"ip": "203.0.113.5", "dns_seen_at": iso(9000), "doh_seen_at": iso(60),
-                       "ip_added_at": iso(99999)})
-check("only encrypted DNS lately: that is said instead", "رمزگذاری‌شده استفاده" in line, line)
-line = sync.dns_check({"ip": "203.0.113.5", "dns_seen_at": None, "ip_added_at": iso(120)})
-check("just registered: wait, not a warning", "⏳" in line and "warnbox" not in line)
-line = sync.dns_check({"ip": "203.0.113.5", "dns_seen_at": iso(7200), "ip_added_at": iso(99999)})
-check("nothing for an hour: the warning, with when it last came, and what to do",
-      "warnbox" in line and "ساعت پیش" in line and "DNS رمزگذاری‌شده" in line, line)
-line = sync.dns_check({"ip": "203.0.113.5", "dns_seen_at": None, "ip_added_at": iso(99999)})
-check("never: the warning without a time", "warnbox" in line and "آخرین" not in line)
+check("no line about whether the DNS reaches us - it only alarmed people",
+      "def dns_check(" not in read("templates/smartdns-sync"))
 sync.CFG = {"PANEL_DOMAIN": "users.example.com"}
 sync.DOH_FLAG = os.path.join(tmp, "flag")
 open(sync.DOH_FLAG, "w").close()

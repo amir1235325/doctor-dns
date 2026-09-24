@@ -24,6 +24,11 @@ valid_ip() {
     for p in $1; do [ "$p" -le 255 ] || return 1; done
 }
 
+# The API's port: 8443, or on a single machine the loopback one it moved to -
+# where 8443 is the customer panel, and must not be closed.
+port="$(sed -n 's/^API_PORT=//p' "$ETC/panel.env" 2>/dev/null | head -1)"
+case "$port" in ""|*[!0-9]*) port=8443 ;; esac
+
 list="127.0.0.1"
 for ip in $(sed -n 's/^RELAY_IP=//p' "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
     if valid_ip "$ip"; then list="$list, $ip"
@@ -36,8 +41,8 @@ delete table inet smartdns_api
 table inet smartdns_api {
     chain input {
         type filter hook input priority -5 ; policy accept ;
-        tcp dport 8443 ip saddr { $list } accept
-        tcp dport 8443 drop
+        tcp dport $port ip saddr { $list } accept
+        tcp dport $port drop
     }
 }"
 
@@ -54,7 +59,7 @@ if [ -z "$NFT" ]; then
     exit 0
 fi
 if printf '%s\n' "$rules" | "$NFT" -f -; then
-    echo "port 8443 answers: $list"
+    echo "port $port answers: $list"
 else
     echo "nft refused the rule - the sync API stays open, and the panel refuses strangers itself" >&2
 fi

@@ -23,7 +23,9 @@ case "${1:-}" in
     *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
 esac
 [ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-menu" >&2; exit 1; }
-if [ -f "$ETC/sync.env" ]; then role=relay
+# Both is a single machine, the relay and the exit in one.
+if [ -f "$ETC/sync.env" ] && [ -f "$ETC/panel.env" ]; then role=single
+elif [ -f "$ETC/sync.env" ]; then role=relay
 elif [ -f "$ETC/panel.env" ]; then role=exit
 else echo "doctor dns is not installed on this machine" >&2; exit 1; fi
 VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo '?')"
@@ -149,10 +151,10 @@ menu_logs() {
         'more lines per part   (smartdns-logs -n)|ask "lines per part" && run smartdns-logs -n "$REPLY"'
         'one file to send, secrets masked   (smartdns-logs --report)|run smartdns-logs --report'
     )
-    [ "$role" = exit ] && [ -x /usr/local/bin/smartdns-bot-logs ] && items+=(
+    [ "$role" != relay ] && [ -x /usr/local/bin/smartdns-bot-logs ] && items+=(
         'logs of the Telegram bot   (smartdns-bot-logs)|run smartdns-bot-logs'
     )
-    [ "$role" = relay ] && items+=(
+    [ "$role" != exit ] && items+=(
         'what this relay is doing   (smartdns status)|run smartdns status'
         'the names a customer asks for, live   (smartdns-watch)|watch_customer'
     )
@@ -214,7 +216,7 @@ menu_install() {
 }
 
 restart_all() {
-    if [ "$role" = relay ]; then
+    if [ "$role" != exit ]; then
         sure "customers' open connections drop for a moment - go ahead?" || return 0
     fi
     run smartdns-restart
@@ -228,6 +230,16 @@ main() {
             'domains|menu_domains'
             'customers and access|menu_customers'
             'tunnel to the exit|menu_tunnel'
+            'restart everything   (smartdns-restart)|restart_all'
+            'installation, updates and certificates|menu_install'
+        )
+    elif [ "$role" = single ]; then
+        # No tunnel: there is nothing to tunnel between.
+        items=(
+            'status and logs|menu_logs'
+            'domains|menu_domains'
+            'customers and access|menu_customers'
+            'admin panel|menu_admin'
             'restart everything   (smartdns-restart)|restart_all'
             'installation, updates and certificates|menu_install'
         )

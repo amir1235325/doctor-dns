@@ -253,8 +253,8 @@ print("the relay's nginx with DNS over HTTPS")
 don, doff = render(True, doh=True), render(False, doh=True)
 check("443 reads the name and nothing more",
       "ssl_preread on;" in don and "proxy_pass $https_target;" in don)
-check("  the relay's own name goes to the DoH server",
-      "users.example.com  127.0.0.1:8453;" in don)
+check("  the DoH names go to the DoH server - the file the installer and smartdns-sync keep",
+      "include /etc/nginx/smartdns-doh-names.map;" in don)
 check("  every other name goes where it always went, through the tunnel",
       "default       to_exit_https;" in don)
 check("  or straight to the exit without one",

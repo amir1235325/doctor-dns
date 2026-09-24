@@ -2,7 +2,7 @@
 """The DNS report a customer switches on for support.
 
 What has to hold: nothing is kept for anybody who did not switch it on;
-switched on, it lasts 24 hours and each name 24 hours from its last use, and
+switched on, it lasts an hour and each name an hour from its last use, and
 switching it off throws away what was kept at once. Plain DNS comes from
 smartdns-watch run for exactly those addresses, DoH and DoT from
 smartdns-doh for exactly those accounts - both saying where each answer sent
@@ -205,15 +205,15 @@ panel.record_qlog(store, {"doh:%d" % u["id"]: [["store.steampowered.com", "via r
 r = [x for x in panel.qlog_rows(store, u["id"]) if x["name"] == "store.steampowered.com"][0]
 check("DoH adds to the same name, and says it came that way", r["hits"] == 7 and r["via"] == "doh")
 store.run("UPDATE query_log SET last_at = ? WHERE name = 'example.org'",
-          ((datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec="seconds"),))
+          ((datetime.now(timezone.utc) - timedelta(minutes=61)).isoformat(timespec="seconds"),))
 panel.prune_usage(store)
 left = {x["name"] for x in panel.qlog_rows(store, u["id"])}
-check("a name not asked for 24 hours is gone, the rest stay",
+check("a name not asked for an hour is gone, the rest stay",
       "example.org" not in left and "store.steampowered.com" in left, repr(left))
 store.run("UPDATE users SET qlog_until = ? WHERE id = ?",
           ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds"), u["id"]))
 panel.prune_usage(store)
-check("the switch goes off by itself after 24 hours",
+check("the switch goes off by itself after an hour",
       store.one("SELECT qlog_until FROM users WHERE id = ?", (u["id"],))["qlog_until"] is None
       and panel.qlog_wanted(store) == {"uids": [], "ips": []})
 before = [(x["name"], x["hits"]) for x in panel.qlog_rows(store, u["id"])]
@@ -239,7 +239,13 @@ check("the customer's page shows what was kept, where it went and why",
 check("with the switch to turn it off", "value='0'" in box and "خاموش کردن" in box)
 off = sync.qlog_box({"ip": "203.0.113.5", "qlog_until": None, "qlog": []})
 check("off, it offers to turn it on and explains who sees it and for how long",
-      "value='1'" in off and "۲۴ ساعت" in off and "پشتیبانی هم همین را می‌بیند" in off)
+      "value='1'" in off and "یک ساعت" in off and "۲۴ ساعت" not in off
+      and "پشتیبانی هم همین را می‌بیند" in off)
+check("an hour, in the panel too", panel.QLOG_HOURS == 1)
+psrc = open(os.path.join(ROOT, "templates/smartdns-panel"), encoding="utf-8").read()
+sync_part = psrc[psrc.index('if self.path == "/sync":'):psrc.index("PRUNED[0] = time.time()")]
+check("and it is thrown away on every sync, not with the hourly pruning",
+      "prune_qlog(self.store)" in sync_part)
 check("no address registered, no switch", sync.qlog_box({"ip": None}) == "")
 admin.DB = os.path.join(tmp, "panel.db")
 admin.STORE = admin.Store(admin.DB)

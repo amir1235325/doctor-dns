@@ -53,7 +53,9 @@ logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
 stream = conf[conf.index("stream {"):]
 
 print("the exit's config")
-check("the public server passes to $upstream", "proxy_pass $upstream;" in stream)
+check("the public server passes to $upstream, unless a single machine's DoH is on",
+      "proxy_pass __HTTPS_TARGET__;" in stream
+      and "s#__HTTPS_TARGET__#${HTTPS_TARGET:-\$upstream}#g" in logic)
 check("$upstream is chosen from $target, so the blackholes still apply first",
       "map $target $upstream {" in stream and "map $ssl_preread_server_name $target {" in stream)
 check("everything else leaves as before, $target:443", "default  $target:443;" in stream)
@@ -104,9 +106,12 @@ check("and so do they with the block in", conf.count("{") == conf.count("}"))
 print("the installer")
 check("install_payload drops the block when told to",
       '-e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}"' in logic)
-det = logic[logic.index("NO_GOOGLE_V6=1"):logic.index("install_payload EXIT_NGINX")]
+start = logic.index("NO_GOOGLE_V6=1")
+det = logic[start:logic.index("install_payload EXIT_NGINX", start)]
 check("the default is to leave it out", det.startswith("NO_GOOGLE_V6=1"))
-check("only an exit considers it", 'if [ "$ROLE" = exit ]; then' in det)
+check("only an exit considers it - or a single machine, which is one too",
+      "if is_exit; then" in det
+      and 'is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }' in logic)
 check("it needs a real IPv6 connection to Google",
       "curl -6 -s -o /dev/null -m 10 https://www.google.com/" in det)
 check("and an nginx with ipv4=off, 1.23.1 or later", "1.23.1" in det and "sort -V" in det)

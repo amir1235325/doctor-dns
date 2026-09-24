@@ -312,7 +312,7 @@ logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
 at = logic.find("payload SMARTDNS_RULES > /usr/local/bin/smartdns-rules")
 check("it is written", at > 0)
 check("inside the relay-only part",
-      logic.index('if [ "$ROLE" = relay ]; then\n\n    step "dnsmasq') < at
+      logic.index('if is_relay; then\n\n    step "dnsmasq') < at
       < logic.index('step "epic-pin'))
 check("and uninstall knows it is ours", "note_file /usr/local/bin/smartdns-rules" in logic)
 build = open(os.path.join(HERE, "build-installer.py"), encoding="utf-8").read()

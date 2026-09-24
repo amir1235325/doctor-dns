@@ -608,7 +608,9 @@ def heat_chart(hours):
 QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
                 "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
                 "no address": "بدون آدرس"}
-QLOG_REASON = {"routed": "در قالبش از رله می‌رود",
+QLOG_REASON = {"blocked": "ادمین مسدودش کرده",
+               "forward": "از DNS تعیین‌شدهٔ ادمین پرسیده می‌شود",
+               "routed": "در قالبش از رله می‌رود",
                "unticked": "در قالبش از رله نمی‌رود",
                "bypass": "در قالبش از رله نمی‌رود",
                "outside": "در فهرست سرویس‌ها نیست"}
@@ -632,7 +634,7 @@ def qlog_card(user):
                 "</p></div>")
     out = ["<div class='card'><h2>گزارش DNS — %s</h2>" % (
         "روشن تا %s" % user["qlog_until"][:16].replace("T", " ") if on else "خاموش"),
-        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم ۲۴ ساعت بعد از آخرین بار پاک "
+        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم یک ساعت بعد از آخرین بار پاک "
         "می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا "
         "اسم در فهرست نیست.</p>",
         "<table><tr><th>اسم</th><th>کجا رفت</th><th>چرا</th><th>راه</th><th>بار</th>"
@@ -690,6 +692,56 @@ def doh_card():
     return "".join(out)
 
 
+def doh_name_card(p):
+    """The settings page's card for the name DoH and DoT answer on."""
+    row = STORE.one("SELECT value FROM settings WHERE key = 'doh_name'")
+    want = row["value"] if row and row["value"] else ""
+    row = STORE.one("SELECT value FROM settings WHERE key = 'doh_host'")
+    given = row["value"] if row and row["value"] else ""
+    out = ["<div class='card'><h2>نام DNS امن (DoH و DoT)</h2>"]
+    if not given:
+        out.append("<p class='muted'>هیچ رله‌ای هنوز DNS امن را روشن نکرده؛ رله برای این کار "
+                   "به دامنه و گواهی نیاز دارد.</p></div>")
+        return "".join(out)
+    out.append("<p>نامی که الان به مشتری‌ها داده می‌شود: <code dir='ltr'>%s</code></p>"
+               % html.escape(given))
+    rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'doh_name_state:%'"
+                   " ORDER BY key")
+    if want and rows:
+        out.append("<table><tr><th>رله</th><th>وضعیت</th></tr>")
+        for r in rows:
+            try:
+                st = json.loads(r["value"])
+            except ValueError:
+                continue
+            if st.get("active") == want:
+                what = "<span class='ok'>✓ روی %s</span>" % html.escape(want)
+            elif st.get("working"):
+                what = "در حال گرفتن گواهی…"
+            elif st.get("error"):
+                what = "<span class='warn'>نشد: %s</span> <span class='muted'>(۱۵ دقیقه بعد " \
+                       "دوباره امتحان می‌شود)</span>" % html.escape(st["error"])
+            else:
+                what = "<span class='muted'>منتظر همگام‌سازی بعدی</span>"
+            out.append("<tr><td dir='ltr'>%s</td><td>%s</td></tr>"
+                       % (html.escape(r["key"].split(":", 1)[1]), what))
+        out.append("</table>")
+    out.append("<form method='post' action='/%s/doh-name' class='row'>"
+               "<input name='name' dir='ltr' placeholder='dns.example.com' value='%s' "
+               "style='min-width:240px'><button>ذخیره</button></form>"
+               % (p, html.escape(want)))
+    if want:
+        out.append("<form method='post' action='/%s/doh-name'><input type='hidden' name='name' "
+                   "value=''><button class='ghost'>برگشت به نام خود رله</button></form>" % p)
+    out.append("<p class='muted'>برای روزی که نام فعلی در ایران فیلتر شود. اول یک رکورد A برای "
+               "نام تازه بسازید که به آی‌پی رله اشاره کند؛ بعد اینجا ذخیره کنید. رله برای نام تازه "
+               "گواهی می‌گیرد (حدود بیست ثانیه پورت ۸۰ به Let's Encrypt داده می‌شود و دانلود "
+               "کنسول‌ها همان مدت مکث می‌کند) و از آن به بعد آدرس DoH و DoT مشتری‌ها با نام تازه "
+               "نشان داده می‌شود. تا وقتی نام قبلی هنوز به رله اشاره کند، در همان گواهی می‌ماند و "
+               "دستگاه‌هایی که با آن تنظیم شده‌اند از کار نمی‌افتند.</p></div>")
+    return "".join(out)
+
+
 def user_usage(uid):
     """The same numbers the customer's page is drawn from, straight from the
     panel's tables - this runs beside it, on the same database."""
@@ -703,6 +755,102 @@ def user_usage(uid):
     return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
             "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
             "days": series("1d", now_t - timedelta(days=30), "%Y-%m-%d")}
+
+
+def total_usage():
+    """Everybody's usage added up, from the same tables as a customer's own
+    charts: five minutes for a day, hours for a week, days for two months -
+    two, so this month can be set against the one before."""
+    now_t = datetime.now(TEHRAN)
+
+    def series(grain, since, fmt):
+        return [(r["bucket"], r["up"], r["down"]) for r in STORE.q(
+            "SELECT bucket, SUM(up) up, SUM(down) down FROM usage WHERE grain = ?"
+            " AND bucket >= ? GROUP BY bucket ORDER BY bucket",
+            (grain, since.strftime(fmt)))]
+
+    return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
+            "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
+            "days": series("1d", now_t - timedelta(days=60), "%Y-%m-%d")}
+
+
+def change_note(now_b, before_b, word):
+    """"12٪ more than the week before", or nothing when there is no before."""
+    if not before_b:
+        return ""
+    pct = 100.0 * (now_b - before_b) / before_b
+    if abs(pct) < 5:
+        return "تقریباً همان %s قبل" % word
+    return "%d٪ %s از %s قبل" % (abs(pct), "بیشتر" if pct > 0 else "کمتر", word)
+
+
+def total_usage_card(p):
+    """The home page's picture of the whole service: every customer's usage
+    together, and who used the most - each name a link to their own charts."""
+    try:
+        view = total_usage()
+    except sqlite3.OperationalError:
+        return ""          # a panel that has not made the table yet
+    if not view["days"] and not view["five"]:
+        return ("<div class='card'><h2>مصرف کل</h2><p class='muted'>هنوز مصرفی ثبت نشده. "
+                "نمودارها از اولین همگام‌سازی رله بعد از این نسخه پر می‌شوند.</p></div>")
+    today = datetime.now(TEHRAN).date()
+    by = {b: (u, d) for b, u, d in view["days"]}
+
+    def span(first, last):
+        """Days first..last ago, both included, as (up, down)."""
+        up = down = 0
+        for i in range(first, last + 1):
+            u, d = by.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), (0, 0))
+            up += u
+            down += d
+        return up, down
+
+    now_up, now_down = span(0, 0)
+    week, last_week = span(0, 6), span(7, 13)
+    month, last_month = span(0, 29), span(30, 59)
+    live = view["five"][-1] if view["five"] else None
+    live_bps = ""
+    now_t = datetime.now(TEHRAN)
+    current = now_t.replace(minute=now_t.minute - now_t.minute % 5, second=0, microsecond=0)
+    if live and live[0] == current.strftime("%Y-%m-%dT%H:%M"):
+        took = max(30.0, (now_t - current).total_seconds())
+        live_bps = "↓ %s · ↑ %s Mbps" % (mbit(live[2] * 8 / took), mbit(live[1] * 8 / took))
+
+    out = ["<div class='card'><h2>مصرف کل — همهٔ مشتری‌ها</h2><div class='grid'>"]
+    for n, l, note in (
+            (live_bps or "-", "سرعت الان", "میانگین ۵ دقیقهٔ اخیر"),
+            (human(now_up + now_down), "امروز", "دانلود %s، آپلود %s" % (human(now_down), human(now_up))),
+            (human(sum(week)), "۷ روز اخیر", change_note(sum(week), sum(last_week), "هفتهٔ")),
+            (human(sum(month)), "۳۰ روز اخیر", change_note(sum(month), sum(last_month), "ماه"))):
+        out.append("<div class='stat'><div class='n' dir='ltr'>%s</div><div class='l'>%s</div>"
+                   "<div class='l'>%s</div></div>" % (html.escape(n), l, html.escape(note)))
+    out.append("</div>")
+    days_svg, _ = days_chart(view["days"])
+    out.append("<h3 class='chart-h'>روزانه</h3>" + legend() + days_svg)
+    out.append("<h3 class='chart-h'>سرعت کل ۲۴ ساعت اخیر</h3>" + legend() + speed_chart(view["five"]))
+    out.append("<h3 class='chart-h'>ساعت‌های پرمصرف — ۷ روز اخیر</h3>" + heat_chart(view["hours"]))
+
+    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
+    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+                  " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
+                  " WHERE g.grain = '1d' AND g.bucket >= ? GROUP BY u.id"
+                  " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10", (since,))
+    if top:
+        total = sum(week) or 1
+        out.append("<h3 class='chart-h'>پرمصرف‌ترین‌ها — ۷ روز اخیر</h3><table><tr><th>مشتری</th>"
+                   "<th>دانلود</th><th>آپلود</th><th>سهم</th></tr>")
+        for r in top:
+            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
+            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a> <span class='muted'>%s</span>"
+                       "</td><td>%s</td><td>%s</td><td>%d٪</td></tr>"
+                       % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
+                          human(r["down"]), human(r["up"]),
+                          round(100.0 * (r["down"] + r["up"]) / total)))
+        out.append("</table>")
+    out.append("<p class='muted'>روز و ساعت به وقت تهران. روی نام هر مشتری بزنید تا نمودار "
+               "خودش را ببینید.</p></div>")
+    return "".join(out)
 
 
 # ---------------------------------------------------------------- at rest
@@ -913,10 +1061,14 @@ UPSTREAM_FILE = "/etc/smart-dns/upstream"
 RESOLVER_LINE = re.compile(r"(\bresolver )[0-9. ]+?( ipv[46]=off;)")
 
 
-def dns_probe(server, name="cloudflare.com", timeout=2.0):
+def dns_probe(server, name="cloudflare.com", timeout=2.0, any_answer=False):
     """How long `server` takes to answer an A query for `name`, in
     milliseconds; None when it does not answer, or answers with an error.
-    Twice, so one lost packet does not condemn a resolver."""
+    Twice, so one lost packet does not condemn a resolver. `server` may carry
+    a port, 1.2.3.4#5353, the way dnsmasq writes it. With `any_answer`, an
+    answer of "no such name" or with no records counts too: the question is
+    then whether the resolver is there, not whether the name is."""
+    server, _, port = server.partition("#")
     qid = os.urandom(2)
     query = (qid + bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
              + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
@@ -926,12 +1078,14 @@ def dns_probe(server, name="cloudflare.com", timeout=2.0):
         s.settimeout(timeout)
         try:
             t0 = time.monotonic()
-            s.sendto(query, (server, 53))
+            s.sendto(query, (server, int(port or 53)))
             while True:
                 data, _ = s.recvfrom(4096)
                 if len(data) >= 12 and data[:2] == qid:
                     break
             # An answer, no error, and at least one record in it.
+            if data[2] & 0x80 and any_answer and data[3] & 0x0F in (0, 3):
+                return max(1, int((time.monotonic() - t0) * 1000))
             if data[2] & 0x80 and data[3] & 0x0F == 0 and (data[6] or data[7]):
                 return max(1, int((time.monotonic() - t0) * 1000))
             return None
@@ -940,6 +1094,48 @@ def dns_probe(server, name="cloudflare.com", timeout=2.0):
         finally:
             s.close()
     return None
+
+
+
+
+def bench(ips, tries=3, workers=8):
+    """How long each resolver takes to answer from here: the median of a few
+    real DNS questions, in milliseconds, or None for one that did not answer.
+    A DNS question rather than a ping, because a ping is not what a resolver
+    is for - some answer no pings, and some route them another way."""
+    import concurrent.futures
+
+    def one(ip):
+        times = sorted(t for t in (dns_probe(ip) for _ in range(tries)) if t is not None)
+        return ip, (times[len(times) // 2] if times else None)
+
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        return dict(pool.map(one, ips))
+
+
+# The same timing from this machine, whose nginx asks these resolvers too:
+# every ten minutes, and at once when the operator asks.
+EXIT_BENCH = {"ms": {}, "at": 0, "wake": threading.Event()}
+
+
+def bench_ips():
+    ips = [ip for _, a, b, _ in RESOLVERS for ip in (a, b)]
+    row = STORE.one("SELECT value FROM settings WHERE key = 'dns_upstream'")
+    for ip in ((row["value"] if row and row["value"] else "") or "").split():
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+def bench_loop():
+    while True:
+        try:
+            EXIT_BENCH["ms"] = bench(bench_ips())
+            EXIT_BENCH["at"] = time.time()
+        except Exception as e:
+            log(WARN, "resolvers not timed here: %r" % e)
+        EXIT_BENCH["wake"].wait(600)
+        EXIT_BENCH["wake"].clear()
 
 
 def resolver_name(ip):
@@ -993,20 +1189,77 @@ def sealing_note(p):
             % (KEY_FILE, p))
 
 
+def ms_text(v):
+    return "%d ms" % v if isinstance(v, int) else "جواب نداد"
+
+
+def bench_table(picks):
+    """Each resolver's time from each relay, and from this machine: the
+    fastest in each column marked, one that did not answer said so."""
+    cols = []
+    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'resolver_bench:%'"
+                     " ORDER BY key"):
+        try:
+            got = json.loads(r["value"])
+        except ValueError:
+            continue
+        cols.append(("رله " + r["key"].split(":", 1)[1], got.get("ms") or {}, got.get("at") or 0))
+    if EXIT_BENCH["ms"]:
+        cols.append(("این سرور", EXIT_BENCH["ms"], int(EXIT_BENCH["at"])))
+    if not cols:
+        return ("<p class='muted'>زمان جواب هنوز اندازه گرفته نشده؛ رله‌ها چند دقیقه بعد از "
+                "این نسخه اولین اندازه‌گیری را می‌فرستند.</p>"), {}
+    rows = [(prov, ip) for prov, a, b, _ in RESOLVERS for ip in (a, b)]
+    for ip in picks:
+        if ip and ip not in [x for _, x in rows]:
+            rows.append(("دلخواه", ip))
+    best = []
+    for _, ms, _ in cols:
+        answered = [v for v in ms.values() if isinstance(v, int)]
+        best.append(min(answered) if answered else None)
+    out = ["<table><tr><th>DNS</th><th>آی‌پی</th>%s</tr>"
+           % "".join("<th>%s</th>" % html.escape(c[0]) for c in cols)]
+    for prov, ip in rows:
+        cells = []
+        for (name, ms, _), fastest in zip(cols, best):
+            v = ms.get(ip)
+            text = ms_text(v) if ip in ms else "-"
+            if isinstance(v, int) and v == fastest:
+                cells.append("<td><b class='ok'>%s ✓</b></td>" % text)
+            elif ip in ms and v is None:
+                cells.append("<td class='warn'>%s</td>" % text)
+            else:
+                cells.append("<td>%s</td>" % text)
+        mark = " <span class='ok'>●</span>" if ip in picks else ""
+        out.append("<tr><td>%s%s</td><td><code>%s</code></td>%s</tr>"
+                   % (html.escape(prov), mark, ip, "".join(cells)))
+    ages = [int(time.time() - at) // 60 for _, _, at in cols if at]
+    out.append("</table><p class='muted'>میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر "
+               "ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: "
+               "سؤال‌هایشان از آن‌جا پرسیده می‌شود. آخرین اندازه‌گیری: %s.</p>"
+               % ("حدود %d دقیقه پیش" % max(ages) if ages and max(ages) else "همین الان"))
+    # For the option labels: the relays' figure, where there is one.
+    first = cols[0][1]
+    return "".join(out), first
+
+
 def upstream_card():
     """The settings page's card for picking the public resolvers."""
     p = CFG["ADMIN_PATH"]
     row = STORE.one("SELECT value FROM settings WHERE key = 'dns_upstream'")
     picks = ((row["value"] if row and row["value"] else DEFAULT_UPSTREAM).split() + [""])[:2]
     known = {ip for _, a, b, _ in RESOLVERS for ip in (a, b)}
+    timings, label_ms = bench_table(picks)
 
     def select(name, current):
         opts = ["<option value=''%s>— هیچ —</option>" % ("" if current else " selected")
                 ] if name == "backup" else []
         for prov, a, b, _ in RESOLVERS:
             opts.append("<optgroup label='%s'>%s</optgroup>" % (html.escape(prov), "".join(
-                "<option value='%s'%s>%s</option>"
-                % (ip, " selected" if ip == current else "", ip) for ip in (a, b))))
+                "<option value='%s'%s>%s%s</option>"
+                % (ip, " selected" if ip == current else "", ip,
+                   " — " + ms_text(label_ms[ip]) if ip in label_ms else "")
+                for ip in (a, b))))
         custom = current if current and current not in known else ""
         return ("<select name='%s' dir='ltr'>%s</select> <input name='%s_custom'"
                 " value='%s' placeholder='یا آی‌پی دلخواه' dir='ltr' size='15'>"
@@ -1025,6 +1278,9 @@ def upstream_card():
     notes = ["<li><b>%s</b> (%s، %s): %s</li>" % (html.escape(n), a, b, html.escape(w))
              for n, a, b, w in RESOLVERS if w]
     out.append("<ul class='muted'>%s</ul>" % "".join(notes))
+    out.append("<h3 class='chart-h'>زمان جواب</h3>" + timings)
+    out.append("<form method='post' action='/%s/dns-bench'><button class='ghost'>"
+               "اندازه‌گیری دوباره</button></form>" % p)
 
     rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
                    " ORDER BY key")
@@ -1251,6 +1507,7 @@ details.svc>summary label{flex:1}
 .under{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:2px}
 .alsoneed{margin:0;padding:8px 30px 10px;font-size:11px;color:var(--warn);
  border-top:1px solid var(--row)}
+h3.chart-h{font-size:13px;font-weight:600;margin:20px 0 6px;color:var(--fg)}
 h3.sec{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em;
  margin:24px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--row)}
 h3.sec:first-of-type{margin-top:6px}
@@ -2038,6 +2295,10 @@ def ordered_rows(out):
             # template, so it is not drawn where it could be ticked.
             if grp.get("locked"):
                 continue
+            # The operator's own domains are ticked one by one at the foot of
+            # the page, beside the blocks and forwards, not as a service here.
+            if svc["key"] == "custom":
+                continue
             where = grp.get("section") or svc.get("section") or ""
             rank = order.index(where) if where in order else len(order)
             rows.append((rank, svc, grp))
@@ -2692,6 +2953,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                        "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
         out.append("</div></div>")
 
+        out.append(total_usage_card(CFG["ADMIN_PATH"]))
         out.append(doh_card())
 
         rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
@@ -3350,7 +3612,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     "علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. "
                     "برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید."
                     "</p></div>"
-                    % html.escape(t["name"]))
+                    % html.escape(t["name"])) + template_rules_card(t, p)
 
         groups = STORE.template_groups(t["id"])
         off = STORE.template_domains_off(t["id"])
@@ -3531,6 +3793,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
   });
 })();
 </script>""")
+        out.append(template_rules_card(t, p))
         return "".join(out)
 
     def domains(self):
@@ -3558,6 +3821,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
         out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس "
                    "«دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را "
                    "برداشت. به‌علاوهٔ %d دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
+        out.append(blocked_card(p))
+        out.append(forwards_card(p))
         return "".join(out)
 
     def settings(self):
@@ -3593,6 +3858,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       "تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.</p>"))
 
         out.append(upstream_card())
+        out.append(doh_name_card(p))
 
         out.append("<div class='card'><h2>آدرس این پنل</h2>"
                    "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
@@ -4221,9 +4487,15 @@ class Admin(http.server.BaseHTTPRequestHandler):
             # out by subtraction: every domain in a routed group that did not
             # come back.
             keep = set(params.get("d") or [])
-            STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
-            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?", (tid,))
+            # The operator's own domains are not in this form - they have one
+            # of their own at the foot of the page - so they are kept as they are.
+            STORE.run("DELETE FROM template_services WHERE template_id = ?"
+                      " AND service_key != 'custom'", (tid,))
+            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
+                      " AND domain NOT IN (SELECT domain FROM custom_domains)", (tid,))
             for svc in catalogue_now():
+                if svc["key"] == "custom":
+                    continue
                 for g in svc["groups"]:
                     # A locked group cannot be ticked, even by a form that
                     # sends it anyway.
@@ -4282,6 +4554,106 @@ class Admin(http.server.BaseHTTPRequestHandler):
             STORE.run("INSERT INTO custom_domains (domain, note, added_at)"
                       " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
             return self.redirect("domains?m=%s اضافه شد" % domain)
+
+        if rest == "blocked-add":
+            try:
+                domain = clean_domain(one("domain"))
+            except ValueError as e:
+                return self.redirect("domains?m=!%s" % e)
+            for host in own_hosts():
+                if host == domain or host.endswith("." + domain):
+                    return self.redirect("domains?m=!با بستن %s، %s هم بسته می‌شود که "
+                                         "مشتری‌ها برای رسیدن به سرویس لازمش دارند"
+                                         % (domain, host))
+            if STORE.one("SELECT 1 FROM blocked_domains WHERE domain = ?", (domain,)):
+                return self.redirect("domains?m=!%s از قبل مسدود است" % domain)
+            # For every template; a template's own page takes it out of that one.
+            STORE.run("INSERT INTO blocked_domains (domain, note, added_at)"
+                      " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
+            also = [svc["label"] for svc in catalogue_now() if svc["key"] != "custom"
+                    and any(d == domain or d.endswith("." + domain)
+                            for g in svc["groups"] for d in g["domains"])]
+            if STORE.one("SELECT 1 FROM custom_domains WHERE domain = ? OR domain LIKE ?",
+                         (domain, "%." + domain)):
+                also.append("دامنه‌های شما")
+            return self.redirect("domains?m=%s مسدود شد%s" % (
+                domain, "؛ جزو %s هم بود و دیگر از رله نمی‌رود" % "، ".join(also[:3])
+                if also else ""))
+
+        if rest == "forward-add":
+            try:
+                domain = clean_domain(one("domain"))
+                servers = clean_servers(one("servers"))
+            except ValueError as e:
+                return self.redirect("domains?m=!%s" % e)
+            if STORE.one("SELECT 1 FROM dns_forwards WHERE domain = ?", (domain,)):
+                return self.redirect("domains?m=!%s از قبل DNS جداگانه دارد؛ اول حذفش کنید"
+                                     % domain)
+            # Only a block for every template makes a forward pointless;
+            # under one for some, it still works for the rest.
+            for r in STORE.q("SELECT domain FROM blocked_domains WHERE all_templates = 1"):
+                if domain == r["domain"] or domain.endswith("." + r["domain"]):
+                    return self.redirect("domains?m=!%s برای همهٔ قالب‌ها مسدود است (%s)"
+                                         % (domain, r["domain"]))
+            STORE.run("INSERT INTO dns_forwards (domain, servers, note, added_at)"
+                      " VALUES (?, ?, ?, ?)",
+                      (domain, " ".join(servers), one("note") or None, now()))
+            also = [svc["label"] for svc in catalogue_now() if svc["key"] != "custom"
+                    and any(d == domain or d.endswith("." + domain)
+                            for g in svc["groups"] for d in g["domains"])]
+            return self.redirect("domains?m=%s از %s پرسیده می‌شود%s" % (
+                domain, " ".join(servers),
+                "؛ جزو %s هم بود و دیگر از رله نمی‌رود" % "، ".join(also[:3]) if also else ""))
+
+        if rest == "template-rules":
+            tid = int(one("id") or 0)
+            ids = [r["id"] for r in STORE.q("SELECT id FROM templates ORDER BY id")]
+            if tid not in ids:
+                return self.redirect("templates?m=!قالب پیدا نشد")
+            # The operator's own domains: the service ticked while any of them
+            # is, each un-ticked one switched off inside it - the same rows the
+            # service list used to write. The default template routes them all.
+            if not STORE.one("SELECT is_default FROM templates WHERE id = ?", (tid,))["is_default"]:
+                custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains")]
+                ticked = set(params.get("c") or []) & set(custom)
+                STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
+                          " AND domain IN (SELECT domain FROM custom_domains)", (tid,))
+                if ticked:
+                    STORE.run("INSERT OR IGNORE INTO template_services"
+                              " (template_id, service_key, group_key) VALUES (?, 'custom', 'main')",
+                              (tid,))
+                    for d in custom:
+                        if d not in ticked:
+                            STORE.run("INSERT OR IGNORE INTO template_domains_off"
+                                      " (template_id, domain) VALUES (?, ?)", (tid, d))
+                else:
+                    STORE.run("DELETE FROM template_services WHERE template_id = ?"
+                              " AND service_key = 'custom'", (tid,))
+            for table, field in (("blocked_domains", "b"), ("dns_forwards", "f")):
+                ticked = set(params.get(field) or [])
+                for r in STORE.q("SELECT domain FROM %s" % table):
+                    every, have = rule_templates(table, r["domain"])
+                    on, want = every or tid in have, r["domain"] in ticked
+                    if on == want:
+                        continue
+                    if want:
+                        set_scope(table, r["domain"], False, sorted(have | {tid}))
+                    elif every:
+                        # "Every template but this one" - which from now on
+                        # does not take in templates made later.
+                        set_scope(table, r["domain"], False, [i for i in ids if i != tid])
+                    else:
+                        set_scope(table, r["domain"], False, sorted(have - {tid}))
+            return self.redirect("templates?t=%d&m=ذخیره شد؛ تا ۳۰ ثانیه دیگر روی "
+                                 "رله‌ها اعمال می‌شود" % tid)
+
+        if rest == "forward-del":
+            STORE.run("DELETE FROM dns_forwards WHERE domain = ?", (one("domain"),))
+            return self.redirect("domains?m=حذف شد")
+
+        if rest == "blocked-del":
+            STORE.run("DELETE FROM blocked_domains WHERE domain = ?", (one("domain"),))
+            return self.redirect("domains?m=آزاد شد")
 
         if rest == "domain-del":
             STORE.run("DELETE FROM custom_domains WHERE domain = ?", (one("domain"),))
@@ -4362,6 +4734,31 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 "از این به بعد خرید و تمدید در پنل وب تلگرام وصل‌شده می‌خواهد" if on
                 else "وصل کردن تلگرام دیگر اجباری نیست"))
 
+        if rest == "doh-name":
+            raw = (one("name") or "").strip()
+            if not raw:
+                STORE.run("DELETE FROM settings WHERE key = 'doh_name'")
+                return self.redirect("settings?m=DNS امن تا یک دقیقه دیگر به نام خود رله "
+                                     "برمی‌گردد")
+            try:
+                name = clean_domain(raw)
+            except ValueError as e:
+                return self.redirect("settings?m=!%s" % e)
+            if re.fullmatch(r"[0-9.]+", name):
+                return self.redirect("settings?m=!یک نام بنویسید، نه آی‌پی")
+            STORE.run("INSERT INTO settings (key, value) VALUES ('doh_name', ?)"
+                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (name,))
+            return self.redirect("settings?m=ذخیره شد؛ رله تا یکی دو دقیقه دیگر گواهی %s را "
+                                 "می‌گیرد — وضعیتش همین‌جاست" % name)
+
+        if rest == "dns-bench":
+            # The relays at their next sync, this machine now.
+            STORE.run("INSERT INTO settings (key, value) VALUES ('bench_now', ?)"
+                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (now(),))
+            EXIT_BENCH["wake"].set()
+            return self.redirect("settings?m=اندازه‌گیری شروع شد؛ تا یک دقیقه دیگر صفحه را "
+                                 "تازه کنید")
+
         if rest == "dns-upstream":
             picks = []
             for k in ("primary", "backup"):
@@ -4430,6 +4827,224 @@ FORBIDDEN = ("localhost", "local", "internal", "arpa", "telegram.org",
              "t.me", "telegram.me")
 
 
+# Which templates a block or a forward is for: every one, including those made
+# later, or the ones listed in its link table.
+RULE_TABLES = {"blocked_domains": "blocked_templates", "dns_forwards": "forward_templates"}
+
+
+def rule_templates(table, domain):
+    """(for every template, the ids it is ticked for)."""
+    row = STORE.one("SELECT all_templates FROM %s WHERE domain = ?" % table, (domain,))
+    ids = {r["template_id"] for r in STORE.q(
+        "SELECT template_id FROM %s WHERE domain = ?" % RULE_TABLES[table], (domain,))}
+    return bool(row and row["all_templates"]), ids
+
+
+def scope_text(table, domain):
+    every, ids = rule_templates(table, domain)
+    if every:
+        return "همهٔ قالب‌ها"
+    names = [r["name"] for r in STORE.q("SELECT id, name FROM templates ORDER BY id")
+             if r["id"] in ids]
+    return "، ".join(names) if names else "هیچ قالبی"
+
+
+def set_scope(table, domain, every, ids):
+    STORE.run("UPDATE %s SET all_templates = ? WHERE domain = ?" % table,
+              (1 if every else 0, domain))
+    STORE.run("DELETE FROM %s WHERE domain = ?" % RULE_TABLES[table], (domain,))
+    for tid in ([] if every else ids):
+        STORE.run("INSERT OR IGNORE INTO %s (domain, template_id) VALUES (?, ?)"
+                  % RULE_TABLES[table], (domain, tid))
+
+
+def template_rules_card(t, p):
+    """A template's own page, at its foot: the operator's own domains it
+    routes, and the blocks and forwards it has - everything the operator
+    added themselves, in one place."""
+    try:
+        blocked = STORE.q("SELECT domain FROM blocked_domains ORDER BY domain")
+        forwards = STORE.q("SELECT domain, servers FROM dns_forwards ORDER BY domain")
+    except sqlite3.OperationalError:
+        blocked = forwards = []
+    custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains ORDER BY domain")]
+    out = ["<div class='card'><h2>دامنه‌های دلخواه، مسدودها و DNS جداگانهٔ این قالب</h2>"]
+    if not blocked and not forwards and not custom:
+        out.append("<p class='muted'>هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از "
+                   "<a href='/%s/domains'>صفحهٔ دامنه‌ها</a>.</p></div>" % p)
+        return "".join(out)
+    out.append("<form method='post' action='/%s/template-rules'>"
+               "<input type='hidden' name='id' value='%d'>" % (p, t["id"]))
+    if custom:
+        out.append("<h3 class='chart-h'>دامنه‌های دلخواه — از رله می‌روند</h3>")
+        if t["is_default"]:
+            out += ["<label style='display:block;margin:4px 0'><input type='checkbox' checked "
+                    "disabled> <code>%s</code></label>" % html.escape(d) for d in custom]
+            out.append("<p class='muted'>قالب پیش‌فرض همیشه همهٔ دامنه‌های دلخواه را از رله "
+                       "می‌برد.</p>")
+        else:
+            on = ("custom", "main") in STORE.template_groups(t["id"])
+            off = STORE.template_domains_off(t["id"])
+            out += ["<label style='display:block;margin:4px 0'><input type='checkbox' name='c' "
+                    "value='%s'%s> <code>%s</code></label>"
+                    % (html.escape(d), " checked" if on and d not in off else "",
+                       html.escape(d)) for d in custom]
+            out.append("<p class='muted'>دامنهٔ دلخواهی که بعداً اضافه کنید، در قالبی که "
+                       "دست‌کم یکی از این‌ها تیک خورده، خودکار از رله می‌رود.</p>")
+
+    def box(name, table, domain, extra):
+        every, ids = rule_templates(table, domain)
+        on = every or t["id"] in ids
+        return ("<label style='display:block;margin:4px 0'><input type='checkbox' name='%s' "
+                "value='%s'%s> <code>%s</code>%s <span class='muted'>— %s</span></label>"
+                % (name, html.escape(domain), " checked" if on else "", html.escape(domain),
+                   extra, html.escape(scope_text(table, domain))))
+    if blocked:
+        out.append("<h3 class='chart-h'>دامنه‌های مسدود</h3>")
+        out += [box("b", "blocked_domains", r["domain"], "") for r in blocked]
+    if forwards:
+        out.append("<h3 class='chart-h'>DNS جداگانه</h3>")
+        out += [box("f", "dns_forwards", r["domain"],
+                    " ← <code dir='ltr'>%s</code>" % html.escape(r["servers"]))
+                for r in forwards]
+    out.append("<p class='muted'>تیکِ مسدودها و DNS جداگانه یعنی برای مشتری‌های این قالب. "
+               "برداشتن تیکِ ردیفی که "
+               "«همهٔ قالب‌ها» است آن را فقط برای قالب‌های دیگر نگه می‌دارد. اگر دامنه‌ای در "
+               "این قالب هم مسدود باشد هم DNS جداگانه داشته باشد، مسدود بودن برنده است.</p>"
+               "<button>ذخیره</button></form></div>")
+    return "".join(out)
+
+
+def blocked_card(p):
+    """The domains page's second card: names closed for every customer."""
+    try:
+        rows = STORE.q("SELECT * FROM blocked_domains ORDER BY added_at DESC")
+    except sqlite3.OperationalError:
+        return ""          # a panel that has not made the table yet
+    out = ["<div class='card'><h2>دامنه‌های مسدود (%d)</h2>" % len(rows),
+           "<form method='post' action='/%s/blocked-add' class='row' "
+           "style='margin-bottom:14px'>"
+           "<input name='domain' placeholder='example.com' style='min-width:220px'>"
+           "<input name='note' placeholder='یادداشت (اختیاری)'>"
+           "<button class='danger'>مسدود کن</button></form>" % p]
+    if rows:
+        out.append("<table><tr><th>دامنه</th><th>قالب‌ها</th><th>یادداشت</th><th>افزوده</th>"
+                   "<th></th></tr>")
+        for r in rows:
+            out.append("<tr><td><code>%s</code></td><td>%s</td><td class='muted'>%s</td>"
+                       "<td class='muted'>%s</td>"
+                       "<td><form method='post' action='/%s/blocked-del'>"
+                       "<input type='hidden' name='domain' value='%s'>"
+                       "<button class='ghost'>آزاد کن</button></form></td></tr>"
+                       % (html.escape(r["domain"]),
+                          html.escape(scope_text("blocked_domains", r["domain"])),
+                          html.escape(r["note"] or ""),
+                          (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
+        out.append("</table>")
+    out.append("<p class='muted'>این‌ها برای مشتری‌های قالب‌های انتخاب‌شده بالا نمی‌آیند: DNS "
+               "جواب «چنین اسمی نیست» می‌دهد، با همهٔ زیردامنه‌ها. دامنه‌ای که خود سرویس "
+               "از رله می‌برد هم بسته می‌شود. تا یک دقیقه بعد روی رله‌ها اعمال می‌شود؛ "
+               "دستگاهی که جواب قبلی را نگه داشته ممکن است چند دقیقه دیرتر ببیند. "
+               "فقط جلوی DNS ما را می‌گیرد: کسی که DNS دیگری بگذارد یا مستقیم با آی‌پی "
+               "وصل شود از این رد می‌شود. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ "
+               "در صفحهٔ هر قالب می‌شود تیکش را برداشت.</p></div>")
+    return "".join(out)
+
+
+FORWARD_SERVER_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(#(\d{1,5}))?$")
+
+
+def clean_servers(raw):
+    """"1.1.1.1, 8.8.8.8#5353" as the list dnsmasq will be given, or an error."""
+    out = []
+    for s in re.split(r"[\s,،]+", (raw or "").strip()):
+        if not s:
+            continue
+        m = FORWARD_SERVER_RE.match(s)
+        if not m or any(int(x) > 255 for x in m.groups()[:4]) or \
+                (m.group(6) and not 0 < int(m.group(6)) < 65536):
+            raise ValueError("«%s» آی‌پی درستی نیست؛ مثل 1.1.1.1 یا 10.0.0.2#5353" % s)
+        if s.startswith("0.") or s.startswith("127."):
+            raise ValueError("«%s» روی خود رله است، نه یک DNS" % s)
+        if s not in out:
+            out.append(s)
+    if not out:
+        raise ValueError("آی‌پی DNS را بنویسید")
+    if len(out) > 4:
+        raise ValueError("حداکثر چهار DNS برای هر دامنه")
+    return out
+
+
+def forwards_card(p):
+    """The domains page's third card: names asked of a resolver of the
+    operator's choosing, and whether each relay can reach it."""
+    try:
+        rows = STORE.q("SELECT * FROM dns_forwards ORDER BY added_at DESC")
+    except sqlite3.OperationalError:
+        return ""
+    relays = []
+    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'forward_check:%'"
+                     " ORDER BY key"):
+        try:
+            relays.append((r["key"].split(":", 1)[1], json.loads(r["value"]).get("ms") or {}))
+        except ValueError:
+            continue
+    out = ["<div class='card'><h2>DNS جداگانه برای دامنه‌ها (%d)</h2>" % len(rows),
+           "<form method='post' action='/%s/forward-add' class='row' "
+           "style='margin-bottom:14px'>"
+           "<input name='domain' placeholder='example.com' style='min-width:200px'>"
+           "<input name='servers' placeholder='1.1.1.1' dir='ltr' style='min-width:160px'>"
+           "<input name='note' placeholder='یادداشت (اختیاری)'>"
+           "<button>افزودن</button></form>" % p]
+    if rows:
+        out.append("<table><tr><th>دامنه</th><th>DNS</th><th>قالب‌ها</th>%s<th>یادداشت</th>"
+                   "<th></th></tr>"
+                   % "".join("<th>از رله %s</th>" % html.escape(ip) for ip, _ in relays))
+        for r in rows:
+            cells = []
+            for _, ms in relays:
+                got = ms.get(r["domain"])
+                if not isinstance(got, dict):
+                    cells.append("<td class='muted'>-</td>")
+                    continue
+                parts = []
+                for s in r["servers"].split():
+                    v = got.get(s)
+                    parts.append("<span class='ok'>%d ms</span>" % v if isinstance(v, int)
+                                 else "<span class='warn'>جواب نداد</span>" if s in got else "-")
+                cells.append("<td>%s</td>" % " · ".join(parts))
+            out.append("<tr><td><code>%s</code></td><td dir='ltr'><code>%s</code></td>"
+                       "<td>%s</td>%s<td class='muted'>%s</td>"
+                       "<td><form method='post' action='/%s/forward-del'>"
+                       "<input type='hidden' name='domain' value='%s'>"
+                       "<button class='danger'>حذف</button></form></td></tr>"
+                       % (html.escape(r["domain"]), html.escape(r["servers"]),
+                          html.escape(scope_text("dns_forwards", r["domain"])), "".join(cells),
+                          html.escape(r["note"] or ""), p, html.escape(r["domain"])))
+        out.append("</table>")
+    out.append("<p class='muted'>این دامنه و همهٔ زیردامنه‌هایش برای مشتری‌های قالب‌های "
+               "انتخاب‌شده از همین DNS "
+               "پرسیده می‌شوند، نه از DNS بالادستی. اگر جزو دامنه‌هایی باشد که سرویس از رله "
+               "می‌برد، دیگر از رله نمی‌رود و جواب همین DNS به مشتری داده می‌شود. چند DNS را با "
+               "فاصله بنویسید؛ پورت غیر ۵۳ با #، مثل <code dir='ltr'>10.0.0.2#5353</code>. "
+               "ستون هر رله می‌گوید آن DNS از خود رله جواب می‌دهد یا نه (هر ده دقیقه). "
+               "دامنهٔ مسدود بر این مقدم است. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ در صفحهٔ "
+               "هر قالب می‌شود تیکش را برداشت.</p></div>")
+    return "".join(out)
+
+
+def own_hosts():
+    """The names customers need to reach us by, which a block must not cover."""
+    hosts = []
+    for key in ("doh_host", "doh_name", "customer_panel_url"):
+        row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+        v = (row["value"] if row and row["value"] else "").strip().lower()
+        v = v.split("://", 1)[-1].split("/")[0].split(":")[0].strip(".")
+        if v:
+            hosts.append(v)
+    return hosts
+
+
 def clean_domain(raw):
     """Same normalisation the bot does, so a domain added here and one added
     there end up identical rather than as two rows differing by a www."""
@@ -4473,6 +5088,7 @@ def main():
     SECTIONS[:] = load_sections()
     STORE = Store(DB)
     SEALED_CHECK.append(lambda: count_sealed(STORE.db))
+    threading.Thread(target=bench_loop, daemon=True).start()
     try:
         db_key()
     except Exception as e:

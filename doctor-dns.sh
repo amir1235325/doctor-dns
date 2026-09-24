@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.7.4"
+VERSION="0.8.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -87,12 +87,22 @@ backup_file() {
 # Write payload $1 to file $2, substituting the two addresses. Backs up whatever
 # was there, and skips the write when the content is identical so re-runs do not
 # churn files or trigger needless restarts. Returns 0 only if it changed.
+# A single machine (ROLE=single) is both ends at once: the relay's DNS and
+# gate in front of the exit's proxy, with the panel beside them. Most of this
+# file asks which parts a machine has, not which role it is.
+is_relay() { [ "$ROLE" = relay ] || [ "$ROLE" = single ]; }
+is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }
+# Where a single machine's sync API listens: loopback only, because 8443 is
+# its customer panel, and the only relay it has is itself.
+SINGLE_API_PORT=8449
+
 # Where the relay's certificate is, and so whether it can serve DoH. The
 # name is the customer panel's: one certificate, one name, for the panel on
 # 8443 and for DNS on 443 and 853.
 doh_paths() {
     DOH_ON=""; NO_DOH=1; DOH_HOST=""; DOH_CERT=""; DOH_KEY=""
-    [ "$ROLE" = relay ] && [ -n "${PANEL_DOMAIN:-}" ] || return 0
+    HTTPS_TARGET='$upstream'
+    is_relay && [ -n "${PANEL_DOMAIN:-}" ] || return 0
     if [ -n "${PANEL_CERT:-}" ]; then
         DOH_CERT="$PANEL_CERT"; DOH_KEY="${PANEL_KEY:-}"
     else
@@ -101,7 +111,29 @@ doh_paths() {
     fi
     if [ -f "$DOH_CERT" ] && [ -f "$DOH_KEY" ]; then
         DOH_ON=1; NO_DOH=""; DOH_HOST="$PANEL_DOMAIN"
+        # A single machine's 443 sends its own name to the DoH server. An if,
+        # not &&: the last command of a function is its status, and under
+        # set -e a relay would have stopped here.
+        if [ "$ROLE" = single ]; then HTTPS_TARGET='$https_target'; fi
     fi
+}
+
+# What nginx's DoH blocks include: the certificate, and the names that reach
+# the DoH server. Written here with the machine's own name; once the admin
+# panel has given DoH a name of its own and smartdns-sync has a certificate
+# for it (/etc/smart-dns/doh-name), they are smartdns-sync's, and an upgrade
+# leaves them be. Needed before nginx -t whenever DoH is on.
+DOH_CERT_CONF=/etc/nginx/smartdns-doh-cert.conf
+DOH_NAMES_MAP=/etc/nginx/smartdns-doh-names.map
+doh_includes() {
+    if [ -s /etc/smart-dns/doh-name ] && [ -s "$DOH_CERT_CONF" ] && [ -s "$DOH_NAMES_MAP" ]; then
+        return 0
+    fi
+    note_file "$DOH_CERT_CONF"; note_file "$DOH_NAMES_MAP"
+    printf 'ssl_certificate     %s;\nssl_certificate_key %s;\n' "$DOH_CERT" "$DOH_KEY" \
+        > "$DOH_CERT_CONF"
+    printf '%s 127.0.0.1:8453;\n' "$DOH_HOST" > "$DOH_NAMES_MAP"
+    chmod 644 "$DOH_CERT_CONF" "$DOH_NAMES_MAP"
 }
 
 # Once the certificate exists: nginx with the DoH blocks in, and the flag
@@ -109,15 +141,20 @@ doh_paths() {
 # this is what turns DoH on; on an upgrade the nginx step already had the
 # certificate and this only confirms it.
 relay_doh() {
-    [ "$ROLE" = relay ] || return 0
+    is_relay || return 0
     local was="$DOH_ON"
     doh_paths
     if [ -z "$DOH_ON" ]; then
         rm -f /etc/smart-dns/doh
         return 0
     fi
+    doh_includes
     if [ -z "$was" ]; then
-        install_payload RELAY_NGINX /etc/nginx/nginx.conf || true
+        if [ "$ROLE" = single ]; then
+            install_payload EXIT_NGINX /etc/nginx/nginx.conf || true
+        else
+            install_payload RELAY_NGINX /etc/nginx/nginx.conf || true
+        fi
         nginx -t || die "nginx rejected the DoH config; the previous one is in $BACKUP_DIR"
         systemctl reload nginx 2>/dev/null || systemctl restart nginx
     fi
@@ -126,7 +163,10 @@ relay_doh() {
 }
 
 install_payload() {
-    local name="$1" dest="$2" tmp
+    local name="$1" dest="$2" tmp solo=1
+    # A single machine's own blocks, and its dropping of the "only the relay"
+    # lines, happen on a single machine only (ROLE=single sets SINGLE).
+    [ -n "${SINGLE:-}" ] && solo=""
     tmp="$(mktemp)"
     # MODULE_PATH is filled in here, not with a sed -i afterwards, so that what
     # we compare against the installed file is the finished article. Doing it
@@ -135,7 +175,14 @@ install_payload() {
     # empty for the payloads written before it is discovered, and none of those
     # contain the placeholder.
     payload "$name" \
-        | sed -e "s#__RELAY_IP__#${RELAY_IP}#g" \
+        | sed -e "${SINGLE:+/^ *allow __RELAY_IP__;\$/d}" \
+              -e "${SINGLE:+/^ *allow 127\.0\.0\.1;\$/d}" \
+              -e "${SINGLE:+/^ *deny all;\$/d}" \
+              -e "${solo:+/# single begin/,/# single end/d}" \
+              -e "s#__HTTPS_TARGET__#${HTTPS_TARGET:-\$upstream}#g" \
+              -e "s#__LISTEN_IP__#${LISTEN_IP:-$RELAY_IP}#g" \
+              -e "s#__TURN_EXTERNAL__#${TURN_EXTERNAL:-$RELAY_IP}#g" \
+              -e "s#__RELAY_IP__#${RELAY_IP}#g" \
               -e "s#__EXIT_IP__#${EXIT_IP}#g" \
               -e "s#__MODULE_PATH__#${MOD:-__MODULE_PATH__}#g" \
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
@@ -842,11 +889,16 @@ if [ -n "$INSTALLED_VERSION" ]; then
     was() { recall "$1" 2>/dev/null | tail -1 || true; }
     ROLE="${ROLE:-$(was role)}"
     if [ -z "$ROLE" ]; then
-        if [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
+        # Both files is a single machine; one of them, that end.
+        if [ -f /etc/smart-dns/sync.env ] && [ -f /etc/smart-dns/panel.env ]; then ROLE=single
+        elif [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
         elif [ -f /etc/smart-dns/panel.env ]; then ROLE=exit
         fi
     fi
-    if [ "$ROLE" = relay ]; then
+    if [ "$ROLE" = single ]; then
+        SELF_IP="${SELF_IP:-$(was relay-ip)}"
+        [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
+    elif [ "$ROLE" = relay ]; then
         PEER_IP="${PEER_IP:-$(was exit-ip)}"
         SELF_IP="${SELF_IP:-$(was relay-ip)}"
         # Older state files, or none: the relay's own config has both.
@@ -876,19 +928,33 @@ ROLE="${ROLE:-}"; PEER_IP="${PEER_IP:-}"; SELF_IP="${SELF_IP:-}"
 if [ -z "$ROLE" ]; then
     printf '\n%sWhich side is this machine?%s\n\n' "$B" "$N"
     printf '  1) relay  - the server inside Iran, the one clients point their DNS at\n'
-    printf '  2) exit   - the server abroad, which reaches the blocked sites\n\n'
+    printf '  2) exit   - the server abroad, which reaches the blocked sites\n'
+    printf '  3) single - both on one server abroad, with no relay in Iran\n\n'
     while :; do
-        read -r -p "  choice [1/2]: " answer
+        read -r -p "  choice [1/2/3]: " answer
         case "$answer" in
-            1|relay) ROLE=relay; break ;;
-            2|exit)  ROLE=exit;  break ;;
-            *) warn "answer 1 or 2" ;;
+            1|relay)  ROLE=relay;  break ;;
+            2|exit)   ROLE=exit;   break ;;
+            3|single) ROLE=single; break ;;
+            *) warn "answer 1, 2 or 3" ;;
         esac
     done
 fi
-[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || die "ROLE must be relay or exit"
+[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || [ "$ROLE" = single ] \
+    || die "ROLE must be relay, exit or single"
+SINGLE=""
+if [ "$ROLE" = single ]; then
+    SINGLE=1
+    # Said once, plainly, because it is the whole trade: customers in Iran
+    # reach a server abroad directly, which is what gets filtered and slowed
+    # on the way, and what a relay in Iran exists to avoid.
+    warn "one server abroad, no relay: customers reach it directly from Iran."
+    warn "that works, but the direct path is the one that gets filtered and slowed."
+    warn "for real customers a relay in Iran is better - this is for trying it out,"
+    warn "or where the direct path to this server happens to be good."
+fi
 
-if [ -z "$PEER_IP" ]; then
+if [ -z "$PEER_IP" ] && [ "$ROLE" != single ]; then
     printf '\n'
     if [ "$ROLE" = relay ]; then
         read -r -p "  public address of the EXIT server abroad: " PEER_IP
@@ -896,7 +962,7 @@ if [ -z "$PEER_IP" ]; then
         read -r -p "  public address of the RELAY server in Iran: " PEER_IP
     fi
 fi
-valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
+[ "$ROLE" = single ] || valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
 
 if [ -z "$SELF_IP" ]; then
     guess="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
@@ -905,12 +971,28 @@ if [ -z "$SELF_IP" ]; then
     SELF_IP="${SELF_IP:-$guess}"
 fi
 valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
-[ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
+[ "$ROLE" = single ] || [ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
 
-if [ "$ROLE" = relay ]; then
+if [ "$ROLE" = single ]; then
+    RELAY_IP="$SELF_IP"; EXIT_IP="$SELF_IP"; PEER_IP="$SELF_IP"
+elif [ "$ROLE" = relay ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$PEER_IP"
 else
     RELAY_IP="$PEER_IP"; EXIT_IP="$SELF_IP"
+fi
+# Where dnsmasq and coturn listen. The public address, as it always was -
+# unless it is not on any interface here, as on a cloud machine behind NAT
+# (AWS and many others, where a single machine is likely to be): then they
+# listen on the private address the public one is mapped to, and coturn is
+# told the public one to hand out. DNS answers name the public address either
+# way; that is what customers connect to.
+LISTEN_IP="$RELAY_IP"; TURN_EXTERNAL="$RELAY_IP"
+if is_relay && ! ip -4 -o addr show 2>/dev/null | grep -qw "inet $RELAY_IP"; then
+    local_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+    if [ -n "$local_ip" ] && [ "$local_ip" != "$RELAY_IP" ]; then
+        LISTEN_IP="$local_ip"; TURN_EXTERNAL="$RELAY_IP/$local_ip"
+        info "$RELAY_IP is not on this machine - listening on $local_ip, which it is mapped to"
+    fi
 fi
 
 # ------------------------------------------------------------------ panel
@@ -934,7 +1016,10 @@ fi
 # take it and register their own address against the user's account.
 if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     printf '\n%sHTTPS%s (optional - press enter to skip)\n\n' "$B" "$N"
-    if [ "$ROLE" = relay ]; then
+    if [ "$ROLE" = single ]; then
+        printf '  A name pointing at this machine, for both panels and for DNS\n'
+        printf '  over HTTPS and TLS.\n'
+    elif [ "$ROLE" = relay ]; then
         printf '  A name pointing at this machine, for the page users open to\n'
         printf '  register their address.\n'
     else
@@ -979,6 +1064,8 @@ if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
         read -r -p "  pairing token: " SYNC_TOKEN
     fi
 fi
+# One machine has nothing to tunnel between.
+[ "$ROLE" = single ] && TUNNEL=off
 if [ -z "$TUNNEL" ]; then
     if [ "$ROLE" = exit ] && [ -n "$(env_get /etc/smart-dns/panel.env TUNNEL)" ]; then
         TUNNEL="$(env_get /etc/smart-dns/panel.env TUNNEL)"
@@ -1074,7 +1161,9 @@ remember installed-at "$(date -Is)"
 
 # ---------------------------------------------------------------- packages
 step "Installing packages"
-if [ "$ROLE" = relay ]; then
+if [ "$ROLE" = single ]; then
+    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl openssl"
+elif [ "$ROLE" = relay ]; then
     WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl"
 else
     # nftables for the rule that keeps strangers off the sync API.
@@ -1220,7 +1309,7 @@ info "stream module: $MOD"
 # that can be told to ask for AAAA records only, which nginx has from 1.23.1 -
 # older, or without IPv6, the block is left out and nothing changes.
 NO_GOOGLE_V6=1
-if [ "$ROLE" = exit ]; then
+if is_exit; then
     ngv="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
     if [ "$(printf '%s\n%s\n' 1.23.1 "${ngv:-0}" | sort -V | head -1)" = 1.23.1 ] \
        && curl -6 -s -o /dev/null -m 10 https://www.google.com/ 2>/dev/null; then
@@ -1248,10 +1337,11 @@ fi
 # it. On a first install the certificate comes later in this run, so this is
 # decided again once it is there - see relay_doh.
 doh_paths
+if [ -n "$DOH_ON" ]; then doh_includes; fi
 # The exit's public resolvers, as the admin panel last set them - so an
 # upgrade does not put the defaults back over the operator's choice.
 RESOLVERS=""
-if [ "$ROLE" = exit ] && [ -f /etc/smart-dns/upstream ]; then
+if is_exit && [ -f /etc/smart-dns/upstream ]; then
     RESOLVERS="$(head -n 1 /etc/smart-dns/upstream \
         | grep -Ex '([0-9]{1,3}\.){3}[0-9]{1,3}( ([0-9]{1,3}\.){3}[0-9]{1,3})?' || true)"
 fi
@@ -1264,7 +1354,7 @@ nginx -t || die "nginx rejected the config; the previous one is in $BACKUP_DIR"
 enable_service nginx nginx
 
 # ---------------------------------------------------------------- relay only
-if [ "$ROLE" = relay ]; then
+if is_relay; then
 
     step "dnsmasq: the routed domain list"
     note_file /etc/dnsmasq.d/smart-dns.conf
@@ -1276,7 +1366,7 @@ if [ "$ROLE" = relay ]; then
         # The upstream resolvers are in upstream.conf, below: the admin panel
         # changes them, and this file is rewritten on every upgrade.
         printf 'cache-size=10000\ndomain-needed\nbogus-priv\nno-hosts\n'
-        printf 'bind-interfaces\nlisten-address=127.0.0.1,%s\n\n' "$RELAY_IP"
+        printf 'bind-interfaces\nlisten-address=127.0.0.1,%s\n\n' "$LISTEN_IP"
         printf '# domains answered with this relay, so the traffic leaves via the exit\n'
         payload DOMAINS | while read -r d; do
             [ -n "$d" ] && printf 'address=/%s/%s\n' "$d" "$RELAY_IP"
@@ -1537,7 +1627,7 @@ fi
 relay_doh
 
 # ----------------------------------------------------------------- panel
-if [ "$ROLE" = exit ]; then
+if is_exit; then
     step "Panel: database and sync API"
     mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
 
@@ -1583,6 +1673,12 @@ EOF
                info "added $RELAY_IP to the relays this panel serves" ;;
         esac
     fi
+    # A single machine's sync API is for itself alone, on loopback: its 8443
+    # is the customer panel.
+    if [ "$ROLE" = single ]; then
+        set_env_key /etc/smart-dns/panel.env API_PORT "$SINGLE_API_PORT"
+        set_env_key /etc/smart-dns/panel.env API_BIND 127.0.0.1
+    fi
     # What a re-run or an upgrade keeps, unasked.
     set_env_key /etc/smart-dns/panel.env TUNNEL "$TUNNEL"
     set_env_key /etc/smart-dns/panel.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
@@ -1623,11 +1719,14 @@ EOF
     systemctl restart smartdns-panel.service
     sleep 2
     if systemctl is-active --quiet smartdns-panel.service; then
-        info "sync API is up on :8443"
+        if [ "$ROLE" = single ]; then info "sync API is up on 127.0.0.1:$SINGLE_API_PORT"
+        else info "sync API is up on :8443"; fi
     else
         warn "the panel did not start - journalctl -u smartdns-panel"
     fi
-    if nft list table inet smartdns_api >/dev/null 2>&1; then
+    if [ "$ROLE" = single ]; then
+        :       # on loopback, nothing to close
+    elif nft list table inet smartdns_api >/dev/null 2>&1; then
         info "port 8443 answers the relays only: $(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/panel.env | head -1)"
     else
         warn "port 8443 could not be closed to strangers - the panel still refuses them itself"
@@ -1695,6 +1794,8 @@ EOF
                 8445) die "port 8445 is the bot API" ;;
                 8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
                 18119) die "port 18119 is the exit's own route to Battle.net" ;;
+                "$SINGLE_API_PORT") if [ "$ROLE" = single ]; then die "port $SINGLE_API_PORT is this machine's own sync API"; fi ;;
+                853|3478) if [ "$ROLE" = single ]; then die "port $ADMIN_PORT is taken on a single machine - DoT and STUN"; fi ;;
                 1119) die "port 1119 carries Battle.net's launcher" ;;
                 4070) die "port 4070 carries Spotify's access point" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
@@ -1776,19 +1877,24 @@ EOF
           | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z')"
     # A third part when there is a tunnel, so the relay sets up the same one.
     SYNC_TOKEN_OUT="$SYNC_SECRET.$FP${TUNNEL_SPEC:+.$TUNNEL_SPEC}"
+    # A single machine pairs with itself, here and now; there is nobody to
+    # hand the token to.
+    if [ "$ROLE" = single ]; then
+        SYNC_TOKEN="$SYNC_TOKEN_OUT"; SYNC_TOKEN_OUT=""; PANEL_IP=127.0.0.1
+    fi
 fi
 
 # A relay that is already paired keeps its pairing. Requiring the token again
 # on every run meant an upgrade run without it skipped this whole section and
 # silently left the old agent in place - the machine kept syncing, so nothing
 # looked wrong, while the new code never arrived.
-if [ "$ROLE" = relay ] && [ -z "${SYNC_TOKEN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
+if is_relay && [ -z "${SYNC_TOKEN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
     SYNC_TOKEN="$(sed -n 's/^SYNC_SECRET=//p' /etc/smart-dns/sync.env | head -1 || true).$(sed -n 's/^SYNC_FINGERPRINT=//p' /etc/smart-dns/sync.env | head -1 || true)"
     PANEL_IP="${PANEL_IP:-$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env | head -1 || true)}"
     KEEP_PAIRING=1
 fi
 
-if [ "$ROLE" = relay ] && [ -n "${SYNC_TOKEN:-}" ]; then
+if is_relay && [ -n "${SYNC_TOKEN:-}" ]; then
     step "Panel: sync agent and claim page"
     # secret.fingerprint - one string for the user to copy, carrying both the
     # shared secret and the certificate to pin. Splitting them into two
@@ -1837,6 +1943,9 @@ EOF
         set_env_key /etc/smart-dns/sync.env SYNC_FINGERPRINT "$FINGER"
         set_env_key /etc/smart-dns/sync.env SELF_IP "$RELAY_IP"
         set_env_key /etc/smart-dns/sync.env PANEL_DOMAIN "${PANEL_DOMAIN:-}"
+    fi
+    if [ "$ROLE" = single ]; then
+        set_env_key /etc/smart-dns/sync.env PANEL_PORT "$SINGLE_API_PORT"
     fi
     set_env_key /etc/smart-dns/sync.env TUNNEL "$TUNNEL"
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
@@ -1916,7 +2025,7 @@ if [ "$ROLE" = exit ]; then apply_tunnel "${SYNC_SECRET:-}"; else apply_tunnel "
 step "Starting services"
 if [ "$NGINX_CHANGED" = 1 ]; then systemctl restart nginx
 else systemctl reload nginx 2>/dev/null || systemctl start nginx; fi
-if [ "$ROLE" = relay ]; then
+if is_relay; then
     if [ "$DNSMASQ_CHANGED" = 1 ]; then systemctl restart dnsmasq
     else systemctl start dnsmasq 2>/dev/null || true; fi
     /usr/local/bin/epic-pin || warn "epic-pin failed this run; the timer will retry"
@@ -1930,7 +2039,7 @@ check() {
     else printf '    %sx%s %s  (got: %s)\n' "$RD" "$N" "$1" "$2"; fail=1; fi
 }
 check "nginx running" "$(systemctl is-active nginx)" active
-if [ "$ROLE" = relay ]; then
+if is_relay; then
     check "dnsmasq running" "$(systemctl is-active dnsmasq)" active
     check "coturn running"  "$(systemctl is-active coturn)"  active
     check "a routed domain resolves to this relay" \
@@ -1956,15 +2065,17 @@ if [ "$ROLE" = relay ]; then
     check "an unrouted domain is not pointed at this relay" \
           "$(printf '%s\n' "$unrouted" | grep -c "^${RELAY_IP}$" || true)" "0"
     check "a site loads through the full chain" \
-          "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${RELAY_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || echo 000)" "200"
+          "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${LISTEN_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || echo 000)" "200"
     # The API the relay syncs with, reached the way smartdns-sync reaches it -
     # by address, with a name in the handshake - but with a GET, which the API
     # refuses as 501 without looking at any secret, so this proves the path
     # and leaves no "wrong secret" warning in the exit's log. A relay whose
     # sync could not get through used to pass every check here and then fail
     # in the customer's panel instead.
+    if [ "$ROLE" = single ]; then api_at="127.0.0.1"; api_port="$SINGLE_API_PORT"
+    else api_at="$EXIT_IP"; api_port=8443; fi
     check "the exit's sync API answers this relay" \
-          "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:8443:${EXIT_IP}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:8443/" 2>/dev/null || true)" "501"
+          "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:${api_port}:${api_at}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:${api_port}/" 2>/dev/null || true)" "501"
 fi
 if [ "$TUNNEL" = backpack ]; then
     check "the tunnel service is running" "$(systemctl is-active smartdns-tunnel.service)" active
@@ -1998,7 +2109,7 @@ else
     printf '%sSomething is off - see the failures above.%s\n' "$Y" "$N"
 fi
 
-if [ "$ROLE" = relay ]; then
+if is_relay; then
     printf '
     Point your devices at this address for DNS:
 
@@ -2044,7 +2155,7 @@ if [ -n "$USER_PANEL_OUT" ]; then
 ' "$B" "$N" "$USER_PANEL_OUT"
 fi
 
-if [ "$ROLE" = relay ] && [ -z "${PANEL_DOMAIN:-}" ]; then
+if is_relay && [ -z "${PANEL_DOMAIN:-}" ]; then
     printf '    %sThere is no customer panel on this relay%s, because it has no
     certificate. That page asks for a password, and nothing asks for a
     password over plain http here - so it is not served at all rather than
@@ -2307,6 +2418,45 @@ exit 0
 #    resolver __RESOLVERS__ ipv6=off;
 #    resolver_timeout 5s;
 #
+#    # single begin
+#    # One machine doing both ends (ROLE=single): the relay's own parts, which
+#    # an exit behind a relay does not have. The installer cuts this block out
+#    # everywhere else, and on a single machine it also drops every "allow the
+#    # relay only" line below - there is no relay, and the customers reach this
+#    # machine themselves, past the same gate a relay has.
+#    # doh begin
+#    server_tokens off;
+#    map "$request_method:$arg_dns" $doh_browser {
+#        "GET:"  1;
+#        default 0;
+#    }
+#    # The DoH server, on loopback: the stream on 443 hands it this machine's
+#    # own name, and nothing reaches 443 that the gate has not let through.
+#    server {
+#        listen 127.0.0.1:8453 ssl http2;
+#        server_name __DOH_HOST__;
+#        include /etc/nginx/smartdns-doh-cert.conf;
+#        ssl_protocols TLSv1.2 TLSv1.3;
+#        client_max_body_size 8k;
+#
+#        location /dns-query {
+#            if ($doh_browser) {
+#                return 302 https://__DOH_HOST__:8443/doh-setup$uri;
+#            }
+#            proxy_pass http://127.0.0.1:8055;
+#            proxy_http_version 1.1;
+#            proxy_set_header Connection "";
+#            proxy_set_header X-Real-IP $remote_addr;
+#            proxy_connect_timeout 3s;
+#            proxy_read_timeout 10s;
+#        }
+#        location / {
+#            return 302 https://__DOH_HOST__:8443/;
+#        }
+#    }
+#    # doh end
+#    # single end
+#
 #    # Console download CDNs are served over plain HTTP. Both Sony and Microsoft
 #    # put theirs on Akamai's HTTP-only network:
 #    #
@@ -2394,6 +2544,13 @@ exit 0
 #}
 #
 #stream {
+#    # single begin
+#    # One line per connection, for the customer's usage by service - the same
+#    # as a relay keeps, and read and deleted the same way by smartdns-sync.
+#    log_format usage '$remote_addr $server_port $ssl_preread_server_name $bytes_sent $bytes_received';
+#    access_log /run/smartdns-usage usage buffer=32k flush=10s;
+#    # single end
+#
 #    # A TLS client should never send a bare IP as SNI. When one does, blindly
 #    # forwarding to $ssl_preread_server_name:443 sends the session straight back
 #    # at the relay, which forwards it here again - an infinite loop that pins
@@ -2423,6 +2580,30 @@ exit 0
 #        # google-v6 end
 #    }
 #
+#    # single begin
+#    # doh begin
+#    # A single machine answers DNS over HTTPS on its own name, like a relay;
+#    # every other name goes on as below.
+#    map $ssl_preread_server_name $https_target {
+#        # The DoH names this machine answers - its own, and any the admin
+#        # panel set - kept by the installer and smartdns-sync.
+#        include /etc/nginx/smartdns-doh-names.map;
+#        default       $upstream;
+#    }
+#    # DNS over TLS, as on a relay: TLS ends here and the stream goes to
+#    # smartdns-doh with a PROXY line saying who connected.
+#    server {
+#        listen 853 ssl;
+#        include /etc/nginx/smartdns-doh-cert.conf;
+#        ssl_protocols TLSv1.2 TLSv1.3;
+#        proxy_protocol on;
+#        proxy_connect_timeout 5s;
+#        proxy_timeout 2m;
+#        proxy_pass 127.0.0.1:8054;
+#    }
+#    # doh end
+#    # single end
+#
 #    # Only the Iran relay may use this proxy. Prevents open-proxy abuse.
 #    server {
 #        resolver __RESOLVERS__ ipv6=off;
@@ -2434,7 +2615,9 @@ exit 0
 #        deny all;
 #        ssl_preread on;
 #        proxy_connect_timeout 10s;
-#        proxy_pass $upstream;
+#        # $upstream, or on a single machine with DoH $https_target, which is
+#        # $upstream for every name but this machine's own.
+#        proxy_pass __HTTPS_TARGET__;
 #    }
 #    # Spotify's access point. The desktop and phone apps ask apresolve for one
 #    # and are handed the same host on 4070, 443 and 80; they try 4070 first and
@@ -2564,7 +2747,9 @@ exit 0
 #    # Every other name goes exactly where it always went, and a client that
 #    # sends no name at all goes to the exit, as before.
 #    map $ssl_preread_server_name $https_target {
-#        __DOH_HOST__  127.0.0.1:8453;
+#        # The DoH names this machine answers - its own, and any the admin
+#        # panel set - kept by the installer and smartdns-sync.
+#        include /etc/nginx/smartdns-doh-names.map;
 #        default       __EXIT_HTTPS__;
 #    }
 #    server {
@@ -2581,8 +2766,7 @@ exit 0
 #    # resolver to ask, since the connection itself now comes from loopback.
 #    server {
 #        listen 853 ssl;
-#        ssl_certificate     __DOH_CERT__;
-#        ssl_certificate_key __DOH_KEY__;
+#        include /etc/nginx/smartdns-doh-cert.conf;
 #        ssl_protocols TLSv1.2 TLSv1.3;
 #        proxy_protocol on;
 #        proxy_connect_timeout 5s;
@@ -2647,8 +2831,7 @@ exit 0
 #    server {
 #        listen 127.0.0.1:8453 ssl http2;
 #        server_name __DOH_HOST__;
-#        ssl_certificate     __DOH_CERT__;
-#        ssl_certificate_key __DOH_KEY__;
+#        include /etc/nginx/smartdns-doh-cert.conf;
 #        ssl_protocols TLSv1.2 TLSv1.3;
 #        client_max_body_size 8k;
 #
@@ -2696,8 +2879,8 @@ exit 0
 ## relaying, and with no-auth that is an open relay for anyone on the internet.
 #
 #listening-port=3478
-#listening-ip=__RELAY_IP__
-#external-ip=__RELAY_IP__
+#listening-ip=__LISTEN_IP__
+#external-ip=__TURN_EXTERNAL__
 #
 ## Serve STUN Binding only. No allocations, ever.
 #stun-only
@@ -3860,7 +4043,7 @@ exit 0
 #-- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
 #-- after thirty days not even that. Only the customer is shown it.
 #-- The DNS report a customer switched on for support: which names their
-#-- devices asked, where the answer sent them and why, for 24 hours from the
+#-- devices asked, where the answer sent them and why, for an hour from the
 #-- last time each was asked. Nothing is kept for anybody who did not ask.
 #CREATE TABLE IF NOT EXISTS query_log (
 #    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -3903,6 +4086,38 @@ exit 0
 #    domain   TEXT PRIMARY KEY,
 #    note     TEXT,
 #    added_at TEXT NOT NULL
+#);
+#
+#-- Domains the operator wants closed: answered "no such name", subdomains
+#-- and all, on every relay - including a name the service itself routes.
+#-- For every template, `all_templates`, which includes templates made later;
+#-- or for those listed in blocked_templates.
+#CREATE TABLE IF NOT EXISTS blocked_domains (
+#    domain        TEXT PRIMARY KEY,
+#    note          TEXT,
+#    added_at      TEXT NOT NULL,
+#    all_templates INTEGER NOT NULL DEFAULT 1
+#);
+#CREATE TABLE IF NOT EXISTS blocked_templates (
+#    domain      TEXT NOT NULL REFERENCES blocked_domains(domain) ON DELETE CASCADE,
+#    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+#    PRIMARY KEY (domain, template_id)
+#);
+#
+#-- Domains the operator wants asked of a resolver of their choosing - the
+#-- domain and everything under it. `servers` is one or more IPv4 addresses,
+#-- space-separated, each with an optional #port. Which templates, as above.
+#CREATE TABLE IF NOT EXISTS dns_forwards (
+#    domain        TEXT PRIMARY KEY,
+#    servers       TEXT NOT NULL,
+#    note          TEXT,
+#    added_at      TEXT NOT NULL,
+#    all_templates INTEGER NOT NULL DEFAULT 1
+#);
+#CREATE TABLE IF NOT EXISTS forward_templates (
+#    domain      TEXT NOT NULL REFERENCES dns_forwards(domain) ON DELETE CASCADE,
+#    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+#    PRIMARY KEY (domain, template_id)
 #);
 #
 #-- Host health, one row per sample per machine. Written every thirty seconds
@@ -4076,6 +4291,9 @@ exit 0
 ## Columns added after the first release. sqlite has no ADD COLUMN IF NOT
 ## EXISTS, so these are applied only when the column is genuinely missing.
 #MIGRATIONS = [
+#    # Blocks and forwards per template; the ones made before that are for all.
+#    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
+#    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
 #    # Which warning thresholds this user has already been told about, so a
 #    # sync every thirty seconds does not send the same warning a hundred times.
 #    ("users", "warned", "INTEGER NOT NULL DEFAULT 0"),
@@ -4180,6 +4398,21 @@ exit 0
 ## The public resolvers until the operator picks others: neither sends the
 ## asker's subnet on, which Google does and Tencent's games refuse Iran by.
 #DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
+## The resolvers the admin panel offers, for the relays to time. The admin
+## panel names them; a test holds the two lists to each other.
+#BENCH_RESOLVERS = ["1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
+#                   "9.9.9.9", "149.112.112.112", "8.8.8.8", "8.8.4.4",
+#                   "208.67.222.222", "208.67.220.220", "94.140.14.14", "94.140.15.15"]
+#
+#
+#def bench_wanted(store):
+#    """What the relays should time: the list, and the operator's own pick if
+#    it is not on it; "now" changes when the operator asks to time them again."""
+#    ips = list(BENCH_RESOLVERS)
+#    for ip in (store.setting("dns_upstream") or "").split():
+#        if ip not in ips:
+#            ips.append(ip)
+#    return {"ips": ips, "now": store.setting("bench_now") or ""}
 #
 ## Fractions of the quota at which the user is warned, and the bit each one
 ## sets in users.warned.
@@ -4910,11 +5143,40 @@ exit 0
 #                # them, and keeps them everywhere else.
 #                "pins": ("bypass", "epic") not in self.template_groups(tid),
 #            }
+#            # The operator's blocks and forwards for this template, which the
+#            # relay writes into its resolver alone.
+#            profiles[str(tid)].update(self.template_rules(tid))
 #        return by_ip, profiles
 #
 #    def custom_domains(self):
 #        return [r["domain"] for r in self.q(
 #            "SELECT domain FROM custom_domains ORDER BY domain")]
+#
+#    def blocked_domains(self):
+#        return [r["domain"] for r in self.q(
+#            "SELECT domain FROM blocked_domains ORDER BY domain")]
+#
+#    def dns_forwards(self):
+#        return {r["domain"]: r["servers"].split() for r in self.q(
+#            "SELECT domain, servers FROM dns_forwards ORDER BY domain")}
+#
+#    def template_rules(self, template_id):
+#        """The blocks and forwards one template has: those for every template
+#        and those ticked for it. A forward under one of its blocks is left out
+#        - the block wins - so the relay is never handed the two to settle."""
+#        blocked = [r["domain"] for r in self.q(
+#            "SELECT domain FROM blocked_domains b WHERE all_templates = 1 OR EXISTS"
+#            " (SELECT 1 FROM blocked_templates t WHERE t.domain = b.domain"
+#            " AND t.template_id = ?) ORDER BY domain", (template_id,))]
+#        closed = set(blocked)
+#        forwards = {}
+#        for r in self.q("SELECT domain, servers FROM dns_forwards f WHERE all_templates = 1"
+#                        " OR EXISTS (SELECT 1 FROM forward_templates t WHERE t.domain = f.domain"
+#                        " AND t.template_id = ?) ORDER BY domain", (template_id,)):
+#            parts = r["domain"].split(".")
+#            if not any(".".join(parts[i:]) in closed for i in range(len(parts))):
+#                forwards[r["domain"]] = r["servers"].split()
+#        return {"blocked": blocked, "forwards": forwards}
 #
 #    def template_names(self):
 #        """Every template's name by id, and which is the default - so the
@@ -5678,12 +5940,14 @@ exit 0
 #
 #
 ## ----------------------------------------------------------------- DNS report
-#QLOG_HOURS = 24
+## An hour: long enough to open the service that fails and look, short
+## enough that nobody's browsing sits in a table for a day.
+#QLOG_HOURS = 1
 #QLOG_MAX = 2000         # rows kept per customer; the oldest go first
 #
 #
 #def qlog_on(store, user_id, on):
-#    """Switch a customer's DNS report on for 24 hours, or off - which also
+#    """Switch a customer's DNS report on for an hour, or off - which also
 #    throws away what was kept, at once."""
 #    if on:
 #        until = (datetime.now(timezone.utc) + timedelta(hours=QLOG_HOURS)
@@ -5714,10 +5978,18 @@ exit 0
 #    index = service_index(catalogue)
 #    label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
 #    custom = set(store.custom_domains())
+#    rules = store.template_rules(tid)
+#    blocked = set(rules["blocked"])
+#    forwards = rules["forwards"]
 #
 #    def reason(name):
 #        parts = name.lower().rstrip(".").split(".")
 #        tails = [".".join(parts[i:]) for i in range(len(parts) - 1)]
+#        if any(t in blocked for t in tails):
+#            return "blocked:"
+#        for t in tails:
+#            if t in forwards:
+#                return "forward:" + " ".join(forwards[t])
 #        if any(t in custom for t in tails):
 #            return "routed:دامنه‌های دلخواه ادمین"
 #        for t in tails:                     # the longest rule wins, as in dnsmasq
@@ -5789,6 +6061,16 @@ exit 0
 #    return token
 #
 #
+#def prune_qlog(store):
+#    """The DNS report: gone an hour after a name was last asked, and the
+#    switch off by itself when its hour is up. Run on every sync, not with
+#    the hourly pruning - an hour's keeping must not become two."""
+#    cutoff = (datetime.now(timezone.utc) - timedelta(hours=QLOG_HOURS)
+#              ).isoformat(timespec="seconds")
+#    store.run("DELETE FROM query_log WHERE last_at < ?", (cutoff,))
+#    store.run("UPDATE users SET qlog_until = NULL WHERE qlog_until <= ?", (now(),))
+#
+#
 #def prune_usage(store):
 #    """Drop what is older than each grain is kept for."""
 #    now_t = datetime.now(timezone.utc)
@@ -5799,11 +6081,7 @@ exit 0
 #    store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
 #    cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
 #    store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
-#    # The DNS report: 24 hours from the last time a name was asked, and the
-#    # switch goes off by itself when its time is up.
-#    store.run("DELETE FROM query_log WHERE last_at < ?",
-#              ((now_t - timedelta(hours=QLOG_HOURS)).isoformat(timespec="seconds"),))
-#    store.run("UPDATE users SET qlog_until = NULL WHERE qlog_until <= ?", (now(),))
+#    prune_qlog(store)
 #    store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 #
 #
@@ -7043,6 +7321,31 @@ exit 0
 #                self.store.set_setting("doh_host", doh_host)
 #            # Which resolvers the relay asks and how the admin's last pick
 #            # went there, for the settings page. Written only when it changes.
+#            # How the admin panel's name for DoH is going on this relay.
+#            state = body.get("doh_name")
+#            if isinstance(state, dict):
+#                text = json.dumps({k: str(state.get(k) or "")[:400]
+#                                   for k in ("want", "active", "error")}
+#                                  | {"working": bool(state.get("working"))}, sort_keys=True)
+#                if self.store.setting("doh_name_state:" + who) != text:
+#                    self.store.set_setting("doh_name_state:" + who, text)
+#            checked = body.get("forward_check")
+#            if isinstance(checked, dict) and isinstance(checked.get("ms"), dict):
+#                text = json.dumps({"at": int(checked.get("at") or 0), "ms": {
+#                    str(d)[:253]: {str(s)[:21]: (int(v) if isinstance(v, (int, float)) else None)
+#                                   for s, v in list(servers.items())[:4]}
+#                    for d, servers in list(checked["ms"].items())[:200]
+#                    if isinstance(servers, dict)}}, sort_keys=True)
+#                if self.store.setting("forward_check:" + who) != text:
+#                    self.store.set_setting("forward_check:" + who, text)
+#            timed = body.get("resolver_bench")
+#            if isinstance(timed, dict) and isinstance(timed.get("ms"), dict):
+#                text = json.dumps({"at": int(timed.get("at") or 0),
+#                                   "ms": {str(k)[:15]: (int(v) if isinstance(v, (int, float)) else None)
+#                                          for k, v in list(timed["ms"].items())[:32]}},
+#                                  sort_keys=True)
+#                if self.store.setting("resolver_bench:" + who) != text:
+#                    self.store.set_setting("resolver_bench:" + who, text)
 #            report = body.get("upstream")
 #            if isinstance(report, dict):
 #                text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
@@ -7057,6 +7360,10 @@ exit 0
 #                enforce_quotas(self.store)
 #            except Exception as e:
 #                log_exception("quota pass failed: %r" % e)
+#            try:
+#                prune_qlog(self.store)
+#            except Exception as e:
+#                log_exception("DNS report prune failed: %r" % e)
 #            # Once an hour is plenty for throwing away what is past keeping.
 #            if time.time() - PRUNED[0] > 3600:
 #                PRUNED[0] = time.time()
@@ -7085,12 +7392,22 @@ exit 0
 #                log_exception("DoH tokens not built: %r" % e)
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra, "doh": doh,
+#                                    # Closed for everybody; the relay takes
+#                                    # them out of every rule that routes them.
+#                                    # The default template's blocks and
+#                                    # forwards; the others' are in their profiles.
+#                                    "default_rules": self.store.template_rules(
+#                                        DEFAULT_TEMPLATE[0]),
 #                                    # The public resolvers the operator picked;
 #                                    # the relay checks them before it takes them.
 #                                    "upstream": (self.store.setting("dns_upstream")
 #                                                 or DEFAULT_UPSTREAM).split(),
 #                                    # Whose DNS to keep for the support report.
 #                                    "qlog": qlog_wanted(self.store),
+#                                    # The name the admin panel gave DoH, if any.
+#                                    "doh_name": self.store.setting("doh_name") or "",
+#                                    # The resolvers to time, and when last asked.
+#                                    "bench": bench_wanted(self.store),
 #                                    "templates": self.store.template_names(),
 #                                    "watch": watch_job(self.store),
 #                                    })
@@ -7131,7 +7448,7 @@ exit 0
 #            on = bool(body.get("on"))
 #            qlog_on(self.store, user["id"], on)
 #            return self.reply(200, {"ok": True, "message": (
-#                "گزارش DNS روشن شد؛ تا ۲۴ ساعت نگه داشته می‌شود" if on else
+#                "گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود" if on else
 #                "گزارش DNS خاموش و پاک شد")})
 #        if self.path == "/user-doh-reset":
 #            user = self._session_user(body.get("session"))
@@ -7463,6 +7780,17 @@ exit 0
 #        }
 #
 #
+#def api_address(cfg):
+#    """Where the sync API listens: everywhere on 8443, as the relays expect -
+#    or, on a single machine (ROLE=single), on loopback and another port,
+#    because there 8443 is the customer panel and the only relay is itself."""
+#    try:
+#        port = int(cfg.get("API_PORT") or API_PORT)
+#    except ValueError:
+#        port = API_PORT
+#    return (cfg.get("API_BIND") or "0.0.0.0", port)
+#
+#
 #def serve_api(cfg, store):
 #    API.store = store
 #    API.secret = cfg["SYNC_SECRET"]
@@ -7470,11 +7798,13 @@ exit 0
 #    API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
 #    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #    ctx.load_cert_chain(CERT, KEY)
-#    make_api_server(ctx).serve_forever()
+#    make_api_server(ctx, address=api_address(cfg)).serve_forever()
 #
 #
-#def make_api_server(ctx, port=None):
-#    return TLSServer(("0.0.0.0", API_PORT if port is None else port), API, ctx)
+#def make_api_server(ctx, port=None, address=None):
+#    if address is None:
+#        address = ("0.0.0.0", API_PORT if port is None else port)
+#    return TLSServer(address, API, ctx)
 #
 #
 ## ---------------------------------------------------------------- bot API
@@ -8346,7 +8676,7 @@ exit 0
 #    signal.signal(signal.SIGINT, bye)
 #    threading.Thread(target=serve_bot_api, args=(cfg, store), daemon=True).start()
 #    threading.Thread(target=webhook_worker, args=(store,), daemon=True).start()
-#    print("panel up: api on :%d" % API_PORT, flush=True)
+#    print("panel up: api on %s:%d" % api_address(cfg), flush=True)
 #    # In the foreground now. The Telegram loop used to be what kept this
 #    # process alive and the API rode along on a daemon thread behind it; with
 #    # the bot gone the API is the whole job, so it holds the process itself.
@@ -8555,7 +8885,13 @@ exit 0
 #    customer's receipt timed out every time, the exit logging a read that
 #    never finished, and the same bytes went through the tunnel untouched.
 #    """
-#    direct = (CFG["PANEL_HOST"], API_PORT)
+#    # PANEL_PORT only on a single machine, whose sync API is on loopback
+#    # beside the customer panel's 8443.
+#    try:
+#        port = int(CFG.get("PANEL_PORT") or API_PORT)
+#    except ValueError:
+#        port = API_PORT
+#    direct = (CFG["PANEL_HOST"], port)
 #    if (CFG.get("TUNNEL") or "off") != "backpack":
 #        return [direct]
 #    return [("127.0.0.1", API_TUNNEL_PORT), direct]
@@ -8903,8 +9239,136 @@ exit 0
 #
 #
 #def template_label(key, names):
+#    if key == DEFAULT_PROFILE:
+#        return "default template (with its blocks and forwards)"
 #    name = (names or {}).get(str(key))
 #    return "template %s (%s)" % (key, name) if name else "template %s" % key
+#
+#
+#def is_overridden(name, domains):
+#    """Whether `name` is one of `domains` or under one."""
+#    parts = name.lower().rstrip(".").split(".")
+#    return any(".".join(parts[i:]) in domains for i in range(len(parts)))
+#
+#
+#def drop_overridden(lines, blocked):
+#    """Rule lines with every name the operator took over - blocked, or sent
+#    to a resolver of their own - taken out.
+#
+#    That has to be done by absence. dnsmasq answers a name from the longest
+#    rule that covers it and, at a tie, from an address= with an address over
+#    everything else - measured on 2.91: no form of "no such name", not even
+#    a hosts file, beats address=/x/relay for the same x. So a name the
+#    service routes, or anything under a blocked domain that has a rule of its
+#    own, would go on answering however the block is written, unless its rule
+#    is simply not there. The same goes for a forward: server=/x/ip loses to
+#    address=/x/relay, and a bypass under x would send its name elsewhere.
+#    """
+#    if not blocked:
+#        return list(lines)
+#    out = []
+#    for line in lines:
+#        m = RULE_LINE.match(line.strip())
+#        if not m:
+#            out.append(line)
+#            continue
+#        kind, domains, target = m.groups()
+#        keep = [d for d in domains.split("/") if d and not is_overridden(d, blocked)]
+#        if keep:
+#            out.append("%s=/%s/%s" % (kind, "/".join(keep), target))
+#    return out
+#
+#
+#def rule_lines(path):
+#    try:
+#        with open(path) as fh:
+#            return [l.strip() for l in fh if RULE_LINE.match(l.strip())]
+#    except OSError:
+#        return []
+#
+#
+## The default template's own resolver, when it has blocks or forwards. Those
+## are per template, so they cannot go in /etc/dnsmasq.d, which every resolver
+## reads; and the main resolver on :53 reads the installer's own files - the
+## hijack list, the bypasses, Epic's pins - which are not this program's to
+## edit, and whose rules for a name would beat a block or a forward of it. So
+## the default template's customers are moved to a resolver of their own with
+## the same rules less those names, and go back to :53 when it has none.
+#DEFAULT_PROFILE = "default"
+#
+#
+#def default_profile(rules, custom):
+#    """That resolver's spec, or None when the main one does the job."""
+#    rules = rules if isinstance(rules, dict) else {}
+#    if not rules.get("blocked") and not rules.get("forwards"):
+#        return None
+#    return {"raw": rule_lines(HIJACK_CONF) + rule_lines(BYPASS_CONF), "custom": list(custom),
+#            "pins": True, "blocked": rules.get("blocked") or [],
+#            "forwards": rules.get("forwards") or {}}
+#
+#
+#def template_rules(spec):
+#    """A template's blocks and forwards, checked: the blocked domains, the
+#    forwards less any under a block - the block wins - and every name the
+#    two take over, whose other rules this template's resolver must not have."""
+#    blocked = sorted({d for d in spec.get("blocked") or [] if is_domain(d)})
+#    forwards = {d: v for d, v in clean_forwards(spec.get("forwards")).items()
+#                if not is_overridden(d, set(blocked))}
+#    return blocked, forwards, set(blocked) | set(forwards)
+#
+#
+#def is_domain(d):
+#    return isinstance(d, str) and bool(re.fullmatch(r"[a-z0-9.-]{1,253}", d)) \
+#        and "." in d.strip(".")
+#
+#
+#def clean_forwards(forwards):
+#    """{domain: [resolver, ...]} as the panel sent it, less anything that is
+#    not a domain or an IPv4 address with an optional #port."""
+#    out = {}
+#    for d, servers in (forwards.items() if isinstance(forwards, dict) else ()):
+#        ok = [s for s in servers or [] if isinstance(s, str) and re.fullmatch(
+#            r"(\d{1,3}\.){3}\d{1,3}(#\d{1,5})?", s)][:4]
+#        if is_domain(d) and ok:
+#            out[d] = ok
+#    return out
+#
+#
+## Whether each forward's resolver answers from here: every ten minutes, and at
+## once when the list changes. An answer of "no such name" still counts - the
+## resolver is there and talking; a refusal or silence does not.
+#FWD_CHECK = {"ms": {}, "at": 0, "key": None, "running": False}
+#
+#
+#def all_forwards(profiles):
+#    """Every resolver some template forwards some domain to, for the check."""
+#    out = {}
+#    for spec in profiles.values():
+#        for d, servers in template_rules(spec)[1].items():
+#            out[d] = sorted(set(out.get(d, [])) | set(servers))
+#    return out
+#
+#
+#def maybe_check_forwards(forwards):
+#    key = json.dumps(forwards, sort_keys=True)
+#    if not forwards:
+#        FWD_CHECK.update(ms={}, key=key)
+#        return False
+#    if FWD_CHECK["running"] or (key == FWD_CHECK["key"]
+#                                and time.time() - FWD_CHECK["at"] < BENCH_EVERY):
+#        return False
+#    FWD_CHECK.update(running=True, key=key)
+#
+#    def run():
+#        try:
+#            FWD_CHECK["ms"] = {d: {s: dns_probe(s, name=d, any_answer=True) for s in servers}
+#                               for d, servers in forwards.items()}
+#        except Exception as e:
+#            log(WARN, "forwards not checked: %s" % e)
+#        finally:
+#            FWD_CHECK.update(at=time.time(), running=False)
+#    threading.Thread(target=run, daemon=True).start()
+#    return True
 #
 #
 #def apply_custom_domains(domains):
@@ -8995,22 +9459,33 @@ exit 0
 #        # it resolves normally and the client goes straight to it - which is
 #        # what an un-ticked service is supposed to mean.
 #        me = CFG.get("SELF_IP") or ""
+#        # The operator's blocks and forwards for this template. Every other
+#        # rule for a name they cover is left out below: see drop_overridden.
+#        blocked, forwards, taken = template_rules(spec)
+#        body += ["address=/%s/" % d for d in blocked]
+#        body += ["server=/%s/%s" % (d, v) for d in sorted(forwards) for v in forwards[d]]
 #        body += ["address=/%s/%s" % (d, me)
-#                 for d in sorted(set(spec.get("routed") or []))]
+#                 for d in sorted(set(spec.get("routed") or []))
+#                 if not is_overridden(d, taken)]
 #        body += ["address=/%s/%s" % (d, me)
-#                 for d in sorted(set(spec.get("custom") or []))]
+#                 for d in sorted(set(spec.get("custom") or []))
+#                 if not is_overridden(d, taken)]
+#        # The default template's stand-in: the main resolver's own rules, as
+#        # read from its files.
+#        body += drop_overridden(spec.get("raw") or [], taken)
 #        # Names whose parent this profile routes, that it must not route
 #        # itself - gosredirector.ea.com under a routed ea.com, say. Here the
 #        # subtraction does work: the profile's rule names a longer host than
 #        # the one hijacking the parent, so longest match prefers it.
 #        # "#" is dnsmasq's "the usual resolvers": whatever upstream.conf says.
-#        body += ["server=/%s/#" % d for d in spec.get("bypass", [])]
+#        body += ["server=/%s/#" % d for d in spec.get("bypass", [])
+#                 if not is_overridden(d, taken)]
 #        # Epic's pins, unless this template asked to route that backend. They
 #        # come last and are address= rules, so where they appear they win -
 #        # which is the point: a bypass sends the name to a public resolver,
 #        # while a pin sends it to an address checked to answer from here.
 #        if spec.get("pins", True):
-#            body += epic_pins
+#            body += drop_overridden(epic_pins, taken)
 #        conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
 #        text = "\n".join(body) + "\n"
 #        old = None
@@ -9318,7 +9793,8 @@ exit 0
 #        # A customer whose template has no resolver running yet - nobody on it
 #        # had an address until now - is answered by the main one meanwhile.
 #        "tokens": {h: {"uid": t.get("uid"),
-#                       "port": ports.get(t.get("profile") or "", MAIN_DNS_PORT)}
+#                       "port": ports.get(t.get("profile") or "",
+#                                         ports.get(DEFAULT_PROFILE, MAIN_DNS_PORT))}
 #                   for h, t in (tokens or {}).items()},
 #        "ips": ips,
 #        "allowed": sorted(allowed),
@@ -9355,10 +9831,14 @@ exit 0
 #UPSTREAM = {"want": None, "tested": {}, "error": "", "at": 0.0}
 #
 #
-#def dns_probe(server, name="cloudflare.com", timeout=2.0):
+#def dns_probe(server, name="cloudflare.com", timeout=2.0, any_answer=False):
 #    """How long `server` takes to answer an A query for `name`, in
 #    milliseconds; None when it does not answer, or answers with an error.
-#    Twice, so one lost packet does not condemn a resolver."""
+#    Twice, so one lost packet does not condemn a resolver. `server` may carry
+#    a port, 1.2.3.4#5353, the way dnsmasq writes it. With `any_answer`, an
+#    answer of "no such name" or with no records counts too: the question is
+#    then whether the resolver is there, not whether the name is."""
+#    server, _, port = server.partition("#")
 #    qid = os.urandom(2)
 #    query = (qid + bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
 #             + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
@@ -9368,12 +9848,14 @@ exit 0
 #        s.settimeout(timeout)
 #        try:
 #            t0 = time.monotonic()
-#            s.sendto(query, (server, 53))
+#            s.sendto(query, (server, int(port or 53)))
 #            while True:
 #                data, _ = s.recvfrom(4096)
 #                if len(data) >= 12 and data[:2] == qid:
 #                    break
 #            # An answer, no error, and at least one record in it.
+#            if data[2] & 0x80 and any_answer and data[3] & 0x0F in (0, 3):
+#                return max(1, int((time.monotonic() - t0) * 1000))
 #            if data[2] & 0x80 and data[3] & 0x0F == 0 and (data[6] or data[7]):
 #                return max(1, int((time.monotonic() - t0) * 1000))
 #            return None
@@ -9455,6 +9937,52 @@ exit 0
 #    return True
 #
 #
+## The resolvers the admin panel offers, timed from here every ten minutes -
+## from here because this is where customers' questions leave from, and a
+## resolver that is 5 ms from Frankfurt can be 150 ms from Tehran - or at once
+## when the operator asks for it again.
+#BENCH_EVERY = 600
+#BENCH_STATE = {"ms": {}, "at": 0, "asked": None, "running": False}
+#
+#def bench(ips, tries=3, workers=8):
+#    """How long each resolver takes to answer from here: the median of a few
+#    real DNS questions, in milliseconds, or None for one that did not answer.
+#    A DNS question rather than a ping, because a ping is not what a resolver
+#    is for - some answer no pings, and some route them another way."""
+#    import concurrent.futures
+#
+#    def one(ip):
+#        times = sorted(t for t in (dns_probe(ip) for _ in range(tries)) if t is not None)
+#        return ip, (times[len(times) // 2] if times else None)
+#
+#    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+#        return dict(pool.map(one, ips))
+#
+#
+#def maybe_bench(wanted):
+#    """Start timing the resolvers the panel listed, in a thread of its own -
+#    it takes seconds, and the syncs go on - when it is due or was asked for."""
+#    if not isinstance(wanted, dict) or BENCH_STATE["running"]:
+#        return False
+#    ips = [str(i) for i in wanted.get("ips") or [] if re.fullmatch(r"[0-9.]{7,15}", str(i))][:32]
+#    asked = str(wanted.get("now") or "")
+#    if not ips:
+#        return False
+#    if time.time() - BENCH_STATE["at"] < BENCH_EVERY and asked == BENCH_STATE["asked"]:
+#        return False
+#    BENCH_STATE.update(running=True, asked=asked)
+#
+#    def run():
+#        try:
+#            BENCH_STATE["ms"] = bench(ips)
+#        except Exception as e:
+#            log(WARN, "resolvers not timed: %s" % e)
+#        finally:
+#            BENCH_STATE.update(at=time.time(), running=False)
+#    threading.Thread(target=run, daemon=True).start()
+#    return True
+#
+#
 #def upstream_report():
 #    return {"want": UPSTREAM["want"], "applied": current_upstream(),
 #            "tested": UPSTREAM["tested"], "error": UPSTREAM["error"]}
@@ -9485,7 +10013,7 @@ exit 0
 #
 ## ---------------------------------------------------------------- DNS report
 ## For a customer who switched on "keep my DNS for support" on their page: the
-## names their addresses ask, and where each answer sent them, for 24 hours.
+## names their addresses ask, and where each answer sent them, for an hour.
 ## Plain DNS is read off the wire by smartdns-watch, run here for as long as
 ## anybody has it on; DoH and DoT come from smartdns-doh's counts. Kept here
 ## as {key: {(name, verdict): [first, last, hits]}} until delivered.
@@ -9642,12 +10170,18 @@ exit 0
 #               "panel_url": url,
 #               # The name a bot should give out for DoH and DoT, once this
 #               # relay has the certificate for it; empty until then.
-#               "doh_host": (CFG.get("PANEL_DOMAIN") or "") if os.path.exists(DOH_FLAG) else "",
+#               "doh_host": doh_public_name(),
+#               # How the admin panel's name for DoH is going here.
+#               "doh_name": doh_name_report(),
 #               # Upload and download apart, for the customer's charts. The
 #               # total above is still what the bill is made from.
 #               "split": {r["ip"]: [r.get("up", 0), r.get("down", 0)] for r in rows},
 #               # Which resolvers this relay asks, and how the last pick went.
 #               "upstream": upstream_report()}
+#    if BENCH_STATE["ms"]:
+#        payload["resolver_bench"] = {"at": int(BENCH_STATE["at"]), "ms": BENCH_STATE["ms"]}
+#    if FWD_CHECK["ms"]:
+#        payload["forward_check"] = {"at": int(FWD_CHECK["at"]), "ms": FWD_CHECK["ms"]}
 #    try:
 #        services = take_usage()
 #    except Exception as e:
@@ -9712,15 +10246,34 @@ exit 0
 #    # allowlist below, so an address is pointed at the right resolver no later
 #    # than the moment it is let in.
 #    try:
+#        apply_doh_name(answer.get("doh_name"))
+#    except Exception as e:
+#        log(WARN, "DoH name not applied: %s" % e)
+#    try:
+#        maybe_bench(answer.get("bench"))
+#    except Exception as e:
+#        log(WARN, "resolvers not timed: %s" % e)
+#    try:
 #        new_upstream = apply_upstream(answer.get("upstream"))
 #    except Exception as e:
 #        new_upstream = False
 #        log_exception("resolvers not applied: %s" % e)
 #    try:
-#        changed = apply_custom_domains(answer.get("extra_domains") or [])
+#        custom = answer.get("extra_domains") or []
+#        changed = apply_custom_domains(custom)
 #        assignment = {a["ip"]: a.get("profile", "")
 #                      for a in answer.get("allowed", []) if a.get("profile")}
-#        ports = apply_profiles(answer.get("profiles") or {}, assignment,
+#        profiles = dict(answer.get("profiles") or {})
+#        stand_in = default_profile(answer.get("default_rules"), custom)
+#        if stand_in:
+#            profiles[DEFAULT_PROFILE] = stand_in
+#            for ip in want:
+#                assignment.setdefault(ip, DEFAULT_PROFILE)
+#        try:
+#            maybe_check_forwards(all_forwards(profiles))
+#        except Exception as e:
+#            log(WARN, "forwards not checked: %s" % e)
+#        ports = apply_profiles(profiles, assignment,
 #                               restart=changed or new_upstream,
 #                               names=(answer.get("templates") or {}).get("names"))
 #    except Exception as e:
@@ -10462,12 +11015,6 @@ exit 0
 #
 #
 ## ---------------------------------------------------------------- DoH page
-## How recent a query has to be to count as "reaching us". Long enough that a
-## console left on is not flagged between two lookups, short enough that a
-## relay the customer has lost says so the same evening.
-#DNS_FRESH = 3600
-#
-#
 #def seconds_since(ts):
 #    try:
 #        t = datetime.fromisoformat(str(ts))
@@ -10488,42 +11035,13 @@ exit 0
 #    return "%d روز پیش" % (seconds // 86400)
 #
 #
-#def dns_check(info):
-#    """Whether the registered internet's DNS reaches this relay.
-#
-#    Not a test the page runs - a browser cannot put a DNS query to anybody,
-#    let alone see who answered - but what the relay itself has seen: the
-#    kernel counts each registered address's queries on port 53, and
-#    smartdns-doh counts the encrypted ones. Nothing arriving means the DNS
-#    was never set, or the operator answers it before it gets here.
-#    """
-#    if not info.get("ip"):
-#        return ""
-#    plain = seconds_since(info.get("dns_seen_at"))
-#    safe = seconds_since(info.get("doh_seen_at"))
-#    added = seconds_since(info.get("ip_added_at"))
-#    if plain is not None and plain < DNS_FRESH:
-#        return ("<p class='note'>✅ DNS اینترنت ثبت‌شده‌تان به ما می‌رسد — آخرین "
-#                "درخواست %s.</p>" % ago(plain))
-#    if safe is not None and safe < DNS_FRESH:
-#        return ("<p class='note'>✅ از DNS رمزگذاری‌شده استفاده می‌کنید — آخرین "
-#                "درخواست %s.</p>" % ago(safe))
-#    if plain is None and added is not None and added < 900:
-#        return ("<p class='note'>⏳ هنوز درخواست DNS از اینترنت ثبت‌شده‌تان نرسیده. "
-#                "DNS را روی مودم یا کنسول بگذارید؛ چند دقیقه بعد این‌جا تأیید "
-#                "می‌شود.</p>")
-#    return ("<div class='msg warnbox'>⚠️ در یک ساعت اخیر هیچ درخواست DNS از اینترنت "
-#            "ثبت‌شده‌تان به ما نرسیده%s. اگر دستگاهتان روشن است و سرویس کار نمی‌کند: "
-#            "یا DNS را روی مودم یا کنسول نگذاشته‌اید، یا اپراتور اینترنتتان DNS را "
-#            "می‌رباید. در این صورت از «DNS رمزگذاری‌شده» پایین همین صفحه استفاده "
-#            "کنید.</div>" % (" (آخرین: %s)" % ago(plain) if plain is not None else ""))
-#
-#
 ## How the report says where a name went, and why.
 #QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
 #                "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
 #                "no address": "بدون آدرس"}
-#QLOG_REASON = {"routed": "در قالب شما از رله می‌رود",
+#QLOG_REASON = {"blocked": "در سرویس مسدود شده",
+#               "forward": "از DNS مخصوص این دامنه پرسیده می‌شود",
+#               "routed": "در قالب شما از رله می‌رود",
 #               "unticked": "در قالب شما از رله نمی‌رود",
 #               "bypass": "در قالب شما از رله نمی‌رود",
 #               "outside": "در فهرست سرویس‌ها نیست"}
@@ -10567,17 +11085,17 @@ exit 0
 #    left = ""
 #    if on:
 #        until = (datetime.fromisoformat(info["qlog_until"]) - datetime.now(timezone.utc))
-#        left = " — %d ساعت دیگر خودش خاموش می‌شود" % max(1, int(until.total_seconds() // 3600))
+#        left = " — %d دقیقهٔ دیگر خودش خاموش می‌شود" % max(1, int(until.total_seconds() // 60))
 #    body = ["<details class='pw'%s><summary>🔎 گزارش DNS برای پشتیبانی%s</summary>"
 #            % (" open" if on else "", " (روشن)" if on else ""),
 #            "<p class='note'>وقتی سرویسی باز نمی‌شود، این را روشن کنید و همان سرویس را "
 #            "دوباره باز کنید: این‌جا می‌بینید دستگاه‌هایتان چه اسم‌هایی پرسیدند، هر کدام "
-#            "از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا ۲۴ ساعت "
+#            "از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا یک ساعت "
 #            "نگه داشته می‌شود و خاموشش که کنید همان لحظه پاک می‌شود.</p>",
 #            "<form method='post' action='/qlog' style='margin:0 16px 12px'>"
 #            "<input type='hidden' name='on' value='%s'><button class='%s small'>%s</button>"
 #            "</form>" % ("0" if on else "1", "ghost" if on else "",
-#                         "خاموش کردن و پاک کردن" if on else "روشن کردن برای ۲۴ ساعت")]
+#                         "خاموش کردن و پاک کردن" if on else "روشن کردن برای یک ساعت")]
 #    if on:
 #        body.append("<p class='note'>روشن است%s. جدول هر بار که صفحه را باز کنید تازه "
 #                    "می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.</p>" % left)
@@ -10592,8 +11110,8 @@ exit 0
 #def doh_url(info):
 #    """The customer's personal DNS-over-HTTPS address, on this relay's name."""
 #    token = info.get("doh_token") or ""
-#    host = CFG.get("PANEL_DOMAIN") or ""
-#    if not token or not host or not os.path.exists(DOH_FLAG):
+#    host = doh_public_name()
+#    if not token or not host:
 #        return ""
 #    return "https://%s/dns-query/%s" % (host, token)
 #
@@ -10611,6 +11129,166 @@ exit 0
 #
 ## Present when the installer turned DoH on for this relay.
 #DOH_FLAG = "/etc/smart-dns/doh"
+#
+## ---------------------------------------------------------------- DoH's name
+## DoH and DoT answer on this relay's own name until the admin panel gives them
+## another - for the day that name is filtered, which would take every
+## customer's encrypted DNS down with it. The new name gets a certificate with
+## the old one beside it, while the old still passes Let's Encrypt's check, so
+## a device set up the old way goes on working; nginx takes the certificate
+## and the names from two small files it includes, which the installer writes
+## with the relay's own name and this program rewrites.
+#DOH_NAME_FILE = "/etc/smart-dns/doh-name"
+#DOH_DEFAULT_CERT = "/etc/smart-dns/doh-cert.default"
+#DOH_CERT_CONF = "/etc/nginx/smartdns-doh-cert.conf"
+#DOH_NAMES_MAP = "/etc/nginx/smartdns-doh-names.map"
+#LE_LIVE = "/etc/letsencrypt/live"
+#CERT_TOOL = "/usr/local/bin/smartdns-cert"
+## How long a name that could not be had is left before it is tried again: a
+## certificate try opens port 80 to Let's Encrypt, and stalls console downloads
+## while it does.
+#DOH_NAME_RETRY = 900
+#DOH_NAME = {"want": None, "error": "", "next": 0.0, "running": False}
+#
+#
+#def read_text(path):
+#    try:
+#        with open(path, encoding="utf-8") as fh:
+#            return fh.read()
+#    except OSError:
+#        return None
+#
+#
+#def active_doh_name():
+#    return (read_text(DOH_NAME_FILE) or "").strip()
+#
+#
+#def doh_public_name():
+#    """The name customers are given for DoH and DoT: the admin panel's, once
+#    this relay has it working, and its own until then."""
+#    if not os.path.exists(DOH_FLAG):
+#        return ""
+#    return active_doh_name() or (CFG or {}).get("PANEL_DOMAIN") or ""
+#
+#
+#def cert_dns_names(path):
+#    out = subprocess.run(["openssl", "x509", "-noout", "-ext", "subjectAltName", "-in", path],
+#                         capture_output=True, text=True, timeout=20).stdout
+#    return re.findall(r"DNS:([A-Za-z0-9.-]+)", out)
+#
+#
+#def point_doh_nginx(cert_text, names):
+#    """nginx's DoH on this certificate and these names, checked by nginx
+#    before it is reloaded and put back as it was if refused."""
+#    new = {DOH_CERT_CONF: cert_text,
+#           DOH_NAMES_MAP: "".join("%s 127.0.0.1:8453;\n" % n for n in names)}
+#    old = {path: read_text(path) for path in new}
+#    if old == new:
+#        return True
+#    for path, text in new.items():
+#        with open(path, "w", encoding="utf-8") as fh:
+#            fh.write(text)
+#    if sh("nginx", "-t").returncode != 0:
+#        for path, text in old.items():
+#            if text is None:
+#                os.unlink(path)
+#            else:
+#                with open(path, "w", encoding="utf-8") as fh:
+#                    fh.write(text)
+#        return False
+#    sh("systemctl", "reload", "nginx")
+#    return True
+#
+#
+#def lineage_text(lineage):
+#    d = os.path.join(LE_LIVE, lineage)
+#    return ("ssl_certificate     %s/fullchain.pem;\nssl_certificate_key %s/privkey.pem;\n"
+#            % (d, d))
+#
+#
+#def forget_lineage(name):
+#    if name:
+#        subprocess.run(["certbot", "delete", "--non-interactive", "--cert-name", "doh-" + name],
+#                       capture_output=True, text=True, timeout=120)
+#
+#
+#def take_doh_name(want, own):
+#    """In a thread of its own - certbot takes a while: a certificate for
+#    `want`, with this relay's own name in it too if that still passes, and
+#    nginx moved onto it."""
+#    lineage = "doh-" + want
+#    try:
+#        def issue(*names):
+#            return subprocess.run([CERT_TOOL, "--names", lineage] + list(names),
+#                                  capture_output=True, text=True, timeout=600)
+#        got = issue(want, own) if own else None
+#        if got is None or got.returncode != 0:
+#            got = issue(want)
+#        if got.returncode != 0:
+#            tail = (got.stderr or got.stdout or "").strip().splitlines()[-2:]
+#            raise RuntimeError("no certificate for %s: %s" % (want, " ".join(tail)[:300]))
+#        names = [n for n in cert_dns_names(os.path.join(LE_LIVE, lineage, "fullchain.pem"))
+#                 if n in (want, own)] or [want]
+#        # What the installer wrote, kept for the day the admin panel goes back.
+#        if not os.path.exists(DOH_DEFAULT_CERT) and read_text(DOH_CERT_CONF):
+#            with open(DOH_DEFAULT_CERT, "w", encoding="utf-8") as fh:
+#                fh.write(read_text(DOH_CERT_CONF))
+#        if not point_doh_nginx(lineage_text(lineage), names):
+#            raise RuntimeError("nginx refused the certificate for %s" % want)
+#        before = active_doh_name()
+#        tmp = DOH_NAME_FILE + ".tmp"
+#        with open(tmp, "w", encoding="utf-8") as fh:
+#            fh.write(want + "\n")
+#        os.replace(tmp, DOH_NAME_FILE)
+#        if before and before != want:
+#            forget_lineage(before)
+#        DOH_NAME.update(error="")
+#        print("DoH now on %s (answering %s)" % (want, " ".join(names)), flush=True)
+#    except Exception as e:
+#        DOH_NAME.update(error=str(e)[:400], next=time.time() + DOH_NAME_RETRY)
+#        log(ERROR, "DoH name not changed: %s" % e)
+#    finally:
+#        DOH_NAME["running"] = False
+#
+#
+#def give_back_doh_name(own):
+#    """Back to the relay's own name and the installer's certificate."""
+#    before = active_doh_name()
+#    cert = read_text(DOH_DEFAULT_CERT) or lineage_text(own)
+#    if not point_doh_nginx(cert, [own]):
+#        DOH_NAME.update(error="nginx refused this relay's own certificate")
+#        return
+#    os.unlink(DOH_NAME_FILE)
+#    forget_lineage(before)
+#    DOH_NAME.update(error="")
+#    print("DoH back on %s" % own, flush=True)
+#
+#
+#def apply_doh_name(want):
+#    """Move DoH to the name the admin panel asks for, or back to this relay's."""
+#    if not os.path.exists(DOH_FLAG) or DOH_NAME["running"]:
+#        return
+#    own = (CFG or {}).get("PANEL_DOMAIN") or ""
+#    want = str(want or "").strip().lower().strip(".")
+#    if not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", want) or want == own:
+#        want = ""
+#    if DOH_NAME["want"] != want:
+#        DOH_NAME.update(want=want, error="", next=0.0)
+#    active = active_doh_name()
+#    if want == active:
+#        return
+#    if not want:
+#        give_back_doh_name(own)
+#        return
+#    if time.time() < DOH_NAME["next"]:
+#        return
+#    DOH_NAME["running"] = True
+#    threading.Thread(target=take_doh_name, args=(want, own), daemon=True).start()
+#
+#
+#def doh_name_report():
+#    return {"want": DOH_NAME["want"] or "", "active": active_doh_name(),
+#            "error": DOH_NAME["error"], "working": DOH_NAME["running"]}
 #
 #
 #def copy_field(value, label):
@@ -10641,7 +11319,7 @@ exit 0
 #    url = doh_url(info)
 #    if not url:
 #        return ""
-#    host = CFG.get("PANEL_DOMAIN") or ""
+#    host = doh_public_name()
 #    return (
 #        "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده — وقتی اپراتور DNS را "
 #        "دست‌کاری می‌کند</summary>" % (" open" if setup else "") +
@@ -11713,7 +12391,6 @@ exit 0
 #        body.append(gauge)
 #        body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
 #        body.append(dns_box())
-#        body.append(dns_check(info))
 #        body.append(qlog_box(info))
 #
 #        if not info["ip"]:
@@ -12522,6 +13199,10 @@ exit 0
 ##
 ## usage: smartdns-cert <domain>        get or renew a certificate
 ##        smartdns-cert --renew         renew everything due (the timer's job)
+##        smartdns-cert --names <cert-name> <domain>...
+##                                      one certificate for several names - the
+##                                      DoH name the admin panel set, and the
+##                                      one before it, so both keep working
 ##
 ## Port 80 is the problem this script exists to work around. Let's Encrypt's
 ## HTTP-01 challenge needs it, and on a relay port 80 is forwarded whole to the
@@ -12570,8 +13251,17 @@ exit 0
 #    return 0
 #}
 #
+## The names a certificate is for, from the certificate itself - so a renewal
+## asks for what was asked for the first time, several names included.
+#cert_names() {
+#    openssl x509 -noout -ext subjectAltName -in "$1" 2>/dev/null \
+#        | tr ',' '\n' | sed -n 's/^ *DNS://p'
+#}
+#
 #issue() {
-#    local domain="$1"
+#    local domain="$1"; shift
+#    local names=() d
+#    for d in "${@:-$domain}"; do names+=(-d "$d"); done
 #    if [ -f "$CF_CONF" ]; then
 #        # The operator supplied a DNS token, so prove it that way and leave
 #        # port 80 alone entirely.
@@ -12579,7 +13269,7 @@ exit 0
 #            --dns-cloudflare-credentials "$CF_CONF" \
 #            --dns-cloudflare-propagation-seconds 30 \
 #            --register-unsafely-without-email --agree-tos \
-#            --non-interactive --quiet --cert-name "$domain" -d "$domain"
+#            --non-interactive --quiet --cert-name "$domain" "${names[@]}"
 #        return $?
 #    fi
 #
@@ -12588,7 +13278,7 @@ exit 0
 #    open_port80 || die "could not redirect port 80 for the challenge"
 #    certbot certonly --standalone --http-01-port "$ACME_PORT" \
 #        --register-unsafely-without-email --agree-tos \
-#        --non-interactive --quiet --cert-name "$domain" -d "$domain"
+#        --non-interactive --quiet --cert-name "$domain" "${names[@]}"
 #    local rc=$?
 #    close_port80
 #    trap - EXIT INT TERM
@@ -12606,8 +13296,18 @@ exit 0
 #        openssl x509 -checkend $((30 * 86400)) -noout \
 #            -in "$path/fullchain.pem" >/dev/null 2>&1 && continue
 #        printf 'renewing %s\n' "$domain"
-#        issue "$domain" && systemctl reload nginx 2>/dev/null
+#        # shellcheck disable=SC2046 - one name per word, as certbot wants them
+#        issue "$domain" $(cert_names "$path/fullchain.pem") && systemctl reload nginx 2>/dev/null
 #    done
+#    exit 0
+#    ;;
+#--names)
+#    [ $# -ge 3 ] || die "usage: smartdns-cert --names <cert-name> <domain>..."
+#    shift
+#    NAME="$1"; shift
+#    printf '    getting a certificate for %s\n' "$*"
+#    issue "$NAME" "$@" || die "certbot could not get a certificate for $*"
+#    printf '%s    certificate installed:%s %s\n' "$G" "$N" "$LIVE/$NAME/fullchain.pem"
 #    exit 0
 #    ;;
 #"")
@@ -13288,7 +13988,9 @@ exit 0
 #QLOG_VERDICT = {"via relay": "✅ از رله", "no such name": "چنین اسمی نیست",
 #                "filtered in Iran": "⛔ فیلتر داخل ایران", "no answer": "جوابی نیامد",
 #                "no address": "بدون آدرس"}
-#QLOG_REASON = {"routed": "در قالبش از رله می‌رود",
+#QLOG_REASON = {"blocked": "ادمین مسدودش کرده",
+#               "forward": "از DNS تعیین‌شدهٔ ادمین پرسیده می‌شود",
+#               "routed": "در قالبش از رله می‌رود",
 #               "unticked": "در قالبش از رله نمی‌رود",
 #               "bypass": "در قالبش از رله نمی‌رود",
 #               "outside": "در فهرست سرویس‌ها نیست"}
@@ -13312,7 +14014,7 @@ exit 0
 #                "</p></div>")
 #    out = ["<div class='card'><h2>گزارش DNS — %s</h2>" % (
 #        "روشن تا %s" % user["qlog_until"][:16].replace("T", " ") if on else "خاموش"),
-#        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم ۲۴ ساعت بعد از آخرین بار پاک "
+#        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم یک ساعت بعد از آخرین بار پاک "
 #        "می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا "
 #        "اسم در فهرست نیست.</p>",
 #        "<table><tr><th>اسم</th><th>کجا رفت</th><th>چرا</th><th>راه</th><th>بار</th>"
@@ -13370,6 +14072,56 @@ exit 0
 #    return "".join(out)
 #
 #
+#def doh_name_card(p):
+#    """The settings page's card for the name DoH and DoT answer on."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'doh_name'")
+#    want = row["value"] if row and row["value"] else ""
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'doh_host'")
+#    given = row["value"] if row and row["value"] else ""
+#    out = ["<div class='card'><h2>نام DNS امن (DoH و DoT)</h2>"]
+#    if not given:
+#        out.append("<p class='muted'>هیچ رله‌ای هنوز DNS امن را روشن نکرده؛ رله برای این کار "
+#                   "به دامنه و گواهی نیاز دارد.</p></div>")
+#        return "".join(out)
+#    out.append("<p>نامی که الان به مشتری‌ها داده می‌شود: <code dir='ltr'>%s</code></p>"
+#               % html.escape(given))
+#    rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'doh_name_state:%'"
+#                   " ORDER BY key")
+#    if want and rows:
+#        out.append("<table><tr><th>رله</th><th>وضعیت</th></tr>")
+#        for r in rows:
+#            try:
+#                st = json.loads(r["value"])
+#            except ValueError:
+#                continue
+#            if st.get("active") == want:
+#                what = "<span class='ok'>✓ روی %s</span>" % html.escape(want)
+#            elif st.get("working"):
+#                what = "در حال گرفتن گواهی…"
+#            elif st.get("error"):
+#                what = "<span class='warn'>نشد: %s</span> <span class='muted'>(۱۵ دقیقه بعد " \
+#                       "دوباره امتحان می‌شود)</span>" % html.escape(st["error"])
+#            else:
+#                what = "<span class='muted'>منتظر همگام‌سازی بعدی</span>"
+#            out.append("<tr><td dir='ltr'>%s</td><td>%s</td></tr>"
+#                       % (html.escape(r["key"].split(":", 1)[1]), what))
+#        out.append("</table>")
+#    out.append("<form method='post' action='/%s/doh-name' class='row'>"
+#               "<input name='name' dir='ltr' placeholder='dns.example.com' value='%s' "
+#               "style='min-width:240px'><button>ذخیره</button></form>"
+#               % (p, html.escape(want)))
+#    if want:
+#        out.append("<form method='post' action='/%s/doh-name'><input type='hidden' name='name' "
+#                   "value=''><button class='ghost'>برگشت به نام خود رله</button></form>" % p)
+#    out.append("<p class='muted'>برای روزی که نام فعلی در ایران فیلتر شود. اول یک رکورد A برای "
+#               "نام تازه بسازید که به آی‌پی رله اشاره کند؛ بعد اینجا ذخیره کنید. رله برای نام تازه "
+#               "گواهی می‌گیرد (حدود بیست ثانیه پورت ۸۰ به Let's Encrypt داده می‌شود و دانلود "
+#               "کنسول‌ها همان مدت مکث می‌کند) و از آن به بعد آدرس DoH و DoT مشتری‌ها با نام تازه "
+#               "نشان داده می‌شود. تا وقتی نام قبلی هنوز به رله اشاره کند، در همان گواهی می‌ماند و "
+#               "دستگاه‌هایی که با آن تنظیم شده‌اند از کار نمی‌افتند.</p></div>")
+#    return "".join(out)
+#
+#
 #def user_usage(uid):
 #    """The same numbers the customer's page is drawn from, straight from the
 #    panel's tables - this runs beside it, on the same database."""
@@ -13383,6 +14135,102 @@ exit 0
 #    return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
 #            "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
 #            "days": series("1d", now_t - timedelta(days=30), "%Y-%m-%d")}
+#
+#
+#def total_usage():
+#    """Everybody's usage added up, from the same tables as a customer's own
+#    charts: five minutes for a day, hours for a week, days for two months -
+#    two, so this month can be set against the one before."""
+#    now_t = datetime.now(TEHRAN)
+#
+#    def series(grain, since, fmt):
+#        return [(r["bucket"], r["up"], r["down"]) for r in STORE.q(
+#            "SELECT bucket, SUM(up) up, SUM(down) down FROM usage WHERE grain = ?"
+#            " AND bucket >= ? GROUP BY bucket ORDER BY bucket",
+#            (grain, since.strftime(fmt)))]
+#
+#    return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
+#            "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
+#            "days": series("1d", now_t - timedelta(days=60), "%Y-%m-%d")}
+#
+#
+#def change_note(now_b, before_b, word):
+#    """"12٪ more than the week before", or nothing when there is no before."""
+#    if not before_b:
+#        return ""
+#    pct = 100.0 * (now_b - before_b) / before_b
+#    if abs(pct) < 5:
+#        return "تقریباً همان %s قبل" % word
+#    return "%d٪ %s از %s قبل" % (abs(pct), "بیشتر" if pct > 0 else "کمتر", word)
+#
+#
+#def total_usage_card(p):
+#    """The home page's picture of the whole service: every customer's usage
+#    together, and who used the most - each name a link to their own charts."""
+#    try:
+#        view = total_usage()
+#    except sqlite3.OperationalError:
+#        return ""          # a panel that has not made the table yet
+#    if not view["days"] and not view["five"]:
+#        return ("<div class='card'><h2>مصرف کل</h2><p class='muted'>هنوز مصرفی ثبت نشده. "
+#                "نمودارها از اولین همگام‌سازی رله بعد از این نسخه پر می‌شوند.</p></div>")
+#    today = datetime.now(TEHRAN).date()
+#    by = {b: (u, d) for b, u, d in view["days"]}
+#
+#    def span(first, last):
+#        """Days first..last ago, both included, as (up, down)."""
+#        up = down = 0
+#        for i in range(first, last + 1):
+#            u, d = by.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), (0, 0))
+#            up += u
+#            down += d
+#        return up, down
+#
+#    now_up, now_down = span(0, 0)
+#    week, last_week = span(0, 6), span(7, 13)
+#    month, last_month = span(0, 29), span(30, 59)
+#    live = view["five"][-1] if view["five"] else None
+#    live_bps = ""
+#    now_t = datetime.now(TEHRAN)
+#    current = now_t.replace(minute=now_t.minute - now_t.minute % 5, second=0, microsecond=0)
+#    if live and live[0] == current.strftime("%Y-%m-%dT%H:%M"):
+#        took = max(30.0, (now_t - current).total_seconds())
+#        live_bps = "↓ %s · ↑ %s Mbps" % (mbit(live[2] * 8 / took), mbit(live[1] * 8 / took))
+#
+#    out = ["<div class='card'><h2>مصرف کل — همهٔ مشتری‌ها</h2><div class='grid'>"]
+#    for n, l, note in (
+#            (live_bps or "-", "سرعت الان", "میانگین ۵ دقیقهٔ اخیر"),
+#            (human(now_up + now_down), "امروز", "دانلود %s، آپلود %s" % (human(now_down), human(now_up))),
+#            (human(sum(week)), "۷ روز اخیر", change_note(sum(week), sum(last_week), "هفتهٔ")),
+#            (human(sum(month)), "۳۰ روز اخیر", change_note(sum(month), sum(last_month), "ماه"))):
+#        out.append("<div class='stat'><div class='n' dir='ltr'>%s</div><div class='l'>%s</div>"
+#                   "<div class='l'>%s</div></div>" % (html.escape(n), l, html.escape(note)))
+#    out.append("</div>")
+#    days_svg, _ = days_chart(view["days"])
+#    out.append("<h3 class='chart-h'>روزانه</h3>" + legend() + days_svg)
+#    out.append("<h3 class='chart-h'>سرعت کل ۲۴ ساعت اخیر</h3>" + legend() + speed_chart(view["five"]))
+#    out.append("<h3 class='chart-h'>ساعت‌های پرمصرف — ۷ روز اخیر</h3>" + heat_chart(view["hours"]))
+#
+#    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
+#    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+#                  " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
+#                  " WHERE g.grain = '1d' AND g.bucket >= ? GROUP BY u.id"
+#                  " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10", (since,))
+#    if top:
+#        total = sum(week) or 1
+#        out.append("<h3 class='chart-h'>پرمصرف‌ترین‌ها — ۷ روز اخیر</h3><table><tr><th>مشتری</th>"
+#                   "<th>دانلود</th><th>آپلود</th><th>سهم</th></tr>")
+#        for r in top:
+#            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
+#            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a> <span class='muted'>%s</span>"
+#                       "</td><td>%s</td><td>%s</td><td>%d٪</td></tr>"
+#                       % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
+#                          human(r["down"]), human(r["up"]),
+#                          round(100.0 * (r["down"] + r["up"]) / total)))
+#        out.append("</table>")
+#    out.append("<p class='muted'>روز و ساعت به وقت تهران. روی نام هر مشتری بزنید تا نمودار "
+#               "خودش را ببینید.</p></div>")
+#    return "".join(out)
 #
 #
 ## ---------------------------------------------------------------- at rest
@@ -13593,10 +14441,14 @@ exit 0
 #RESOLVER_LINE = re.compile(r"(\bresolver )[0-9. ]+?( ipv[46]=off;)")
 #
 #
-#def dns_probe(server, name="cloudflare.com", timeout=2.0):
+#def dns_probe(server, name="cloudflare.com", timeout=2.0, any_answer=False):
 #    """How long `server` takes to answer an A query for `name`, in
 #    milliseconds; None when it does not answer, or answers with an error.
-#    Twice, so one lost packet does not condemn a resolver."""
+#    Twice, so one lost packet does not condemn a resolver. `server` may carry
+#    a port, 1.2.3.4#5353, the way dnsmasq writes it. With `any_answer`, an
+#    answer of "no such name" or with no records counts too: the question is
+#    then whether the resolver is there, not whether the name is."""
+#    server, _, port = server.partition("#")
 #    qid = os.urandom(2)
 #    query = (qid + bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
 #             + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
@@ -13606,12 +14458,14 @@ exit 0
 #        s.settimeout(timeout)
 #        try:
 #            t0 = time.monotonic()
-#            s.sendto(query, (server, 53))
+#            s.sendto(query, (server, int(port or 53)))
 #            while True:
 #                data, _ = s.recvfrom(4096)
 #                if len(data) >= 12 and data[:2] == qid:
 #                    break
 #            # An answer, no error, and at least one record in it.
+#            if data[2] & 0x80 and any_answer and data[3] & 0x0F in (0, 3):
+#                return max(1, int((time.monotonic() - t0) * 1000))
 #            if data[2] & 0x80 and data[3] & 0x0F == 0 and (data[6] or data[7]):
 #                return max(1, int((time.monotonic() - t0) * 1000))
 #            return None
@@ -13620,6 +14474,48 @@ exit 0
 #        finally:
 #            s.close()
 #    return None
+#
+#
+#
+#
+#def bench(ips, tries=3, workers=8):
+#    """How long each resolver takes to answer from here: the median of a few
+#    real DNS questions, in milliseconds, or None for one that did not answer.
+#    A DNS question rather than a ping, because a ping is not what a resolver
+#    is for - some answer no pings, and some route them another way."""
+#    import concurrent.futures
+#
+#    def one(ip):
+#        times = sorted(t for t in (dns_probe(ip) for _ in range(tries)) if t is not None)
+#        return ip, (times[len(times) // 2] if times else None)
+#
+#    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+#        return dict(pool.map(one, ips))
+#
+#
+## The same timing from this machine, whose nginx asks these resolvers too:
+## every ten minutes, and at once when the operator asks.
+#EXIT_BENCH = {"ms": {}, "at": 0, "wake": threading.Event()}
+#
+#
+#def bench_ips():
+#    ips = [ip for _, a, b, _ in RESOLVERS for ip in (a, b)]
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'dns_upstream'")
+#    for ip in ((row["value"] if row and row["value"] else "") or "").split():
+#        if ip not in ips:
+#            ips.append(ip)
+#    return ips
+#
+#
+#def bench_loop():
+#    while True:
+#        try:
+#            EXIT_BENCH["ms"] = bench(bench_ips())
+#            EXIT_BENCH["at"] = time.time()
+#        except Exception as e:
+#            log(WARN, "resolvers not timed here: %r" % e)
+#        EXIT_BENCH["wake"].wait(600)
+#        EXIT_BENCH["wake"].clear()
 #
 #
 #def resolver_name(ip):
@@ -13673,20 +14569,77 @@ exit 0
 #            % (KEY_FILE, p))
 #
 #
+#def ms_text(v):
+#    return "%d ms" % v if isinstance(v, int) else "جواب نداد"
+#
+#
+#def bench_table(picks):
+#    """Each resolver's time from each relay, and from this machine: the
+#    fastest in each column marked, one that did not answer said so."""
+#    cols = []
+#    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'resolver_bench:%'"
+#                     " ORDER BY key"):
+#        try:
+#            got = json.loads(r["value"])
+#        except ValueError:
+#            continue
+#        cols.append(("رله " + r["key"].split(":", 1)[1], got.get("ms") or {}, got.get("at") or 0))
+#    if EXIT_BENCH["ms"]:
+#        cols.append(("این سرور", EXIT_BENCH["ms"], int(EXIT_BENCH["at"])))
+#    if not cols:
+#        return ("<p class='muted'>زمان جواب هنوز اندازه گرفته نشده؛ رله‌ها چند دقیقه بعد از "
+#                "این نسخه اولین اندازه‌گیری را می‌فرستند.</p>"), {}
+#    rows = [(prov, ip) for prov, a, b, _ in RESOLVERS for ip in (a, b)]
+#    for ip in picks:
+#        if ip and ip not in [x for _, x in rows]:
+#            rows.append(("دلخواه", ip))
+#    best = []
+#    for _, ms, _ in cols:
+#        answered = [v for v in ms.values() if isinstance(v, int)]
+#        best.append(min(answered) if answered else None)
+#    out = ["<table><tr><th>DNS</th><th>آی‌پی</th>%s</tr>"
+#           % "".join("<th>%s</th>" % html.escape(c[0]) for c in cols)]
+#    for prov, ip in rows:
+#        cells = []
+#        for (name, ms, _), fastest in zip(cols, best):
+#            v = ms.get(ip)
+#            text = ms_text(v) if ip in ms else "-"
+#            if isinstance(v, int) and v == fastest:
+#                cells.append("<td><b class='ok'>%s ✓</b></td>" % text)
+#            elif ip in ms and v is None:
+#                cells.append("<td class='warn'>%s</td>" % text)
+#            else:
+#                cells.append("<td>%s</td>" % text)
+#        mark = " <span class='ok'>●</span>" if ip in picks else ""
+#        out.append("<tr><td>%s%s</td><td><code>%s</code></td>%s</tr>"
+#                   % (html.escape(prov), mark, ip, "".join(cells)))
+#    ages = [int(time.time() - at) // 60 for _, _, at in cols if at]
+#    out.append("</table><p class='muted'>میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر "
+#               "ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: "
+#               "سؤال‌هایشان از آن‌جا پرسیده می‌شود. آخرین اندازه‌گیری: %s.</p>"
+#               % ("حدود %d دقیقه پیش" % max(ages) if ages and max(ages) else "همین الان"))
+#    # For the option labels: the relays' figure, where there is one.
+#    first = cols[0][1]
+#    return "".join(out), first
+#
+#
 #def upstream_card():
 #    """The settings page's card for picking the public resolvers."""
 #    p = CFG["ADMIN_PATH"]
 #    row = STORE.one("SELECT value FROM settings WHERE key = 'dns_upstream'")
 #    picks = ((row["value"] if row and row["value"] else DEFAULT_UPSTREAM).split() + [""])[:2]
 #    known = {ip for _, a, b, _ in RESOLVERS for ip in (a, b)}
+#    timings, label_ms = bench_table(picks)
 #
 #    def select(name, current):
 #        opts = ["<option value=''%s>— هیچ —</option>" % ("" if current else " selected")
 #                ] if name == "backup" else []
 #        for prov, a, b, _ in RESOLVERS:
 #            opts.append("<optgroup label='%s'>%s</optgroup>" % (html.escape(prov), "".join(
-#                "<option value='%s'%s>%s</option>"
-#                % (ip, " selected" if ip == current else "", ip) for ip in (a, b))))
+#                "<option value='%s'%s>%s%s</option>"
+#                % (ip, " selected" if ip == current else "", ip,
+#                   " — " + ms_text(label_ms[ip]) if ip in label_ms else "")
+#                for ip in (a, b))))
 #        custom = current if current and current not in known else ""
 #        return ("<select name='%s' dir='ltr'>%s</select> <input name='%s_custom'"
 #                " value='%s' placeholder='یا آی‌پی دلخواه' dir='ltr' size='15'>"
@@ -13705,6 +14658,9 @@ exit 0
 #    notes = ["<li><b>%s</b> (%s، %s): %s</li>" % (html.escape(n), a, b, html.escape(w))
 #             for n, a, b, w in RESOLVERS if w]
 #    out.append("<ul class='muted'>%s</ul>" % "".join(notes))
+#    out.append("<h3 class='chart-h'>زمان جواب</h3>" + timings)
+#    out.append("<form method='post' action='/%s/dns-bench'><button class='ghost'>"
+#               "اندازه‌گیری دوباره</button></form>" % p)
 #
 #    rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
 #                   " ORDER BY key")
@@ -13931,6 +14887,7 @@ exit 0
 #.under{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:2px}
 #.alsoneed{margin:0;padding:8px 30px 10px;font-size:11px;color:var(--warn);
 # border-top:1px solid var(--row)}
+#h3.chart-h{font-size:13px;font-weight:600;margin:20px 0 6px;color:var(--fg)}
 #h3.sec{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em;
 # margin:24px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--row)}
 #h3.sec:first-of-type{margin-top:6px}
@@ -14718,6 +15675,10 @@ exit 0
 #            # template, so it is not drawn where it could be ticked.
 #            if grp.get("locked"):
 #                continue
+#            # The operator's own domains are ticked one by one at the foot of
+#            # the page, beside the blocks and forwards, not as a service here.
+#            if svc["key"] == "custom":
+#                continue
 #            where = grp.get("section") or svc.get("section") or ""
 #            rank = order.index(where) if where in order else len(order)
 #            rows.append((rank, svc, grp))
@@ -15372,6 +16333,7 @@ exit 0
 #                       "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
 #        out.append("</div></div>")
 #
+#        out.append(total_usage_card(CFG["ADMIN_PATH"]))
 #        out.append(doh_card())
 #
 #        rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
@@ -16030,7 +16992,7 @@ exit 0
 #                    "علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. "
 #                    "برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید."
 #                    "</p></div>"
-#                    % html.escape(t["name"]))
+#                    % html.escape(t["name"])) + template_rules_card(t, p)
 #
 #        groups = STORE.template_groups(t["id"])
 #        off = STORE.template_domains_off(t["id"])
@@ -16211,6 +17173,7 @@ exit 0
 #  });
 #})();
 #</script>""")
+#        out.append(template_rules_card(t, p))
 #        return "".join(out)
 #
 #    def domains(self):
@@ -16238,6 +17201,8 @@ exit 0
 #        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس "
 #                   "«دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را "
 #                   "برداشت. به‌علاوهٔ %d دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
+#        out.append(blocked_card(p))
+#        out.append(forwards_card(p))
 #        return "".join(out)
 #
 #    def settings(self):
@@ -16273,6 +17238,7 @@ exit 0
 #                      "تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.</p>"))
 #
 #        out.append(upstream_card())
+#        out.append(doh_name_card(p))
 #
 #        out.append("<div class='card'><h2>آدرس این پنل</h2>"
 #                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
@@ -16901,9 +17867,15 @@ exit 0
 #            # out by subtraction: every domain in a routed group that did not
 #            # come back.
 #            keep = set(params.get("d") or [])
-#            STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
-#            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?", (tid,))
+#            # The operator's own domains are not in this form - they have one
+#            # of their own at the foot of the page - so they are kept as they are.
+#            STORE.run("DELETE FROM template_services WHERE template_id = ?"
+#                      " AND service_key != 'custom'", (tid,))
+#            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
+#                      " AND domain NOT IN (SELECT domain FROM custom_domains)", (tid,))
 #            for svc in catalogue_now():
+#                if svc["key"] == "custom":
+#                    continue
 #                for g in svc["groups"]:
 #                    # A locked group cannot be ticked, even by a form that
 #                    # sends it anyway.
@@ -16962,6 +17934,106 @@ exit 0
 #            STORE.run("INSERT INTO custom_domains (domain, note, added_at)"
 #                      " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
 #            return self.redirect("domains?m=%s اضافه شد" % domain)
+#
+#        if rest == "blocked-add":
+#            try:
+#                domain = clean_domain(one("domain"))
+#            except ValueError as e:
+#                return self.redirect("domains?m=!%s" % e)
+#            for host in own_hosts():
+#                if host == domain or host.endswith("." + domain):
+#                    return self.redirect("domains?m=!با بستن %s، %s هم بسته می‌شود که "
+#                                         "مشتری‌ها برای رسیدن به سرویس لازمش دارند"
+#                                         % (domain, host))
+#            if STORE.one("SELECT 1 FROM blocked_domains WHERE domain = ?", (domain,)):
+#                return self.redirect("domains?m=!%s از قبل مسدود است" % domain)
+#            # For every template; a template's own page takes it out of that one.
+#            STORE.run("INSERT INTO blocked_domains (domain, note, added_at)"
+#                      " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
+#            also = [svc["label"] for svc in catalogue_now() if svc["key"] != "custom"
+#                    and any(d == domain or d.endswith("." + domain)
+#                            for g in svc["groups"] for d in g["domains"])]
+#            if STORE.one("SELECT 1 FROM custom_domains WHERE domain = ? OR domain LIKE ?",
+#                         (domain, "%." + domain)):
+#                also.append("دامنه‌های شما")
+#            return self.redirect("domains?m=%s مسدود شد%s" % (
+#                domain, "؛ جزو %s هم بود و دیگر از رله نمی‌رود" % "، ".join(also[:3])
+#                if also else ""))
+#
+#        if rest == "forward-add":
+#            try:
+#                domain = clean_domain(one("domain"))
+#                servers = clean_servers(one("servers"))
+#            except ValueError as e:
+#                return self.redirect("domains?m=!%s" % e)
+#            if STORE.one("SELECT 1 FROM dns_forwards WHERE domain = ?", (domain,)):
+#                return self.redirect("domains?m=!%s از قبل DNS جداگانه دارد؛ اول حذفش کنید"
+#                                     % domain)
+#            # Only a block for every template makes a forward pointless;
+#            # under one for some, it still works for the rest.
+#            for r in STORE.q("SELECT domain FROM blocked_domains WHERE all_templates = 1"):
+#                if domain == r["domain"] or domain.endswith("." + r["domain"]):
+#                    return self.redirect("domains?m=!%s برای همهٔ قالب‌ها مسدود است (%s)"
+#                                         % (domain, r["domain"]))
+#            STORE.run("INSERT INTO dns_forwards (domain, servers, note, added_at)"
+#                      " VALUES (?, ?, ?, ?)",
+#                      (domain, " ".join(servers), one("note") or None, now()))
+#            also = [svc["label"] for svc in catalogue_now() if svc["key"] != "custom"
+#                    and any(d == domain or d.endswith("." + domain)
+#                            for g in svc["groups"] for d in g["domains"])]
+#            return self.redirect("domains?m=%s از %s پرسیده می‌شود%s" % (
+#                domain, " ".join(servers),
+#                "؛ جزو %s هم بود و دیگر از رله نمی‌رود" % "، ".join(also[:3]) if also else ""))
+#
+#        if rest == "template-rules":
+#            tid = int(one("id") or 0)
+#            ids = [r["id"] for r in STORE.q("SELECT id FROM templates ORDER BY id")]
+#            if tid not in ids:
+#                return self.redirect("templates?m=!قالب پیدا نشد")
+#            # The operator's own domains: the service ticked while any of them
+#            # is, each un-ticked one switched off inside it - the same rows the
+#            # service list used to write. The default template routes them all.
+#            if not STORE.one("SELECT is_default FROM templates WHERE id = ?", (tid,))["is_default"]:
+#                custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains")]
+#                ticked = set(params.get("c") or []) & set(custom)
+#                STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
+#                          " AND domain IN (SELECT domain FROM custom_domains)", (tid,))
+#                if ticked:
+#                    STORE.run("INSERT OR IGNORE INTO template_services"
+#                              " (template_id, service_key, group_key) VALUES (?, 'custom', 'main')",
+#                              (tid,))
+#                    for d in custom:
+#                        if d not in ticked:
+#                            STORE.run("INSERT OR IGNORE INTO template_domains_off"
+#                                      " (template_id, domain) VALUES (?, ?)", (tid, d))
+#                else:
+#                    STORE.run("DELETE FROM template_services WHERE template_id = ?"
+#                              " AND service_key = 'custom'", (tid,))
+#            for table, field in (("blocked_domains", "b"), ("dns_forwards", "f")):
+#                ticked = set(params.get(field) or [])
+#                for r in STORE.q("SELECT domain FROM %s" % table):
+#                    every, have = rule_templates(table, r["domain"])
+#                    on, want = every or tid in have, r["domain"] in ticked
+#                    if on == want:
+#                        continue
+#                    if want:
+#                        set_scope(table, r["domain"], False, sorted(have | {tid}))
+#                    elif every:
+#                        # "Every template but this one" - which from now on
+#                        # does not take in templates made later.
+#                        set_scope(table, r["domain"], False, [i for i in ids if i != tid])
+#                    else:
+#                        set_scope(table, r["domain"], False, sorted(have - {tid}))
+#            return self.redirect("templates?t=%d&m=ذخیره شد؛ تا ۳۰ ثانیه دیگر روی "
+#                                 "رله‌ها اعمال می‌شود" % tid)
+#
+#        if rest == "forward-del":
+#            STORE.run("DELETE FROM dns_forwards WHERE domain = ?", (one("domain"),))
+#            return self.redirect("domains?m=حذف شد")
+#
+#        if rest == "blocked-del":
+#            STORE.run("DELETE FROM blocked_domains WHERE domain = ?", (one("domain"),))
+#            return self.redirect("domains?m=آزاد شد")
 #
 #        if rest == "domain-del":
 #            STORE.run("DELETE FROM custom_domains WHERE domain = ?", (one("domain"),))
@@ -17042,6 +18114,31 @@ exit 0
 #                "از این به بعد خرید و تمدید در پنل وب تلگرام وصل‌شده می‌خواهد" if on
 #                else "وصل کردن تلگرام دیگر اجباری نیست"))
 #
+#        if rest == "doh-name":
+#            raw = (one("name") or "").strip()
+#            if not raw:
+#                STORE.run("DELETE FROM settings WHERE key = 'doh_name'")
+#                return self.redirect("settings?m=DNS امن تا یک دقیقه دیگر به نام خود رله "
+#                                     "برمی‌گردد")
+#            try:
+#                name = clean_domain(raw)
+#            except ValueError as e:
+#                return self.redirect("settings?m=!%s" % e)
+#            if re.fullmatch(r"[0-9.]+", name):
+#                return self.redirect("settings?m=!یک نام بنویسید، نه آی‌پی")
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('doh_name', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (name,))
+#            return self.redirect("settings?m=ذخیره شد؛ رله تا یکی دو دقیقه دیگر گواهی %s را "
+#                                 "می‌گیرد — وضعیتش همین‌جاست" % name)
+#
+#        if rest == "dns-bench":
+#            # The relays at their next sync, this machine now.
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('bench_now', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (now(),))
+#            EXIT_BENCH["wake"].set()
+#            return self.redirect("settings?m=اندازه‌گیری شروع شد؛ تا یک دقیقه دیگر صفحه را "
+#                                 "تازه کنید")
+#
 #        if rest == "dns-upstream":
 #            picks = []
 #            for k in ("primary", "backup"):
@@ -17110,6 +18207,224 @@ exit 0
 #             "t.me", "telegram.me")
 #
 #
+## Which templates a block or a forward is for: every one, including those made
+## later, or the ones listed in its link table.
+#RULE_TABLES = {"blocked_domains": "blocked_templates", "dns_forwards": "forward_templates"}
+#
+#
+#def rule_templates(table, domain):
+#    """(for every template, the ids it is ticked for)."""
+#    row = STORE.one("SELECT all_templates FROM %s WHERE domain = ?" % table, (domain,))
+#    ids = {r["template_id"] for r in STORE.q(
+#        "SELECT template_id FROM %s WHERE domain = ?" % RULE_TABLES[table], (domain,))}
+#    return bool(row and row["all_templates"]), ids
+#
+#
+#def scope_text(table, domain):
+#    every, ids = rule_templates(table, domain)
+#    if every:
+#        return "همهٔ قالب‌ها"
+#    names = [r["name"] for r in STORE.q("SELECT id, name FROM templates ORDER BY id")
+#             if r["id"] in ids]
+#    return "، ".join(names) if names else "هیچ قالبی"
+#
+#
+#def set_scope(table, domain, every, ids):
+#    STORE.run("UPDATE %s SET all_templates = ? WHERE domain = ?" % table,
+#              (1 if every else 0, domain))
+#    STORE.run("DELETE FROM %s WHERE domain = ?" % RULE_TABLES[table], (domain,))
+#    for tid in ([] if every else ids):
+#        STORE.run("INSERT OR IGNORE INTO %s (domain, template_id) VALUES (?, ?)"
+#                  % RULE_TABLES[table], (domain, tid))
+#
+#
+#def template_rules_card(t, p):
+#    """A template's own page, at its foot: the operator's own domains it
+#    routes, and the blocks and forwards it has - everything the operator
+#    added themselves, in one place."""
+#    try:
+#        blocked = STORE.q("SELECT domain FROM blocked_domains ORDER BY domain")
+#        forwards = STORE.q("SELECT domain, servers FROM dns_forwards ORDER BY domain")
+#    except sqlite3.OperationalError:
+#        blocked = forwards = []
+#    custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains ORDER BY domain")]
+#    out = ["<div class='card'><h2>دامنه‌های دلخواه، مسدودها و DNS جداگانهٔ این قالب</h2>"]
+#    if not blocked and not forwards and not custom:
+#        out.append("<p class='muted'>هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از "
+#                   "<a href='/%s/domains'>صفحهٔ دامنه‌ها</a>.</p></div>" % p)
+#        return "".join(out)
+#    out.append("<form method='post' action='/%s/template-rules'>"
+#               "<input type='hidden' name='id' value='%d'>" % (p, t["id"]))
+#    if custom:
+#        out.append("<h3 class='chart-h'>دامنه‌های دلخواه — از رله می‌روند</h3>")
+#        if t["is_default"]:
+#            out += ["<label style='display:block;margin:4px 0'><input type='checkbox' checked "
+#                    "disabled> <code>%s</code></label>" % html.escape(d) for d in custom]
+#            out.append("<p class='muted'>قالب پیش‌فرض همیشه همهٔ دامنه‌های دلخواه را از رله "
+#                       "می‌برد.</p>")
+#        else:
+#            on = ("custom", "main") in STORE.template_groups(t["id"])
+#            off = STORE.template_domains_off(t["id"])
+#            out += ["<label style='display:block;margin:4px 0'><input type='checkbox' name='c' "
+#                    "value='%s'%s> <code>%s</code></label>"
+#                    % (html.escape(d), " checked" if on and d not in off else "",
+#                       html.escape(d)) for d in custom]
+#            out.append("<p class='muted'>دامنهٔ دلخواهی که بعداً اضافه کنید، در قالبی که "
+#                       "دست‌کم یکی از این‌ها تیک خورده، خودکار از رله می‌رود.</p>")
+#
+#    def box(name, table, domain, extra):
+#        every, ids = rule_templates(table, domain)
+#        on = every or t["id"] in ids
+#        return ("<label style='display:block;margin:4px 0'><input type='checkbox' name='%s' "
+#                "value='%s'%s> <code>%s</code>%s <span class='muted'>— %s</span></label>"
+#                % (name, html.escape(domain), " checked" if on else "", html.escape(domain),
+#                   extra, html.escape(scope_text(table, domain))))
+#    if blocked:
+#        out.append("<h3 class='chart-h'>دامنه‌های مسدود</h3>")
+#        out += [box("b", "blocked_domains", r["domain"], "") for r in blocked]
+#    if forwards:
+#        out.append("<h3 class='chart-h'>DNS جداگانه</h3>")
+#        out += [box("f", "dns_forwards", r["domain"],
+#                    " ← <code dir='ltr'>%s</code>" % html.escape(r["servers"]))
+#                for r in forwards]
+#    out.append("<p class='muted'>تیکِ مسدودها و DNS جداگانه یعنی برای مشتری‌های این قالب. "
+#               "برداشتن تیکِ ردیفی که "
+#               "«همهٔ قالب‌ها» است آن را فقط برای قالب‌های دیگر نگه می‌دارد. اگر دامنه‌ای در "
+#               "این قالب هم مسدود باشد هم DNS جداگانه داشته باشد، مسدود بودن برنده است.</p>"
+#               "<button>ذخیره</button></form></div>")
+#    return "".join(out)
+#
+#
+#def blocked_card(p):
+#    """The domains page's second card: names closed for every customer."""
+#    try:
+#        rows = STORE.q("SELECT * FROM blocked_domains ORDER BY added_at DESC")
+#    except sqlite3.OperationalError:
+#        return ""          # a panel that has not made the table yet
+#    out = ["<div class='card'><h2>دامنه‌های مسدود (%d)</h2>" % len(rows),
+#           "<form method='post' action='/%s/blocked-add' class='row' "
+#           "style='margin-bottom:14px'>"
+#           "<input name='domain' placeholder='example.com' style='min-width:220px'>"
+#           "<input name='note' placeholder='یادداشت (اختیاری)'>"
+#           "<button class='danger'>مسدود کن</button></form>" % p]
+#    if rows:
+#        out.append("<table><tr><th>دامنه</th><th>قالب‌ها</th><th>یادداشت</th><th>افزوده</th>"
+#                   "<th></th></tr>")
+#        for r in rows:
+#            out.append("<tr><td><code>%s</code></td><td>%s</td><td class='muted'>%s</td>"
+#                       "<td class='muted'>%s</td>"
+#                       "<td><form method='post' action='/%s/blocked-del'>"
+#                       "<input type='hidden' name='domain' value='%s'>"
+#                       "<button class='ghost'>آزاد کن</button></form></td></tr>"
+#                       % (html.escape(r["domain"]),
+#                          html.escape(scope_text("blocked_domains", r["domain"])),
+#                          html.escape(r["note"] or ""),
+#                          (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
+#        out.append("</table>")
+#    out.append("<p class='muted'>این‌ها برای مشتری‌های قالب‌های انتخاب‌شده بالا نمی‌آیند: DNS "
+#               "جواب «چنین اسمی نیست» می‌دهد، با همهٔ زیردامنه‌ها. دامنه‌ای که خود سرویس "
+#               "از رله می‌برد هم بسته می‌شود. تا یک دقیقه بعد روی رله‌ها اعمال می‌شود؛ "
+#               "دستگاهی که جواب قبلی را نگه داشته ممکن است چند دقیقه دیرتر ببیند. "
+#               "فقط جلوی DNS ما را می‌گیرد: کسی که DNS دیگری بگذارد یا مستقیم با آی‌پی "
+#               "وصل شود از این رد می‌شود. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ "
+#               "در صفحهٔ هر قالب می‌شود تیکش را برداشت.</p></div>")
+#    return "".join(out)
+#
+#
+#FORWARD_SERVER_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(#(\d{1,5}))?$")
+#
+#
+#def clean_servers(raw):
+#    """"1.1.1.1, 8.8.8.8#5353" as the list dnsmasq will be given, or an error."""
+#    out = []
+#    for s in re.split(r"[\s,،]+", (raw or "").strip()):
+#        if not s:
+#            continue
+#        m = FORWARD_SERVER_RE.match(s)
+#        if not m or any(int(x) > 255 for x in m.groups()[:4]) or \
+#                (m.group(6) and not 0 < int(m.group(6)) < 65536):
+#            raise ValueError("«%s» آی‌پی درستی نیست؛ مثل 1.1.1.1 یا 10.0.0.2#5353" % s)
+#        if s.startswith("0.") or s.startswith("127."):
+#            raise ValueError("«%s» روی خود رله است، نه یک DNS" % s)
+#        if s not in out:
+#            out.append(s)
+#    if not out:
+#        raise ValueError("آی‌پی DNS را بنویسید")
+#    if len(out) > 4:
+#        raise ValueError("حداکثر چهار DNS برای هر دامنه")
+#    return out
+#
+#
+#def forwards_card(p):
+#    """The domains page's third card: names asked of a resolver of the
+#    operator's choosing, and whether each relay can reach it."""
+#    try:
+#        rows = STORE.q("SELECT * FROM dns_forwards ORDER BY added_at DESC")
+#    except sqlite3.OperationalError:
+#        return ""
+#    relays = []
+#    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'forward_check:%'"
+#                     " ORDER BY key"):
+#        try:
+#            relays.append((r["key"].split(":", 1)[1], json.loads(r["value"]).get("ms") or {}))
+#        except ValueError:
+#            continue
+#    out = ["<div class='card'><h2>DNS جداگانه برای دامنه‌ها (%d)</h2>" % len(rows),
+#           "<form method='post' action='/%s/forward-add' class='row' "
+#           "style='margin-bottom:14px'>"
+#           "<input name='domain' placeholder='example.com' style='min-width:200px'>"
+#           "<input name='servers' placeholder='1.1.1.1' dir='ltr' style='min-width:160px'>"
+#           "<input name='note' placeholder='یادداشت (اختیاری)'>"
+#           "<button>افزودن</button></form>" % p]
+#    if rows:
+#        out.append("<table><tr><th>دامنه</th><th>DNS</th><th>قالب‌ها</th>%s<th>یادداشت</th>"
+#                   "<th></th></tr>"
+#                   % "".join("<th>از رله %s</th>" % html.escape(ip) for ip, _ in relays))
+#        for r in rows:
+#            cells = []
+#            for _, ms in relays:
+#                got = ms.get(r["domain"])
+#                if not isinstance(got, dict):
+#                    cells.append("<td class='muted'>-</td>")
+#                    continue
+#                parts = []
+#                for s in r["servers"].split():
+#                    v = got.get(s)
+#                    parts.append("<span class='ok'>%d ms</span>" % v if isinstance(v, int)
+#                                 else "<span class='warn'>جواب نداد</span>" if s in got else "-")
+#                cells.append("<td>%s</td>" % " · ".join(parts))
+#            out.append("<tr><td><code>%s</code></td><td dir='ltr'><code>%s</code></td>"
+#                       "<td>%s</td>%s<td class='muted'>%s</td>"
+#                       "<td><form method='post' action='/%s/forward-del'>"
+#                       "<input type='hidden' name='domain' value='%s'>"
+#                       "<button class='danger'>حذف</button></form></td></tr>"
+#                       % (html.escape(r["domain"]), html.escape(r["servers"]),
+#                          html.escape(scope_text("dns_forwards", r["domain"])), "".join(cells),
+#                          html.escape(r["note"] or ""), p, html.escape(r["domain"])))
+#        out.append("</table>")
+#    out.append("<p class='muted'>این دامنه و همهٔ زیردامنه‌هایش برای مشتری‌های قالب‌های "
+#               "انتخاب‌شده از همین DNS "
+#               "پرسیده می‌شوند، نه از DNS بالادستی. اگر جزو دامنه‌هایی باشد که سرویس از رله "
+#               "می‌برد، دیگر از رله نمی‌رود و جواب همین DNS به مشتری داده می‌شود. چند DNS را با "
+#               "فاصله بنویسید؛ پورت غیر ۵۳ با #، مثل <code dir='ltr'>10.0.0.2#5353</code>. "
+#               "ستون هر رله می‌گوید آن DNS از خود رله جواب می‌دهد یا نه (هر ده دقیقه). "
+#               "دامنهٔ مسدود بر این مقدم است. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ در صفحهٔ "
+#               "هر قالب می‌شود تیکش را برداشت.</p></div>")
+#    return "".join(out)
+#
+#
+#def own_hosts():
+#    """The names customers need to reach us by, which a block must not cover."""
+#    hosts = []
+#    for key in ("doh_host", "doh_name", "customer_panel_url"):
+#        row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+#        v = (row["value"] if row and row["value"] else "").strip().lower()
+#        v = v.split("://", 1)[-1].split("/")[0].split(":")[0].strip(".")
+#        if v:
+#            hosts.append(v)
+#    return hosts
+#
+#
 #def clean_domain(raw):
 #    """Same normalisation the bot does, so a domain added here and one added
 #    there end up identical rather than as two rows differing by a www."""
@@ -17153,6 +18468,7 @@ exit 0
 #    SECTIONS[:] = load_sections()
 #    STORE = Store(DB)
 #    SEALED_CHECK.append(lambda: count_sealed(STORE.db))
+#    threading.Thread(target=bench_loop, daemon=True).start()
 #    try:
 #        db_key()
 #    except Exception as e:
@@ -17411,16 +18727,9 @@ exit 0
 ## Which side this is decides which parts it has. The timers are listed for
 ## their status - a oneshot service reads "inactive" between runs, which looks
 ## like a fault and is not - and the services for their logs.
-#if [ -f "$ETC/sync.env" ]; then
-#    role=relay
-#    status="smartdns-sync dnsmasq nginx coturn epic-pin.timer smartdns-acl-save.timer"
-#    logs="smartdns-sync dnsmasq nginx coturn epic-pin smartdns-acl-save"
-#    for f in /etc/smartdns-profiles/*.conf; do
-#        [ -e "$f" ] || continue
-#        status="$status smartdns-dns@$(basename "$f" .conf)"
-#        logs="$logs smartdns-dns@$(basename "$f" .conf)"
-#    done
-#elif [ -f "$ETC/panel.env" ]; then
+## A single machine has both, and so both lists, with nginx once.
+#status=""; logs=""; role=""
+#if [ -f "$ETC/panel.env" ]; then
 #    role=exit
 #    status="smartdns-panel smartdns-admin nginx smartdns-cert.timer"
 #    logs="smartdns-panel smartdns-admin nginx smartdns-cert"
@@ -17429,7 +18738,19 @@ exit 0
 #        status="$status smartdns-operators.timer"
 #        logs="$logs smartdns-operators"
 #    fi
-#else
+#fi
+#if [ -f "$ETC/sync.env" ]; then
+#    if [ "$role" = exit ]; then role=single; ng=""; else role=relay; ng=" nginx"; fi
+#    status="$status smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin.timer smartdns-acl-save.timer"
+#    logs="$logs smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin smartdns-acl-save"
+#    for f in /etc/smartdns-profiles/*.conf; do
+#        [ -e "$f" ] || continue
+#        status="$status smartdns-dns@$(basename "$f" .conf)"
+#        logs="$logs smartdns-dns@$(basename "$f" .conf)"
+#    done
+#fi
+#status="${status# }"; logs="${logs# }"
+#if [ -z "$role" ]; then
 #    echo "doctor dns is not installed on this machine" >&2
 #    exit 1
 #fi
@@ -17483,7 +18804,7 @@ exit 0
 #        echo "== disk and memory"
 #        df -h / 2>/dev/null | tail -1
 #        free -m 2>/dev/null | sed -n '1,2p'
-#        if [ "$role" = relay ]; then
+#        if [ "$role" != exit ]; then
 #            echo
 #            echo "== routing"
 #            smartdns-rules 2>&1
@@ -17682,6 +19003,8 @@ exit 0
 #        return "dnsmasq" if self.key == "main" else "smartdns-dns@%s" % self.key
 #
 #    def label(self):
+#        if self.key == "default":
+#            return "default template, with the operator's blocks and forwards"
 #        if self.key == "main":
 #            return "%s (default)" % self.name if self.name else "default template"
 #        return self.name or "template %s" % self.key
@@ -18025,21 +19348,26 @@ exit 0
 ## Services only. The timers are clocks with nothing to unstick, and nftables is
 ## left alone on purpose: restarting it reloads the rules from disk, which throws
 ## away the allowlist and the usage counted since the last save.
+## A single machine has both: the panel first, which the sync agent talks to.
+#units=""; role=""
+#if [ -f "$ETC/panel.env" ]; then
+#    role=exit
+#    units="smartdns-panel smartdns-admin"
+#fi
 #if [ -f "$ETC/sync.env" ]; then
-#    role=relay
+#    [ "$role" = exit ] && role=single || role=relay
 #    resolvers=""
 #    for f in "$PROFILES"/*.conf; do
 #        [ -e "$f" ] || continue
 #        resolvers="$resolvers smartdns-dns@$(basename "$f" .conf)"
 #    done
-#    units="smartdns-sync$resolvers dnsmasq coturn smartdns-tunnel nginx"
-#elif [ -f "$ETC/panel.env" ]; then
-#    role=exit
-#    units="smartdns-panel smartdns-admin smartdns-tunnel nginx"
-#else
+#    units="$units smartdns-sync smartdns-doh$resolvers dnsmasq coturn"
+#fi
+#if [ -z "$role" ]; then
 #    echo "doctor dns is not installed on this machine" >&2
 #    exit 1
 #fi
+#units="${units# } smartdns-tunnel nginx"
 #
 #installed() { [ "$(systemctl show -p LoadState --value "$1" 2>/dev/null)" = loaded ]; }
 #
@@ -18051,7 +19379,7 @@ exit 0
 #}
 #
 #echo "restarting doctor dns - $role"
-#[ "$role" = relay ] && echo "customers' open connections drop for a moment and come straight back"
+#[ "$role" != exit ] && echo "customers' open connections drop for a moment and come straight back"
 #echo
 #
 #skipped=""
@@ -18648,7 +19976,9 @@ exit 0
 #    *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
 #esac
 #[ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-menu" >&2; exit 1; }
-#if [ -f "$ETC/sync.env" ]; then role=relay
+## Both is a single machine, the relay and the exit in one.
+#if [ -f "$ETC/sync.env" ] && [ -f "$ETC/panel.env" ]; then role=single
+#elif [ -f "$ETC/sync.env" ]; then role=relay
 #elif [ -f "$ETC/panel.env" ]; then role=exit
 #else echo "doctor dns is not installed on this machine" >&2; exit 1; fi
 #VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo '?')"
@@ -18774,10 +20104,10 @@ exit 0
 #        'more lines per part   (smartdns-logs -n)|ask "lines per part" && run smartdns-logs -n "$REPLY"'
 #        'one file to send, secrets masked   (smartdns-logs --report)|run smartdns-logs --report'
 #    )
-#    [ "$role" = exit ] && [ -x /usr/local/bin/smartdns-bot-logs ] && items+=(
+#    [ "$role" != relay ] && [ -x /usr/local/bin/smartdns-bot-logs ] && items+=(
 #        'logs of the Telegram bot   (smartdns-bot-logs)|run smartdns-bot-logs'
 #    )
-#    [ "$role" = relay ] && items+=(
+#    [ "$role" != exit ] && items+=(
 #        'what this relay is doing   (smartdns status)|run smartdns status'
 #        'the names a customer asks for, live   (smartdns-watch)|watch_customer'
 #    )
@@ -18839,7 +20169,7 @@ exit 0
 #}
 #
 #restart_all() {
-#    if [ "$role" = relay ]; then
+#    if [ "$role" != exit ]; then
 #        sure "customers' open connections drop for a moment - go ahead?" || return 0
 #    fi
 #    run smartdns-restart
@@ -18853,6 +20183,16 @@ exit 0
 #            'domains|menu_domains'
 #            'customers and access|menu_customers'
 #            'tunnel to the exit|menu_tunnel'
+#            'restart everything   (smartdns-restart)|restart_all'
+#            'installation, updates and certificates|menu_install'
+#        )
+#    elif [ "$role" = single ]; then
+#        # No tunnel: there is nothing to tunnel between.
+#        items=(
+#            'status and logs|menu_logs'
+#            'domains|menu_domains'
+#            'customers and access|menu_customers'
+#            'admin panel|menu_admin'
 #            'restart everything   (smartdns-restart)|restart_all'
 #            'installation, updates and certificates|menu_install'
 #        )
@@ -18898,6 +20238,11 @@ exit 0
 #    for p in $1; do [ "$p" -le 255 ] || return 1; done
 #}
 #
+## The API's port: 8443, or on a single machine the loopback one it moved to -
+## where 8443 is the customer panel, and must not be closed.
+#port="$(sed -n 's/^API_PORT=//p' "$ETC/panel.env" 2>/dev/null | head -1)"
+#case "$port" in ""|*[!0-9]*) port=8443 ;; esac
+#
 #list="127.0.0.1"
 #for ip in $(sed -n 's/^RELAY_IP=//p' "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
 #    if valid_ip "$ip"; then list="$list, $ip"
@@ -18910,8 +20255,8 @@ exit 0
 #table inet smartdns_api {
 #    chain input {
 #        type filter hook input priority -5 ; policy accept ;
-#        tcp dport 8443 ip saddr { $list } accept
-#        tcp dport 8443 drop
+#        tcp dport $port ip saddr { $list } accept
+#        tcp dport $port drop
 #    }
 #}"
 #
@@ -18928,7 +20273,7 @@ exit 0
 #    exit 0
 #fi
 #if printf '%s\n' "$rules" | "$NFT" -f -; then
-#    echo "port 8443 answers: $list"
+#    echo "port $port answers: $list"
 #else
 #    echo "nft refused the rule - the sync API stays open, and the panel refuses strangers itself" >&2
 #fi

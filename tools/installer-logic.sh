@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.7.4"
+VERSION="0.8.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -87,12 +87,22 @@ backup_file() {
 # Write payload $1 to file $2, substituting the two addresses. Backs up whatever
 # was there, and skips the write when the content is identical so re-runs do not
 # churn files or trigger needless restarts. Returns 0 only if it changed.
+# A single machine (ROLE=single) is both ends at once: the relay's DNS and
+# gate in front of the exit's proxy, with the panel beside them. Most of this
+# file asks which parts a machine has, not which role it is.
+is_relay() { [ "$ROLE" = relay ] || [ "$ROLE" = single ]; }
+is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }
+# Where a single machine's sync API listens: loopback only, because 8443 is
+# its customer panel, and the only relay it has is itself.
+SINGLE_API_PORT=8449
+
 # Where the relay's certificate is, and so whether it can serve DoH. The
 # name is the customer panel's: one certificate, one name, for the panel on
 # 8443 and for DNS on 443 and 853.
 doh_paths() {
     DOH_ON=""; NO_DOH=1; DOH_HOST=""; DOH_CERT=""; DOH_KEY=""
-    [ "$ROLE" = relay ] && [ -n "${PANEL_DOMAIN:-}" ] || return 0
+    HTTPS_TARGET='$upstream'
+    is_relay && [ -n "${PANEL_DOMAIN:-}" ] || return 0
     if [ -n "${PANEL_CERT:-}" ]; then
         DOH_CERT="$PANEL_CERT"; DOH_KEY="${PANEL_KEY:-}"
     else
@@ -101,7 +111,29 @@ doh_paths() {
     fi
     if [ -f "$DOH_CERT" ] && [ -f "$DOH_KEY" ]; then
         DOH_ON=1; NO_DOH=""; DOH_HOST="$PANEL_DOMAIN"
+        # A single machine's 443 sends its own name to the DoH server. An if,
+        # not &&: the last command of a function is its status, and under
+        # set -e a relay would have stopped here.
+        if [ "$ROLE" = single ]; then HTTPS_TARGET='$https_target'; fi
     fi
+}
+
+# What nginx's DoH blocks include: the certificate, and the names that reach
+# the DoH server. Written here with the machine's own name; once the admin
+# panel has given DoH a name of its own and smartdns-sync has a certificate
+# for it (/etc/smart-dns/doh-name), they are smartdns-sync's, and an upgrade
+# leaves them be. Needed before nginx -t whenever DoH is on.
+DOH_CERT_CONF=/etc/nginx/smartdns-doh-cert.conf
+DOH_NAMES_MAP=/etc/nginx/smartdns-doh-names.map
+doh_includes() {
+    if [ -s /etc/smart-dns/doh-name ] && [ -s "$DOH_CERT_CONF" ] && [ -s "$DOH_NAMES_MAP" ]; then
+        return 0
+    fi
+    note_file "$DOH_CERT_CONF"; note_file "$DOH_NAMES_MAP"
+    printf 'ssl_certificate     %s;\nssl_certificate_key %s;\n' "$DOH_CERT" "$DOH_KEY" \
+        > "$DOH_CERT_CONF"
+    printf '%s 127.0.0.1:8453;\n' "$DOH_HOST" > "$DOH_NAMES_MAP"
+    chmod 644 "$DOH_CERT_CONF" "$DOH_NAMES_MAP"
 }
 
 # Once the certificate exists: nginx with the DoH blocks in, and the flag
@@ -109,15 +141,20 @@ doh_paths() {
 # this is what turns DoH on; on an upgrade the nginx step already had the
 # certificate and this only confirms it.
 relay_doh() {
-    [ "$ROLE" = relay ] || return 0
+    is_relay || return 0
     local was="$DOH_ON"
     doh_paths
     if [ -z "$DOH_ON" ]; then
         rm -f /etc/smart-dns/doh
         return 0
     fi
+    doh_includes
     if [ -z "$was" ]; then
-        install_payload RELAY_NGINX /etc/nginx/nginx.conf || true
+        if [ "$ROLE" = single ]; then
+            install_payload EXIT_NGINX /etc/nginx/nginx.conf || true
+        else
+            install_payload RELAY_NGINX /etc/nginx/nginx.conf || true
+        fi
         nginx -t || die "nginx rejected the DoH config; the previous one is in $BACKUP_DIR"
         systemctl reload nginx 2>/dev/null || systemctl restart nginx
     fi
@@ -126,7 +163,10 @@ relay_doh() {
 }
 
 install_payload() {
-    local name="$1" dest="$2" tmp
+    local name="$1" dest="$2" tmp solo=1
+    # A single machine's own blocks, and its dropping of the "only the relay"
+    # lines, happen on a single machine only (ROLE=single sets SINGLE).
+    [ -n "${SINGLE:-}" ] && solo=""
     tmp="$(mktemp)"
     # MODULE_PATH is filled in here, not with a sed -i afterwards, so that what
     # we compare against the installed file is the finished article. Doing it
@@ -135,7 +175,14 @@ install_payload() {
     # empty for the payloads written before it is discovered, and none of those
     # contain the placeholder.
     payload "$name" \
-        | sed -e "s#__RELAY_IP__#${RELAY_IP}#g" \
+        | sed -e "${SINGLE:+/^ *allow __RELAY_IP__;\$/d}" \
+              -e "${SINGLE:+/^ *allow 127\.0\.0\.1;\$/d}" \
+              -e "${SINGLE:+/^ *deny all;\$/d}" \
+              -e "${solo:+/# single begin/,/# single end/d}" \
+              -e "s#__HTTPS_TARGET__#${HTTPS_TARGET:-\$upstream}#g" \
+              -e "s#__LISTEN_IP__#${LISTEN_IP:-$RELAY_IP}#g" \
+              -e "s#__TURN_EXTERNAL__#${TURN_EXTERNAL:-$RELAY_IP}#g" \
+              -e "s#__RELAY_IP__#${RELAY_IP}#g" \
               -e "s#__EXIT_IP__#${EXIT_IP}#g" \
               -e "s#__MODULE_PATH__#${MOD:-__MODULE_PATH__}#g" \
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
@@ -842,11 +889,16 @@ if [ -n "$INSTALLED_VERSION" ]; then
     was() { recall "$1" 2>/dev/null | tail -1 || true; }
     ROLE="${ROLE:-$(was role)}"
     if [ -z "$ROLE" ]; then
-        if [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
+        # Both files is a single machine; one of them, that end.
+        if [ -f /etc/smart-dns/sync.env ] && [ -f /etc/smart-dns/panel.env ]; then ROLE=single
+        elif [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
         elif [ -f /etc/smart-dns/panel.env ]; then ROLE=exit
         fi
     fi
-    if [ "$ROLE" = relay ]; then
+    if [ "$ROLE" = single ]; then
+        SELF_IP="${SELF_IP:-$(was relay-ip)}"
+        [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
+    elif [ "$ROLE" = relay ]; then
         PEER_IP="${PEER_IP:-$(was exit-ip)}"
         SELF_IP="${SELF_IP:-$(was relay-ip)}"
         # Older state files, or none: the relay's own config has both.
@@ -876,19 +928,33 @@ ROLE="${ROLE:-}"; PEER_IP="${PEER_IP:-}"; SELF_IP="${SELF_IP:-}"
 if [ -z "$ROLE" ]; then
     printf '\n%sWhich side is this machine?%s\n\n' "$B" "$N"
     printf '  1) relay  - the server inside Iran, the one clients point their DNS at\n'
-    printf '  2) exit   - the server abroad, which reaches the blocked sites\n\n'
+    printf '  2) exit   - the server abroad, which reaches the blocked sites\n'
+    printf '  3) single - both on one server abroad, with no relay in Iran\n\n'
     while :; do
-        read -r -p "  choice [1/2]: " answer
+        read -r -p "  choice [1/2/3]: " answer
         case "$answer" in
-            1|relay) ROLE=relay; break ;;
-            2|exit)  ROLE=exit;  break ;;
-            *) warn "answer 1 or 2" ;;
+            1|relay)  ROLE=relay;  break ;;
+            2|exit)   ROLE=exit;   break ;;
+            3|single) ROLE=single; break ;;
+            *) warn "answer 1, 2 or 3" ;;
         esac
     done
 fi
-[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || die "ROLE must be relay or exit"
+[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || [ "$ROLE" = single ] \
+    || die "ROLE must be relay, exit or single"
+SINGLE=""
+if [ "$ROLE" = single ]; then
+    SINGLE=1
+    # Said once, plainly, because it is the whole trade: customers in Iran
+    # reach a server abroad directly, which is what gets filtered and slowed
+    # on the way, and what a relay in Iran exists to avoid.
+    warn "one server abroad, no relay: customers reach it directly from Iran."
+    warn "that works, but the direct path is the one that gets filtered and slowed."
+    warn "for real customers a relay in Iran is better - this is for trying it out,"
+    warn "or where the direct path to this server happens to be good."
+fi
 
-if [ -z "$PEER_IP" ]; then
+if [ -z "$PEER_IP" ] && [ "$ROLE" != single ]; then
     printf '\n'
     if [ "$ROLE" = relay ]; then
         read -r -p "  public address of the EXIT server abroad: " PEER_IP
@@ -896,7 +962,7 @@ if [ -z "$PEER_IP" ]; then
         read -r -p "  public address of the RELAY server in Iran: " PEER_IP
     fi
 fi
-valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
+[ "$ROLE" = single ] || valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
 
 if [ -z "$SELF_IP" ]; then
     guess="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
@@ -905,12 +971,28 @@ if [ -z "$SELF_IP" ]; then
     SELF_IP="${SELF_IP:-$guess}"
 fi
 valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
-[ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
+[ "$ROLE" = single ] || [ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
 
-if [ "$ROLE" = relay ]; then
+if [ "$ROLE" = single ]; then
+    RELAY_IP="$SELF_IP"; EXIT_IP="$SELF_IP"; PEER_IP="$SELF_IP"
+elif [ "$ROLE" = relay ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$PEER_IP"
 else
     RELAY_IP="$PEER_IP"; EXIT_IP="$SELF_IP"
+fi
+# Where dnsmasq and coturn listen. The public address, as it always was -
+# unless it is not on any interface here, as on a cloud machine behind NAT
+# (AWS and many others, where a single machine is likely to be): then they
+# listen on the private address the public one is mapped to, and coturn is
+# told the public one to hand out. DNS answers name the public address either
+# way; that is what customers connect to.
+LISTEN_IP="$RELAY_IP"; TURN_EXTERNAL="$RELAY_IP"
+if is_relay && ! ip -4 -o addr show 2>/dev/null | grep -qw "inet $RELAY_IP"; then
+    local_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+    if [ -n "$local_ip" ] && [ "$local_ip" != "$RELAY_IP" ]; then
+        LISTEN_IP="$local_ip"; TURN_EXTERNAL="$RELAY_IP/$local_ip"
+        info "$RELAY_IP is not on this machine - listening on $local_ip, which it is mapped to"
+    fi
 fi
 
 # ------------------------------------------------------------------ panel
@@ -934,7 +1016,10 @@ fi
 # take it and register their own address against the user's account.
 if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     printf '\n%sHTTPS%s (optional - press enter to skip)\n\n' "$B" "$N"
-    if [ "$ROLE" = relay ]; then
+    if [ "$ROLE" = single ]; then
+        printf '  A name pointing at this machine, for both panels and for DNS\n'
+        printf '  over HTTPS and TLS.\n'
+    elif [ "$ROLE" = relay ]; then
         printf '  A name pointing at this machine, for the page users open to\n'
         printf '  register their address.\n'
     else
@@ -979,6 +1064,8 @@ if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
         read -r -p "  pairing token: " SYNC_TOKEN
     fi
 fi
+# One machine has nothing to tunnel between.
+[ "$ROLE" = single ] && TUNNEL=off
 if [ -z "$TUNNEL" ]; then
     if [ "$ROLE" = exit ] && [ -n "$(env_get /etc/smart-dns/panel.env TUNNEL)" ]; then
         TUNNEL="$(env_get /etc/smart-dns/panel.env TUNNEL)"
@@ -1074,7 +1161,9 @@ remember installed-at "$(date -Is)"
 
 # ---------------------------------------------------------------- packages
 step "Installing packages"
-if [ "$ROLE" = relay ]; then
+if [ "$ROLE" = single ]; then
+    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl openssl"
+elif [ "$ROLE" = relay ]; then
     WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl"
 else
     # nftables for the rule that keeps strangers off the sync API.
@@ -1220,7 +1309,7 @@ info "stream module: $MOD"
 # that can be told to ask for AAAA records only, which nginx has from 1.23.1 -
 # older, or without IPv6, the block is left out and nothing changes.
 NO_GOOGLE_V6=1
-if [ "$ROLE" = exit ]; then
+if is_exit; then
     ngv="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
     if [ "$(printf '%s\n%s\n' 1.23.1 "${ngv:-0}" | sort -V | head -1)" = 1.23.1 ] \
        && curl -6 -s -o /dev/null -m 10 https://www.google.com/ 2>/dev/null; then
@@ -1248,10 +1337,11 @@ fi
 # it. On a first install the certificate comes later in this run, so this is
 # decided again once it is there - see relay_doh.
 doh_paths
+if [ -n "$DOH_ON" ]; then doh_includes; fi
 # The exit's public resolvers, as the admin panel last set them - so an
 # upgrade does not put the defaults back over the operator's choice.
 RESOLVERS=""
-if [ "$ROLE" = exit ] && [ -f /etc/smart-dns/upstream ]; then
+if is_exit && [ -f /etc/smart-dns/upstream ]; then
     RESOLVERS="$(head -n 1 /etc/smart-dns/upstream \
         | grep -Ex '([0-9]{1,3}\.){3}[0-9]{1,3}( ([0-9]{1,3}\.){3}[0-9]{1,3})?' || true)"
 fi
@@ -1264,7 +1354,7 @@ nginx -t || die "nginx rejected the config; the previous one is in $BACKUP_DIR"
 enable_service nginx nginx
 
 # ---------------------------------------------------------------- relay only
-if [ "$ROLE" = relay ]; then
+if is_relay; then
 
     step "dnsmasq: the routed domain list"
     note_file /etc/dnsmasq.d/smart-dns.conf
@@ -1276,7 +1366,7 @@ if [ "$ROLE" = relay ]; then
         # The upstream resolvers are in upstream.conf, below: the admin panel
         # changes them, and this file is rewritten on every upgrade.
         printf 'cache-size=10000\ndomain-needed\nbogus-priv\nno-hosts\n'
-        printf 'bind-interfaces\nlisten-address=127.0.0.1,%s\n\n' "$RELAY_IP"
+        printf 'bind-interfaces\nlisten-address=127.0.0.1,%s\n\n' "$LISTEN_IP"
         printf '# domains answered with this relay, so the traffic leaves via the exit\n'
         payload DOMAINS | while read -r d; do
             [ -n "$d" ] && printf 'address=/%s/%s\n' "$d" "$RELAY_IP"
@@ -1537,7 +1627,7 @@ fi
 relay_doh
 
 # ----------------------------------------------------------------- panel
-if [ "$ROLE" = exit ]; then
+if is_exit; then
     step "Panel: database and sync API"
     mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
 
@@ -1583,6 +1673,12 @@ EOF
                info "added $RELAY_IP to the relays this panel serves" ;;
         esac
     fi
+    # A single machine's sync API is for itself alone, on loopback: its 8443
+    # is the customer panel.
+    if [ "$ROLE" = single ]; then
+        set_env_key /etc/smart-dns/panel.env API_PORT "$SINGLE_API_PORT"
+        set_env_key /etc/smart-dns/panel.env API_BIND 127.0.0.1
+    fi
     # What a re-run or an upgrade keeps, unasked.
     set_env_key /etc/smart-dns/panel.env TUNNEL "$TUNNEL"
     set_env_key /etc/smart-dns/panel.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
@@ -1623,11 +1719,14 @@ EOF
     systemctl restart smartdns-panel.service
     sleep 2
     if systemctl is-active --quiet smartdns-panel.service; then
-        info "sync API is up on :8443"
+        if [ "$ROLE" = single ]; then info "sync API is up on 127.0.0.1:$SINGLE_API_PORT"
+        else info "sync API is up on :8443"; fi
     else
         warn "the panel did not start - journalctl -u smartdns-panel"
     fi
-    if nft list table inet smartdns_api >/dev/null 2>&1; then
+    if [ "$ROLE" = single ]; then
+        :       # on loopback, nothing to close
+    elif nft list table inet smartdns_api >/dev/null 2>&1; then
         info "port 8443 answers the relays only: $(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/panel.env | head -1)"
     else
         warn "port 8443 could not be closed to strangers - the panel still refuses them itself"
@@ -1695,6 +1794,8 @@ EOF
                 8445) die "port 8445 is the bot API" ;;
                 8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
                 18119) die "port 18119 is the exit's own route to Battle.net" ;;
+                "$SINGLE_API_PORT") if [ "$ROLE" = single ]; then die "port $SINGLE_API_PORT is this machine's own sync API"; fi ;;
+                853|3478) if [ "$ROLE" = single ]; then die "port $ADMIN_PORT is taken on a single machine - DoT and STUN"; fi ;;
                 1119) die "port 1119 carries Battle.net's launcher" ;;
                 4070) die "port 4070 carries Spotify's access point" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
@@ -1776,19 +1877,24 @@ EOF
           | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z')"
     # A third part when there is a tunnel, so the relay sets up the same one.
     SYNC_TOKEN_OUT="$SYNC_SECRET.$FP${TUNNEL_SPEC:+.$TUNNEL_SPEC}"
+    # A single machine pairs with itself, here and now; there is nobody to
+    # hand the token to.
+    if [ "$ROLE" = single ]; then
+        SYNC_TOKEN="$SYNC_TOKEN_OUT"; SYNC_TOKEN_OUT=""; PANEL_IP=127.0.0.1
+    fi
 fi
 
 # A relay that is already paired keeps its pairing. Requiring the token again
 # on every run meant an upgrade run without it skipped this whole section and
 # silently left the old agent in place - the machine kept syncing, so nothing
 # looked wrong, while the new code never arrived.
-if [ "$ROLE" = relay ] && [ -z "${SYNC_TOKEN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
+if is_relay && [ -z "${SYNC_TOKEN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
     SYNC_TOKEN="$(sed -n 's/^SYNC_SECRET=//p' /etc/smart-dns/sync.env | head -1 || true).$(sed -n 's/^SYNC_FINGERPRINT=//p' /etc/smart-dns/sync.env | head -1 || true)"
     PANEL_IP="${PANEL_IP:-$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env | head -1 || true)}"
     KEEP_PAIRING=1
 fi
 
-if [ "$ROLE" = relay ] && [ -n "${SYNC_TOKEN:-}" ]; then
+if is_relay && [ -n "${SYNC_TOKEN:-}" ]; then
     step "Panel: sync agent and claim page"
     # secret.fingerprint - one string for the user to copy, carrying both the
     # shared secret and the certificate to pin. Splitting them into two
@@ -1837,6 +1943,9 @@ EOF
         set_env_key /etc/smart-dns/sync.env SYNC_FINGERPRINT "$FINGER"
         set_env_key /etc/smart-dns/sync.env SELF_IP "$RELAY_IP"
         set_env_key /etc/smart-dns/sync.env PANEL_DOMAIN "${PANEL_DOMAIN:-}"
+    fi
+    if [ "$ROLE" = single ]; then
+        set_env_key /etc/smart-dns/sync.env PANEL_PORT "$SINGLE_API_PORT"
     fi
     set_env_key /etc/smart-dns/sync.env TUNNEL "$TUNNEL"
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
@@ -1916,7 +2025,7 @@ if [ "$ROLE" = exit ]; then apply_tunnel "${SYNC_SECRET:-}"; else apply_tunnel "
 step "Starting services"
 if [ "$NGINX_CHANGED" = 1 ]; then systemctl restart nginx
 else systemctl reload nginx 2>/dev/null || systemctl start nginx; fi
-if [ "$ROLE" = relay ]; then
+if is_relay; then
     if [ "$DNSMASQ_CHANGED" = 1 ]; then systemctl restart dnsmasq
     else systemctl start dnsmasq 2>/dev/null || true; fi
     /usr/local/bin/epic-pin || warn "epic-pin failed this run; the timer will retry"
@@ -1930,7 +2039,7 @@ check() {
     else printf '    %sx%s %s  (got: %s)\n' "$RD" "$N" "$1" "$2"; fail=1; fi
 }
 check "nginx running" "$(systemctl is-active nginx)" active
-if [ "$ROLE" = relay ]; then
+if is_relay; then
     check "dnsmasq running" "$(systemctl is-active dnsmasq)" active
     check "coturn running"  "$(systemctl is-active coturn)"  active
     check "a routed domain resolves to this relay" \
@@ -1956,15 +2065,17 @@ if [ "$ROLE" = relay ]; then
     check "an unrouted domain is not pointed at this relay" \
           "$(printf '%s\n' "$unrouted" | grep -c "^${RELAY_IP}$" || true)" "0"
     check "a site loads through the full chain" \
-          "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${RELAY_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || echo 000)" "200"
+          "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${LISTEN_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || echo 000)" "200"
     # The API the relay syncs with, reached the way smartdns-sync reaches it -
     # by address, with a name in the handshake - but with a GET, which the API
     # refuses as 501 without looking at any secret, so this proves the path
     # and leaves no "wrong secret" warning in the exit's log. A relay whose
     # sync could not get through used to pass every check here and then fail
     # in the customer's panel instead.
+    if [ "$ROLE" = single ]; then api_at="127.0.0.1"; api_port="$SINGLE_API_PORT"
+    else api_at="$EXIT_IP"; api_port=8443; fi
     check "the exit's sync API answers this relay" \
-          "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:8443:${EXIT_IP}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:8443/" 2>/dev/null || true)" "501"
+          "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:${api_port}:${api_at}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:${api_port}/" 2>/dev/null || true)" "501"
 fi
 if [ "$TUNNEL" = backpack ]; then
     check "the tunnel service is running" "$(systemctl is-active smartdns-tunnel.service)" active
@@ -1998,7 +2109,7 @@ else
     printf '%sSomething is off - see the failures above.%s\n' "$Y" "$N"
 fi
 
-if [ "$ROLE" = relay ]; then
+if is_relay; then
     printf '
     Point your devices at this address for DNS:
 
@@ -2044,7 +2155,7 @@ if [ -n "$USER_PANEL_OUT" ]; then
 ' "$B" "$N" "$USER_PANEL_OUT"
 fi
 
-if [ "$ROLE" = relay ] && [ -z "${PANEL_DOMAIN:-}" ]; then
+if is_relay && [ -z "${PANEL_DOMAIN:-}" ]; then
     printf '    %sThere is no customer panel on this relay%s, because it has no
     certificate. That page asks for a password, and nothing asks for a
     password over plain http here - so it is not served at all rather than

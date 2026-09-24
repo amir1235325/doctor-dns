@@ -36,16 +36,9 @@ case "$n" in ''|*[!0-9]*) echo "-n wants a number of lines" >&2; exit 1 ;; esac
 # Which side this is decides which parts it has. The timers are listed for
 # their status - a oneshot service reads "inactive" between runs, which looks
 # like a fault and is not - and the services for their logs.
-if [ -f "$ETC/sync.env" ]; then
-    role=relay
-    status="smartdns-sync dnsmasq nginx coturn epic-pin.timer smartdns-acl-save.timer"
-    logs="smartdns-sync dnsmasq nginx coturn epic-pin smartdns-acl-save"
-    for f in /etc/smartdns-profiles/*.conf; do
-        [ -e "$f" ] || continue
-        status="$status smartdns-dns@$(basename "$f" .conf)"
-        logs="$logs smartdns-dns@$(basename "$f" .conf)"
-    done
-elif [ -f "$ETC/panel.env" ]; then
+# A single machine has both, and so both lists, with nginx once.
+status=""; logs=""; role=""
+if [ -f "$ETC/panel.env" ]; then
     role=exit
     status="smartdns-panel smartdns-admin nginx smartdns-cert.timer"
     logs="smartdns-panel smartdns-admin nginx smartdns-cert"
@@ -54,7 +47,19 @@ elif [ -f "$ETC/panel.env" ]; then
         status="$status smartdns-operators.timer"
         logs="$logs smartdns-operators"
     fi
-else
+fi
+if [ -f "$ETC/sync.env" ]; then
+    if [ "$role" = exit ]; then role=single; ng=""; else role=relay; ng=" nginx"; fi
+    status="$status smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin.timer smartdns-acl-save.timer"
+    logs="$logs smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin smartdns-acl-save"
+    for f in /etc/smartdns-profiles/*.conf; do
+        [ -e "$f" ] || continue
+        status="$status smartdns-dns@$(basename "$f" .conf)"
+        logs="$logs smartdns-dns@$(basename "$f" .conf)"
+    done
+fi
+status="${status# }"; logs="${logs# }"
+if [ -z "$role" ]; then
     echo "doctor dns is not installed on this machine" >&2
     exit 1
 fi
@@ -108,7 +113,7 @@ if [ -n "$report" ]; then
         echo "== disk and memory"
         df -h / 2>/dev/null | tail -1
         free -m 2>/dev/null | sed -n '1,2p'
-        if [ "$role" = relay ]; then
+        if [ "$role" != exit ]; then
             echo
             echo "== routing"
             smartdns-rules 2>&1
