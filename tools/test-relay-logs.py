@@ -104,6 +104,13 @@ check("the tunnel's lines go apart from the rest", "tunnel_logs" in sent[0]
       and "smartdns-tunnel" not in sync.LOG_UNITS and "smartdns-tunnel" in asked[-1],
       str(asked[-1]))
 
+check("the DoH server and the certificate's renewal go with the rest",
+      "smartdns-doh" in sync.LOG_UNITS and "smartdns-cert" in sync.LOG_UNITS)
+lsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "templates",
+                         "smartdns-logs"), encoding="utf-8").read()
+check("and smartdns-logs on a relay shows the renewal too",
+      'if [ "$role" = relay ] && [ -f /etc/systemd/system/smartdns-cert.timer ]; then' in lsrc)
+
 print("the relay: smartdns-watch on the panel's request")
 ran = []
 

@@ -963,8 +963,8 @@ def close_relay_when_ready(allowed_count):
 LOG_EVERY = 300
 LOG_LINES = 150
 LOG_MAX = 40000
-LOG_UNITS = ("smartdns-sync", "dnsmasq", "nginx", "coturn", "epic-pin",
-             "smartdns-acl-save", "smartdns-dns@*")
+LOG_UNITS = ("smartdns-sync", "smartdns-doh", "dnsmasq", "nginx", "coturn", "epic-pin",
+             "smartdns-acl-save", "smartdns-cert", "smartdns-dns@*")
 # The tunnel's own lines go separately: the operator looking for why the link
 # to the exit dropped should not have to find them among DNS and nginx.
 TUNNEL_UNIT = "smartdns-tunnel"

@@ -1849,7 +1849,8 @@ def watch_card(pre):
            "انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار "
            "نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت "
            "(اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه "
-           "کنید)، «filtered» یعنی فیلتر خود ایران است.</p>"
+           "کنید)، «filtered» یعنی فیلتر خود ایران است. کوئری‌های DoH و DoT هم دیده می‌شوند، با علامت "
+           "(DOH) یا (DOT) جلویشان.</p>"
            "<form method='post' action='/%s/watch-start' class='row'>"
            "<input name='target' dir='ltr' placeholder='نام کاربری یا آی‌پی (خالی = همه)'"
            " maxlength='40' style='min-width:220px'>"
@@ -3954,7 +3955,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
         for r in rows:
             out.append("<div class='card'><h2>سرور ایران <code>%s</code></h2>"
                        "<p class='muted'>آخرین بار %s — هر ۵ دقیقه تازه می‌شود. DNS، "
-                       "همگام‌سازی، پنل مشتری، nginx، STUN و تونل. روی خود سرور: "
+                       "DNS امن (DoH و DoT)، همگام‌سازی، پنل مشتری، nginx، STUN، تمدید "
+                       "گواهی و تونل. روی خود سرور: "
                        "<code>sudo smartdns-logs</code></p>%s</div>"
                        % (html.escape(r["relay"]), html.escape(ago(r["at"])),
                           pre(r["text"] or "(چیزی نیست)")))

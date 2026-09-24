@@ -9,6 +9,9 @@ usage: smartdns-watch               everybody, each line naming who asked
                                     line each - how smartdns-sync keeps a
                                     customer's report for support
 
+DoH and DoT are shown too, marked so: the relay's DoH server hands over each
+encrypted question and its answer while a watch is running.
+
 For finding what a service needs routed: have the customer open it until it
 fails, and watch. "via relay" is already routed. "direct" went around the
 relay - if the service refuses Iran, those are the names to add, with
@@ -34,6 +37,10 @@ SYNC_ENV = "/etc/smart-dns/sync.env"
 USER_NAMES = "/var/lib/smart-dns/users.json"
 ACL = "/usr/local/bin/smartdns-acl"
 ETH_P_IP = 0x0800
+# Where the DoH server leaves encrypted questions for us while we ask for
+# them - see WATCH_DIR in smartdns-doh.
+WATCH_DIR = "/run/smartdns-watch"
+WATCH_LOG = WATCH_DIR + "/encrypted.log"
 SO_ATTACH_FILTER = 26
 # The address Iran's filtering hands out for a name it blocks.
 FILTERED = "10.10.34."
@@ -203,7 +210,23 @@ class Watcher:
                 del self.pending[key]
                 self.report(key[0], name, "no answer")
 
-    def report(self, client, name, verdict):
+    def encrypted(self, event, users):
+        """One DoH or DoT answer the DoH server passed on. DoT names its
+        customer by address; DoH by account, which is found by its label."""
+        kind, key = event.get("kind"), str(event.get("key") or "")
+        name, verdict = str(event.get("name") or ""), str(event.get("v") or "")
+        if not name or kind not in ("doh", "dot"):
+            return
+        if kind == "dot":
+            ips = [key]
+        else:
+            ips = sorted(ip for ip, u in users.items() if u.get("label") == "u" + key)
+        client = next((ip for ip in ips if self.targets is None or ip in self.targets), None)
+        if client is None and (self.targets is not None or ips):
+            return
+        self.report(client or "u" + key, name, verdict, via=kind.upper())
+
+    def report(self, client, name, verdict, via=""):
         if self.as_json:
             # Every answer, not only the changes: the one keeping the report
             # counts them, and a name asked again is news to it.
@@ -211,14 +234,15 @@ class Watcher:
                                  "name": name, "v": verdict}))
             return
         kind = "direct" if verdict.startswith("direct") else verdict
-        if self.shown.get((client, name)) == kind:
+        if self.shown.get((client, name, via)) == kind:
             return
-        self.shown[(client, name)] = kind
+        self.shown[(client, name, via)] = kind
         self.counts[kind.split(" (")[0]] += 1
         stamp = time.strftime("%H:%M:%S", time.localtime(self.clock()))
         who = "" if self.targets and len(self.targets) == 1 else \
             "%-14s " % self.who.get(client, client)[:14]
-        self.out("%s  %s%-44s %s" % (stamp, who, name, verdict))
+        self.out("%s  %s%-44s %s%s" % (stamp, who, name, verdict,
+                                          "   (%s)" % via if via else ""))
 
     def summary(self):
         total = sum(self.counts.values())
@@ -376,6 +400,9 @@ def main(argv):
     signal.signal(signal.SIGTERM, stop)
 
     w = Watcher(local_addresses(), who, targets, as_json=as_json)
+    # The encrypted questions: not for --json, whose DoH and DoT part the
+    # DoH server keeps for the report itself.
+    feed = None if as_json else EncryptedFeed()
     sock.settimeout(0.5)
     try:
         while True:
@@ -384,10 +411,71 @@ def main(argv):
             except socket.timeout:
                 pass
             w.tick()
+            if feed:
+                for event in feed.read():
+                    w.encrypted(event, users)
     except KeyboardInterrupt:
         if not as_json:
             print("\n" + w.summary())
+    finally:
+        if feed:
+            feed.close()
     return 0
+
+
+class EncryptedFeed:
+    """Asks the DoH server for what it answers, and reads it as it comes."""
+
+    def __init__(self, directory=WATCH_DIR, clock=time.time):
+        self.directory, self.clock = directory, clock
+        self.log = os.path.join(directory, os.path.basename(WATCH_LOG))
+        self.want = os.path.join(directory, "%d.want" % os.getpid())
+        self.touched = 0.0
+        try:
+            os.makedirs(directory, exist_ok=True)
+            self.offset = os.path.getsize(self.log)
+        except OSError:
+            self.offset = 0
+        self.touch()
+
+    def touch(self):
+        try:
+            with open(self.want, "w"):
+                pass
+            self.touched = self.clock()
+        except OSError:
+            pass
+
+    def read(self):
+        if self.clock() - self.touched >= 5:
+            self.touch()
+        try:
+            size = os.path.getsize(self.log)
+        except OSError:
+            return []
+        if size < self.offset:
+            self.offset = 0         # emptied while nobody was watching
+        if size == self.offset:
+            return []
+        with open(self.log, "rb") as fh:
+            fh.seek(self.offset)
+            chunk = fh.read()
+        # Only whole lines; a half-written one is read next time.
+        whole = chunk[:chunk.rfind(b"\n") + 1]
+        self.offset += len(whole)
+        out = []
+        for line in whole.decode("utf-8", "replace").splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
+    def close(self):
+        try:
+            os.unlink(self.want)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

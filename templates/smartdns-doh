@@ -56,6 +56,13 @@ LOOPBACK = {"127.0.0.1", "::1", ""}
 # flush, so the two never need a lock between them. In /run, which is memory.
 STATS_DIR = "/run/smartdns-doh-stats"
 STATS_EVERY = 15
+# smartdns-watch, while it runs, leaves a file here and keeps it fresh; while
+# one is, every encrypted question and where its answer sent the customer
+# goes into WATCH_LOG for it to read, so it sees DoH and DoT as it sees plain
+# DNS. Nobody watching, nothing written; a watcher that died goes stale.
+WATCH_DIR = "/run/smartdns-watch"
+WATCH_LOG = WATCH_DIR + "/encrypted.log"
+WATCH_FRESH = 15
 # Queries a second each customer may make, and how many at once on top.
 # A phone opening an app asks for twenty names in a burst and then nothing;
 # this only ever stops something that keeps going.
@@ -289,6 +296,57 @@ def verdict(reply, relay):
     return ("direct " + addrs[0]) if addrs else "no address"
 
 
+class WatchFeed:
+    def __init__(self, directory=None):
+        self.directory = directory
+        self.lock = threading.Lock()
+        self.checked = 0.0
+        self.on = False
+
+    def paths(self):
+        d = self.directory or WATCH_DIR
+        return d, os.path.join(d, os.path.basename(WATCH_LOG))
+
+    def active(self):
+        """Whether some smartdns-watch is running - looked at once a second,
+        not once a query. When the last one goes, its log is emptied."""
+        now = time.time()
+        if now - self.checked < 1:
+            return self.on
+        self.checked = now
+        d, log_path = self.paths()
+        try:
+            on = any(n.endswith(".want") and os.stat(os.path.join(d, n)).st_mtime > now - WATCH_FRESH
+                     for n in os.listdir(d))
+        except OSError:
+            on = False
+        if self.on and not on:
+            try:
+                open(log_path, "w").close()
+            except OSError:
+                pass
+        self.on = on
+        return on
+
+    def note(self, kind, key, query, reply, state):
+        if not self.active():
+            return
+        q = question(query)
+        if not q or q[1] != 1 or not q[0]:
+            return          # A only, as smartdns-watch shows plain DNS
+        line = json.dumps({"t": int(time.time()), "kind": kind, "key": str(key),
+                           "name": q[0], "v": verdict(reply, state.self_ips())})
+        with self.lock:
+            try:
+                with open(self.paths()[1], "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+
+
+WATCH = WatchFeed()
+
+
 def keep_for_report(key, query, reply, state):
     q = question(query)
     if q and q[1] == 1 and q[0]:      # A only, as smartdns-watch shows
@@ -461,6 +519,8 @@ class DoH(http.server.BaseHTTPRequestHandler):
             reply = servfail(query)
         if uid != "0" and state.logging("doh", uid):
             keep_for_report("doh:" + uid, query, reply, state)
+        if uid != "0":
+            WATCH.note("doh", uid, query, reply, state)
         self.send_response(200)
         self.send_header("Content-Type", "application/dns-message")
         self.send_header("Content-Length", str(len(reply)))
@@ -521,6 +581,7 @@ class DoT(socketserver.BaseRequestHandler):
                         reply = servfail(query)
                     if state.logging("dot", ip):
                         keep_for_report("dot:" + ip, query, reply, state)
+                    WATCH.note("dot", ip, query, reply, state)
                 else:
                     reply = refused(query)
                 sock.sendall(struct.pack("!H", len(reply)) + reply)

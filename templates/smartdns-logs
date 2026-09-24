@@ -52,6 +52,12 @@ if [ -f "$ETC/sync.env" ]; then
     if [ "$role" = exit ]; then role=single; ng=""; else role=relay; ng=" nginx"; fi
     status="$status smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin.timer smartdns-acl-save.timer"
     logs="$logs smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin smartdns-acl-save"
+    # A relay renews its own certificate - the customer panel's and DoH's.
+    # A single machine has it already, from the exit's list.
+    if [ "$role" = relay ] && [ -f /etc/systemd/system/smartdns-cert.timer ]; then
+        status="$status smartdns-cert.timer"
+        logs="$logs smartdns-cert"
+    fi
     for f in /etc/smartdns-profiles/*.conf; do
         [ -e "$f" ] || continue
         status="$status smartdns-dns@$(basename "$f" .conf)"

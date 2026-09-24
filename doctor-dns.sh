@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.0"
+VERSION="0.8.1"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -9681,8 +9681,8 @@ exit 0
 #LOG_EVERY = 300
 #LOG_LINES = 150
 #LOG_MAX = 40000
-#LOG_UNITS = ("smartdns-sync", "dnsmasq", "nginx", "coturn", "epic-pin",
-#             "smartdns-acl-save", "smartdns-dns@*")
+#LOG_UNITS = ("smartdns-sync", "smartdns-doh", "dnsmasq", "nginx", "coturn", "epic-pin",
+#             "smartdns-acl-save", "smartdns-cert", "smartdns-dns@*")
 ## The tunnel's own lines go separately: the operator looking for why the link
 ## to the exit dropped should not have to find them among DNS and nginx.
 #TUNNEL_UNIT = "smartdns-tunnel"
@@ -12661,6 +12661,13 @@ exit 0
 ## flush, so the two never need a lock between them. In /run, which is memory.
 #STATS_DIR = "/run/smartdns-doh-stats"
 #STATS_EVERY = 15
+## smartdns-watch, while it runs, leaves a file here and keeps it fresh; while
+## one is, every encrypted question and where its answer sent the customer
+## goes into WATCH_LOG for it to read, so it sees DoH and DoT as it sees plain
+## DNS. Nobody watching, nothing written; a watcher that died goes stale.
+#WATCH_DIR = "/run/smartdns-watch"
+#WATCH_LOG = WATCH_DIR + "/encrypted.log"
+#WATCH_FRESH = 15
 ## Queries a second each customer may make, and how many at once on top.
 ## A phone opening an app asks for twenty names in a burst and then nothing;
 ## this only ever stops something that keeps going.
@@ -12894,6 +12901,57 @@ exit 0
 #    return ("direct " + addrs[0]) if addrs else "no address"
 #
 #
+#class WatchFeed:
+#    def __init__(self, directory=None):
+#        self.directory = directory
+#        self.lock = threading.Lock()
+#        self.checked = 0.0
+#        self.on = False
+#
+#    def paths(self):
+#        d = self.directory or WATCH_DIR
+#        return d, os.path.join(d, os.path.basename(WATCH_LOG))
+#
+#    def active(self):
+#        """Whether some smartdns-watch is running - looked at once a second,
+#        not once a query. When the last one goes, its log is emptied."""
+#        now = time.time()
+#        if now - self.checked < 1:
+#            return self.on
+#        self.checked = now
+#        d, log_path = self.paths()
+#        try:
+#            on = any(n.endswith(".want") and os.stat(os.path.join(d, n)).st_mtime > now - WATCH_FRESH
+#                     for n in os.listdir(d))
+#        except OSError:
+#            on = False
+#        if self.on and not on:
+#            try:
+#                open(log_path, "w").close()
+#            except OSError:
+#                pass
+#        self.on = on
+#        return on
+#
+#    def note(self, kind, key, query, reply, state):
+#        if not self.active():
+#            return
+#        q = question(query)
+#        if not q or q[1] != 1 or not q[0]:
+#            return          # A only, as smartdns-watch shows plain DNS
+#        line = json.dumps({"t": int(time.time()), "kind": kind, "key": str(key),
+#                           "name": q[0], "v": verdict(reply, state.self_ips())})
+#        with self.lock:
+#            try:
+#                with open(self.paths()[1], "a", encoding="utf-8") as fh:
+#                    fh.write(line + "\n")
+#            except OSError:
+#                pass
+#
+#
+#WATCH = WatchFeed()
+#
+#
 #def keep_for_report(key, query, reply, state):
 #    q = question(query)
 #    if q and q[1] == 1 and q[0]:      # A only, as smartdns-watch shows
@@ -13066,6 +13124,8 @@ exit 0
 #            reply = servfail(query)
 #        if uid != "0" and state.logging("doh", uid):
 #            keep_for_report("doh:" + uid, query, reply, state)
+#        if uid != "0":
+#            WATCH.note("doh", uid, query, reply, state)
 #        self.send_response(200)
 #        self.send_header("Content-Type", "application/dns-message")
 #        self.send_header("Content-Length", str(len(reply)))
@@ -13126,6 +13186,7 @@ exit 0
 #                        reply = servfail(query)
 #                    if state.logging("dot", ip):
 #                        keep_for_report("dot:" + ip, query, reply, state)
+#                    WATCH.note("dot", ip, query, reply, state)
 #                else:
 #                    reply = refused(query)
 #                sock.sendall(struct.pack("!H", len(reply)) + reply)
@@ -15229,7 +15290,8 @@ exit 0
 #           "انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار "
 #           "نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت "
 #           "(اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه "
-#           "کنید)، «filtered» یعنی فیلتر خود ایران است.</p>"
+#           "کنید)، «filtered» یعنی فیلتر خود ایران است. کوئری‌های DoH و DoT هم دیده می‌شوند، با علامت "
+#           "(DOH) یا (DOT) جلویشان.</p>"
 #           "<form method='post' action='/%s/watch-start' class='row'>"
 #           "<input name='target' dir='ltr' placeholder='نام کاربری یا آی‌پی (خالی = همه)'"
 #           " maxlength='40' style='min-width:220px'>"
@@ -17334,7 +17396,8 @@ exit 0
 #        for r in rows:
 #            out.append("<div class='card'><h2>سرور ایران <code>%s</code></h2>"
 #                       "<p class='muted'>آخرین بار %s — هر ۵ دقیقه تازه می‌شود. DNS، "
-#                       "همگام‌سازی، پنل مشتری، nginx، STUN و تونل. روی خود سرور: "
+#                       "DNS امن (DoH و DoT)، همگام‌سازی، پنل مشتری، nginx، STUN، تمدید "
+#                       "گواهی و تونل. روی خود سرور: "
 #                       "<code>sudo smartdns-logs</code></p>%s</div>"
 #                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
 #                          pre(r["text"] or "(چیزی نیست)")))
@@ -18743,6 +18806,12 @@ exit 0
 #    if [ "$role" = exit ]; then role=single; ng=""; else role=relay; ng=" nginx"; fi
 #    status="$status smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin.timer smartdns-acl-save.timer"
 #    logs="$logs smartdns-sync smartdns-doh dnsmasq$ng coturn epic-pin smartdns-acl-save"
+#    # A relay renews its own certificate - the customer panel's and DoH's.
+#    # A single machine has it already, from the exit's list.
+#    if [ "$role" = relay ] && [ -f /etc/systemd/system/smartdns-cert.timer ]; then
+#        status="$status smartdns-cert.timer"
+#        logs="$logs smartdns-cert"
+#    fi
 #    for f in /etc/smartdns-profiles/*.conf; do
 #        [ -e "$f" ] || continue
 #        status="$status smartdns-dns@$(basename "$f" .conf)"
@@ -19443,6 +19512,9 @@ exit 0
 #                                    line each - how smartdns-sync keeps a
 #                                    customer's report for support
 #
+#DoH and DoT are shown too, marked so: the relay's DoH server hands over each
+#encrypted question and its answer while a watch is running.
+#
 #For finding what a service needs routed: have the customer open it until it
 #fails, and watch. "via relay" is already routed. "direct" went around the
 #relay - if the service refuses Iran, those are the names to add, with
@@ -19468,6 +19540,10 @@ exit 0
 #USER_NAMES = "/var/lib/smart-dns/users.json"
 #ACL = "/usr/local/bin/smartdns-acl"
 #ETH_P_IP = 0x0800
+## Where the DoH server leaves encrypted questions for us while we ask for
+## them - see WATCH_DIR in smartdns-doh.
+#WATCH_DIR = "/run/smartdns-watch"
+#WATCH_LOG = WATCH_DIR + "/encrypted.log"
 #SO_ATTACH_FILTER = 26
 ## The address Iran's filtering hands out for a name it blocks.
 #FILTERED = "10.10.34."
@@ -19637,7 +19713,23 @@ exit 0
 #                del self.pending[key]
 #                self.report(key[0], name, "no answer")
 #
-#    def report(self, client, name, verdict):
+#    def encrypted(self, event, users):
+#        """One DoH or DoT answer the DoH server passed on. DoT names its
+#        customer by address; DoH by account, which is found by its label."""
+#        kind, key = event.get("kind"), str(event.get("key") or "")
+#        name, verdict = str(event.get("name") or ""), str(event.get("v") or "")
+#        if not name or kind not in ("doh", "dot"):
+#            return
+#        if kind == "dot":
+#            ips = [key]
+#        else:
+#            ips = sorted(ip for ip, u in users.items() if u.get("label") == "u" + key)
+#        client = next((ip for ip in ips if self.targets is None or ip in self.targets), None)
+#        if client is None and (self.targets is not None or ips):
+#            return
+#        self.report(client or "u" + key, name, verdict, via=kind.upper())
+#
+#    def report(self, client, name, verdict, via=""):
 #        if self.as_json:
 #            # Every answer, not only the changes: the one keeping the report
 #            # counts them, and a name asked again is news to it.
@@ -19645,14 +19737,15 @@ exit 0
 #                                 "name": name, "v": verdict}))
 #            return
 #        kind = "direct" if verdict.startswith("direct") else verdict
-#        if self.shown.get((client, name)) == kind:
+#        if self.shown.get((client, name, via)) == kind:
 #            return
-#        self.shown[(client, name)] = kind
+#        self.shown[(client, name, via)] = kind
 #        self.counts[kind.split(" (")[0]] += 1
 #        stamp = time.strftime("%H:%M:%S", time.localtime(self.clock()))
 #        who = "" if self.targets and len(self.targets) == 1 else \
 #            "%-14s " % self.who.get(client, client)[:14]
-#        self.out("%s  %s%-44s %s" % (stamp, who, name, verdict))
+#        self.out("%s  %s%-44s %s%s" % (stamp, who, name, verdict,
+#                                          "   (%s)" % via if via else ""))
 #
 #    def summary(self):
 #        total = sum(self.counts.values())
@@ -19810,6 +19903,9 @@ exit 0
 #    signal.signal(signal.SIGTERM, stop)
 #
 #    w = Watcher(local_addresses(), who, targets, as_json=as_json)
+#    # The encrypted questions: not for --json, whose DoH and DoT part the
+#    # DoH server keeps for the report itself.
+#    feed = None if as_json else EncryptedFeed()
 #    sock.settimeout(0.5)
 #    try:
 #        while True:
@@ -19818,10 +19914,71 @@ exit 0
 #            except socket.timeout:
 #                pass
 #            w.tick()
+#            if feed:
+#                for event in feed.read():
+#                    w.encrypted(event, users)
 #    except KeyboardInterrupt:
 #        if not as_json:
 #            print("\n" + w.summary())
+#    finally:
+#        if feed:
+#            feed.close()
 #    return 0
+#
+#
+#class EncryptedFeed:
+#    """Asks the DoH server for what it answers, and reads it as it comes."""
+#
+#    def __init__(self, directory=WATCH_DIR, clock=time.time):
+#        self.directory, self.clock = directory, clock
+#        self.log = os.path.join(directory, os.path.basename(WATCH_LOG))
+#        self.want = os.path.join(directory, "%d.want" % os.getpid())
+#        self.touched = 0.0
+#        try:
+#            os.makedirs(directory, exist_ok=True)
+#            self.offset = os.path.getsize(self.log)
+#        except OSError:
+#            self.offset = 0
+#        self.touch()
+#
+#    def touch(self):
+#        try:
+#            with open(self.want, "w"):
+#                pass
+#            self.touched = self.clock()
+#        except OSError:
+#            pass
+#
+#    def read(self):
+#        if self.clock() - self.touched >= 5:
+#            self.touch()
+#        try:
+#            size = os.path.getsize(self.log)
+#        except OSError:
+#            return []
+#        if size < self.offset:
+#            self.offset = 0         # emptied while nobody was watching
+#        if size == self.offset:
+#            return []
+#        with open(self.log, "rb") as fh:
+#            fh.seek(self.offset)
+#            chunk = fh.read()
+#        # Only whole lines; a half-written one is read next time.
+#        whole = chunk[:chunk.rfind(b"\n") + 1]
+#        self.offset += len(whole)
+#        out = []
+#        for line in whole.decode("utf-8", "replace").splitlines():
+#            try:
+#                out.append(json.loads(line))
+#            except ValueError:
+#                pass
+#        return out
+#
+#    def close(self):
+#        try:
+#            os.unlink(self.want)
+#        except OSError:
+#            pass
 #
 #
 #if __name__ == "__main__":

@@ -247,6 +247,78 @@ check("and it goes out with the allowlist", '"user": v.get("user", "")' in psrc)
 store.db.close()
 shutil.rmtree(tmp, ignore_errors=True)
 
+print("DoH and DoT, from the DoH server")
+import json
+import threading
+import time
+doh = load("doh", "smartdns-doh")
+feed_dir = tempfile.mkdtemp()
+server = doh.WatchFeed(feed_dir)
+
+
+class State:
+    def self_ips(self):
+        return {RELAY}
+
+
+def reply_for(query, addr):
+    """An answer to `query` with one A record, the way the resolver sends it."""
+    head = query[:2] + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0)
+    record = struct.pack("!HHHIH", 0xC00C, 1, 1, 60, 4) + socket.inet_aton(addr)
+    return head + query[12:] + record
+
+
+q = question(7, "chat.openai.com")
+server.note("doh", "12", q, reply_for(q, RELAY), State())
+check("with nobody watching, the DoH server writes nothing",
+      not os.path.exists(os.path.join(feed_dir, "encrypted.log")))
+feed = watch.EncryptedFeed(feed_dir)
+check("a watch asks for them, with a file of its own", os.listdir(feed_dir) == ["%d.want" % os.getpid()])
+server.checked = 0
+server.note("doh", "12", q, reply_for(q, RELAY), State())
+q2 = question(8, "steamcommunity.com")
+server.note("dot", OTHER, q2, reply_for(q2, "23.1.2.3"), State())
+got = feed.read()
+check("and then each encrypted answer comes through, with where it sent them",
+      [(e["kind"], e["key"], e["name"], e["v"]) for e in got]
+      == [("doh", "12", "chat.openai.com", "via relay"),
+          ("dot", OTHER, "steamcommunity.com", "direct 23.1.2.3")], repr(got))
+check("each once", feed.read() == [])
+lines3 = []
+w3 = watch.Watcher({RELAY}, {CUSTOMER: "ali", OTHER: "sara"}, None, out=lines3.append)
+users = {CUSTOMER: {"label": "u12", "user": "ali"}, OTHER: {"label": "u13", "user": "sara"}}
+for e in got:
+    w3.encrypted(e, users)
+check("the watcher shows them as it shows plain DNS, marked DoH or DoT",
+      len(lines3) == 2 and "ali" in lines3[0] and "chat.openai.com" in lines3[0]
+      and "via relay" in lines3[0] and "(DOH)" in lines3[0]
+      and "sara" in lines3[1] and "(DOT)" in lines3[1], repr(lines3))
+lines4 = []
+w4 = watch.Watcher({RELAY}, {CUSTOMER: "ali"}, {CUSTOMER}, out=lines4.append)
+for e in got:
+    w4.encrypted(e, users)
+check("watching one customer shows only theirs - DoH found by the account's label",
+      len(lines4) == 1 and "chat.openai.com" in lines4[0], repr(lines4))
+feed.close()
+check("stopping takes the request away", os.listdir(feed_dir) == ["encrypted.log"])
+server.checked = 0
+server.active()
+check("and the DoH server empties its log once nobody is watching",
+      os.path.getsize(os.path.join(feed_dir, "encrypted.log")) == 0)
+old = os.path.join(feed_dir, "999.want")
+open(old, "w").close()
+os.utime(old, (time.time() - 60, time.time() - 60))
+server.checked = 0
+check("a watcher that died without saying goes stale", server.active() is False)
+dsrc = open(os.path.join(HERE, "..", "templates", "smartdns-doh"), encoding="utf-8").read()
+check("the DoH server passes on both kinds",
+      'WATCH.note("doh", uid, query, reply, state)' in dsrc
+      and 'WATCH.note("dot", ip, query, reply, state)' in dsrc)
+wsrc = open(os.path.join(HERE, "..", "templates", "smartdns-watch"), encoding="utf-8").read()
+check("and --json, which keeps the support report, does not ask - the DoH server keeps that itself",
+      "feed = None if as_json else EncryptedFeed()" in wsrc)
+shutil.rmtree(feed_dir, ignore_errors=True)
+
 print("the command itself")
 out = []
 watch.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
