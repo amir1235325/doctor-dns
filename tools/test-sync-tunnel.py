@@ -59,8 +59,7 @@ ports = [l for l in logic.splitlines() if "ports = [" in l]
 check("both tunnel shapes carry it to the exit's 8443",
       len(ports) == 2 and all('=8443' in l for l in ports), str(ports))
 check("and nobody can pick it as the tunnel's own port",
-      '"$TUNNEL_LOCAL_API") echo "the tunnel' in logic
-      or '|"$TUNNEL_LOCAL_API")' in logic)
+      any('"$TUNNEL_LOCAL_API"' in l and 'echo "the tunnel' in l for l in logic.splitlines()))
 
 print("which way the relay goes")
 sync.CFG = {"PANEL_HOST": "198.51.100.7", "SYNC_SECRET": "s", "SELF_IP": "203.0.113.4",

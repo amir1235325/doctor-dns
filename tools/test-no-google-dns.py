@@ -49,15 +49,14 @@ bypass = text("common/bypass.conf")
 rules = re.findall(r"^server=/([^/]+)/(\S+)$", bypass, re.M)
 check("none of them is asked of Google", not any(GOOGLE.search(r) for _, r in rules),
       str([n for n, r in rules if GOOGLE.search(r)]))
-per_name = {}
-for name, resolver in rules:
-    per_name.setdefault(name, set()).add(resolver)
-check("each still has two resolvers",
-      all(v == {"1.1.1.1", "9.9.9.9"} for v in per_name.values()),
-      str({n: sorted(v) for n, v in per_name.items() if v != {"1.1.1.1", "9.9.9.9"}}))
+# "#" is dnsmasq's "the usual resolvers": upstream.conf, which the admin
+# panel picks (test-upstream.py) and which defaults to the two above.
+check("each asks the usual resolvers",
+      rules and all(r == "#" for _, r in rules),
+      str([n for n, r in rules if r != "#"]))
 cli = text("templates/smartdns")
 check("and smartdns bypass adds new ones the same way",
-      "server=/%s/1.1.1.1" in cli and "server=/%s/9.9.9.9" in cli
+      "server=/%s/#" in cli
       and not GOOGLE.search(cli[cli.index("  bypass)"):cli.index("  unbypass)")]))
 
 print("the exception")

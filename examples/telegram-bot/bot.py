@@ -75,8 +75,9 @@ B_IP = "🌐 ثبت آی‌پی"
 B_SUPPORT = "🎫 پشتیبانی"
 B_HELP = "❓ راهنما"
 B_WEB = "🔑 پنل وب"
+B_DOH = "🔒 DNS امن"
 B_CANCEL = "انصراف"
-MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_SUPPORT], [B_WEB, B_HELP]],
+MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_DOH], [B_SUPPORT, B_WEB], [B_HELP]],
         "resize_keyboard": True}
 CANCEL = {"keyboard": [[B_CANCEL]], "resize_keyboard": True}
 STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال ✅",
@@ -253,7 +254,9 @@ class Bot:
             return self.got_name(chat, sender, text)
         if waiting == "onb_user":
             return self.got_username(chat, sender, text, extra)
-        if text in (B_ACCOUNT, B_BUY, B_IP, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
+        if text == "/doh":
+            text = B_DOH
+        if text in (B_ACCOUNT, B_BUY, B_IP, B_DOH, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
             return
         if waiting == "ip":
             return self.got_ip(chat, sender, text)
@@ -278,6 +281,8 @@ class Bot:
             return self.ip_help(chat, sender)
         if text == B_WEB:
             return self.show_web(chat, sender)
+        if text == B_DOH:
+            return self.show_doh(chat, sender)
         if text == B_SUPPORT:
             return self.show_tickets(chat, sender)
         if text == B_HELP:
@@ -367,11 +372,38 @@ class Bot:
                  {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
                                        {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 
+    def show_doh(self, chat, sender):
+        """The customer's personal encrypted-DNS addresses. The panel sends
+        them only once a relay has DoH on; the iPhone profile is on the web
+        page, which is what the login button is for."""
+        u = self.account(sender)
+        doh = u.get("doh")
+        if not doh:
+            return self.say(chat, "🔒 DNS امن هنوز روی این سرویس فعال نیست. از DNS معمولی "
+                            "(«حساب من») استفاده کنید.", MENU)
+        lines = ["🔒 DNS امن (رمزگذاری‌شده)",
+                 "برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند. مثل DNS معمولی "
+                 "فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید.",
+                 "",
+                 "📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان:",
+                 doh["dot_host"],
+                 "",
+                 "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما:",
+                 doh["url"],
+                 "",
+                 "پروفایل آماده‌ی آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است.",
+                 "این آدرس مخصوص حساب شماست؛ آن را به کسی ندهید."]
+        if not u["ips"]:
+            lines.append("\n⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ بدون آن کار نمی‌کند.")
+        self.say(chat, "\n".join(lines),
+                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]]})
+
     def help_text(self):
         return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
                 "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
                 "🌐 ثبت آی‌پی: سرویس فقط روی آی‌پی ثبت‌شده کار می‌کند\n"
                 "🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی\n"
+                "🔒 DNS امن: آدرس DoH و DoT، برای وقتی اپراتور DNS را دست‌کاری می‌کند\n"
                 "🔑 پنل وب: نام کاربری، ورود با یک کلیک و رمز تازه\n\n"
                 "حساب پنل وب دارید؟ در پنل «اتصال حساب به تلگرام» را بزنید و کد را "
                 "همین‌جا بفرستید." + ("\n\n" + self.cfg["support"] if self.cfg["support"] else ""))

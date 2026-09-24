@@ -60,6 +60,9 @@ certificate naming no console host at all.
 | **Service templates** | which brands a customer's plan routes, down to individual domains; a few groups ship visible but unticked, because routing them breaks the thing they belong to |
 | **Selling** | a plan is a template for some days with an allowance and a price; the customer picks one and sends the slip, and approving it puts the plan on; renewals, and a free trial once per Telegram account |
 | **Customer panel** | sign up, register an address, see usage, buy a plan and send the slip, tickets, link Telegram and reset a forgotten password with a Telegram code |
+| **Encrypted DNS** | DNS over HTTPS on the relay's 443 and DNS over TLS on 853, a personal address for each customer, an iPhone profile and a Windows 11 command; like plain DNS it answers only a registered address |
+| **Usage dashboard** | the customer's speed now, 7 and 30 days against the period before, when the allowance runs out, daily download and upload, 24 hours of speed, busy hours, a connection check, and usage by service — kept as service, day and bytes for 30 days, never as a list of sites; the operator sees the same charts without the services |
+| **Upstream DNS** | the operator picks the public resolvers — Cloudflare, Quad9, Google, OpenDNS, AdGuard or any address — and each relay tests the pick from Iran before it takes it |
 | **Operator panel** | customers, plans, receipts, tickets, templates, domains, host monitoring, backup and restore |
 | **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report), set up from the admin panel |
 | **API** | to plug in a sales bot of your own: [docs/bot-api.md](docs/bot-api.md) (in Persian) |
@@ -193,22 +196,28 @@ can see, but a firewall rule you wrote yourself it cannot.
 |---|---|---|
 | **53** udp + tcp | dnsmasq, the address customers point at | — |
 | **80** tcp | forwarded abroad; also how certificates are proved | the same |
-| **443** tcp | the SNI proxy | the same |
+| **443** tcp | the SNI proxy, and DNS over HTTPS on the relay's own name | the same |
+| **853** tcp | DNS over TLS, once the relay has a certificate | — |
+| **1119** tcp | Battle.net's launcher, carried to the exit | the same |
+| **4070** tcp | Spotify's access point, carried to the exit | the same |
 | **3478** udp | STUN, so a console can work out its own NAT | — |
 | **8443** tcp | the customer panel — TLS only, so a relay without a certificate serves no panel at all | the sync API — it answers the relays and nobody else |
 | **8445** tcp | — | the bot API — answers only a key made in the admin panel; open it if your bot runs elsewhere |
 | **8446** tcp | — | loopback only: the exit's route to Google over IPv6, where it has IPv6 |
+| **18119** tcp | — | loopback only: the exit's route to Battle.net's version check |
 | **8444** tcp + udp | only with a tunnel: its port, answering the exit alone — a *reverse* tunnel listens here | the same, for a *direct* tunnel |
 | **22** tcp | ssh — never gated, so a wrong allowlist cannot lock you out | the same |
 
 The admin panel is the one port you choose. It defaults to **9443** and can be
-anything free; the installer stops you at 22, 53, 80, 443, 8443, 8445, 8446 and the
-tunnel's port, and `smartdns-access port` applies the same rule later, plus a
+anything free; the installer stops you at 22, 53, 80, 443, 1119, 4070, 8443, 8445,
+8446, 18119 and the tunnel's port, and `smartdns-access port` applies the same rule later, plus a
 check that nothing else is already listening.
 
 Inbound, the relay is the machine customers reach, so its DNS, proxy, STUN and
 panel ports have to be open to the internet. The exit only ever hears from the
-relay and from you, so 80, 443, 8443 and the panel port are enough there.
+relay and from you, so 80, 443, 8443 and the panel port are enough there —
+plus 1119 and 4070 from the relay, for when the relay reaches the exit
+directly rather than through a tunnel.
 
 ### A tunnel between the relay and the exit (optional)
 

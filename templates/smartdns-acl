@@ -287,7 +287,7 @@ enforce)
 add rule inet smartdns gate iif "lo" accept
 
 add rule inet smartdns gate ip saddr != @allowed udp dport 53 drop
-add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443, 4070 } drop
+add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443, 853, 1119, 4070 } drop
 RULES
         nft flush chain $TABLE gate
         nft -f "$ENFORCE" || { rm -f "$ENFORCE"; die "nft refused the rules; nothing changed"; }

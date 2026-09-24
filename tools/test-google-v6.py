@@ -61,9 +61,9 @@ check("Google's names go to the loopback hop",
       re.search(r"google\\.com\|googleapis\\.com.*\$\s+127\.0\.0\.1:8446;", stream) is not None)
 check("the hop is on loopback only", "listen 127.0.0.1:8446;" in stream
       and not re.search(r"listen\s+8446", stream))
-check("and asks its resolver for AAAA records only", "resolver 1.1.1.1 ipv4=off;" in stream)
+check("and asks its resolver for AAAA records only", "resolver __RESOLVERS__ ipv4=off;" in stream)
 check("the public server still resolves over IPv4 only",
-      stream.index("resolver 1.1.1.1 ipv6=off;") < stream.index("listen 443;"))
+      stream.index("resolver __RESOLVERS__ ipv6=off;") < stream.index("listen 443;"))
 # The relay, and loopback - where the tunnel's end on this machine hands its
 # connections in. Nobody else.
 check("only the relay, and the tunnel's end on this machine, may use the public server",

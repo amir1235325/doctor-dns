@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.4"
+VERSION="0.7.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -87,6 +87,44 @@ backup_file() {
 # Write payload $1 to file $2, substituting the two addresses. Backs up whatever
 # was there, and skips the write when the content is identical so re-runs do not
 # churn files or trigger needless restarts. Returns 0 only if it changed.
+# Where the relay's certificate is, and so whether it can serve DoH. The
+# name is the customer panel's: one certificate, one name, for the panel on
+# 8443 and for DNS on 443 and 853.
+doh_paths() {
+    DOH_ON=""; NO_DOH=1; DOH_HOST=""; DOH_CERT=""; DOH_KEY=""
+    [ "$ROLE" = relay ] && [ -n "${PANEL_DOMAIN:-}" ] || return 0
+    if [ -n "${PANEL_CERT:-}" ]; then
+        DOH_CERT="$PANEL_CERT"; DOH_KEY="${PANEL_KEY:-}"
+    else
+        DOH_CERT="/etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem"
+        DOH_KEY="/etc/letsencrypt/live/$PANEL_DOMAIN/privkey.pem"
+    fi
+    if [ -f "$DOH_CERT" ] && [ -f "$DOH_KEY" ]; then
+        DOH_ON=1; NO_DOH=""; DOH_HOST="$PANEL_DOMAIN"
+    fi
+}
+
+# Once the certificate exists: nginx with the DoH blocks in, and the flag
+# that tells the customer panel to offer the addresses. On a first install
+# this is what turns DoH on; on an upgrade the nginx step already had the
+# certificate and this only confirms it.
+relay_doh() {
+    [ "$ROLE" = relay ] || return 0
+    local was="$DOH_ON"
+    doh_paths
+    if [ -z "$DOH_ON" ]; then
+        rm -f /etc/smart-dns/doh
+        return 0
+    fi
+    if [ -z "$was" ]; then
+        install_payload RELAY_NGINX /etc/nginx/nginx.conf || true
+        nginx -t || die "nginx rejected the DoH config; the previous one is in $BACKUP_DIR"
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    fi
+    touch /etc/smart-dns/doh
+    info "DNS over HTTPS on https://$DOH_HOST/dns-query, over TLS on $DOH_HOST:853"
+}
+
 install_payload() {
     local name="$1" dest="$2" tmp
     tmp="$(mktemp)"
@@ -103,8 +141,15 @@ install_payload() {
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
               -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
               -e "s#__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}#g" \
+              -e "s#__EXIT_BLIZZARD__#${EXIT_BLIZZARD:-__EXIT_BLIZZARD__}#g" \
               -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
               -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
+              -e "s#__DOH_HOST__#${DOH_HOST:-doh.invalid}#g" \
+              -e "s#__DOH_CERT__#${DOH_CERT:-/nonexistent}#g" \
+              -e "s#__DOH_KEY__#${DOH_KEY:-/nonexistent}#g" \
+              -e "${NO_DOH:+/# doh begin/,/# doh end/d}" \
+              -e "${DOH_ON:+/# nodoh begin/,/# nodoh end/d}" \
+              -e "s#__RESOLVERS__#${RESOLVERS:-1.1.1.1 9.9.9.9}#g" \
         > "$tmp"
     [ -s "$tmp" ] || die "payload $name is empty - is this file complete?"
     # Whether this file was ours or already here decides what uninstall does
@@ -215,6 +260,8 @@ TUNNEL_LOCAL_API=18843
 # with everything else, because on a line where 4070 is filtered the direct
 # path is exactly what is broken.
 TUNNEL_LOCAL_SPOTIFY=14070
+# Battle.net's launcher, on 1119 - the same story as Spotify's port.
+TUNNEL_LOCAL_BLIZZARD=11119
 # Which transports each direction has. A direct tunnel has four; BackPack's
 # spoofing carrier is a different kind of tunnel and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
@@ -240,9 +287,12 @@ tunnel_port_problem() {
         8443) echo "the sync API and the customer panel" ;;
         8445) echo "the bot API" ;;
         8446) echo "the exit's route to Google over IPv6" ;;
+        18119) echo "the exit's route to Battle.net's version check" ;;
+        1119) echo "Battle.net's launcher" ;;
+        4070) echo "Spotify's access point" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
-        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API") echo "the tunnel's own end on the relay" ;;
+        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API"|"$TUNNEL_LOCAL_SPOTIFY"|"$TUNNEL_LOCAL_BLIZZARD") echo "the tunnel's own end on the relay" ;;
     esac
     { [ "$p" -ge 5300 ] && [ "$p" -le 5399 ]; } && echo "the templates' resolvers on the relay"
     admin="$(sed -n 's/^ADMIN_PORT=//p' /etc/smart-dns/admin.env 2>/dev/null | head -1 || true)"
@@ -394,15 +444,15 @@ tunnel_toml() {
     printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY" "$TUNNEL_LOCAL_BLIZZARD"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     elif [ "$TUNNEL_DIRECTION" = reverse ]; then
         printf '[client]\nremote_addr = "%s:%s"\n' "$RELAY_IP" "$TUNNEL_PORT"
     elif [ "$ROLE" = relay ]; then
         printf '[direct]\nrole = "iran"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY" "$TUNNEL_LOCAL_BLIZZARD"
     else
         printf '[direct]\nrole = "kharej"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
@@ -1189,8 +1239,21 @@ if [ "$TUNNEL" = backpack ] && ! install_backpack; then
 fi
 if [ "$ROLE" = relay ] && [ "$TUNNEL" = backpack ]; then
     NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http; EXIT_SPOTIFY=to_exit_spotify
+    EXIT_BLIZZARD=to_exit_blizzard
 else
     NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"; EXIT_SPOTIFY="$EXIT_IP:4070"
+    EXIT_BLIZZARD="$EXIT_IP:1119"
+fi
+# DNS over HTTPS and TLS, on a relay that has a name and a certificate for
+# it. On a first install the certificate comes later in this run, so this is
+# decided again once it is there - see relay_doh.
+doh_paths
+# The exit's public resolvers, as the admin panel last set them - so an
+# upgrade does not put the defaults back over the operator's choice.
+RESOLVERS=""
+if [ "$ROLE" = exit ] && [ -f /etc/smart-dns/upstream ]; then
+    RESOLVERS="$(head -n 1 /etc/smart-dns/upstream \
+        | grep -Ex '([0-9]{1,3}\.){3}[0-9]{1,3}( ([0-9]{1,3}\.){3}[0-9]{1,3})?' || true)"
 fi
 if [ "$ROLE" = relay ]; then
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
@@ -1210,11 +1273,8 @@ if [ "$ROLE" = relay ]; then
         # No timestamp in here. It would make the file differ on every run, so
         # every run would rewrite it and restart dnsmasq for no reason.
         printf '# generated by the smart-dns installer - do not edit by hand\n'
-        # No Google. 8.8.8.8 passes the asker's subnet on (ECS), and services
-        # that refuse Iran in their DNS - Tencent's games answer 0.0.0.1 - saw
-        # this relay's Iranian subnet and refused it. Neither of these two
-        # sends it, and dnsmasq takes turns between them.
-        printf 'no-resolv\nserver=1.1.1.1\nserver=9.9.9.9\n'
+        # The upstream resolvers are in upstream.conf, below: the admin panel
+        # changes them, and this file is rewritten on every upgrade.
         printf 'cache-size=10000\ndomain-needed\nbogus-priv\nno-hosts\n'
         printf 'bind-interfaces\nlisten-address=127.0.0.1,%s\n\n' "$RELAY_IP"
         printf '# domains answered with this relay, so the traffic leaves via the exit\n'
@@ -1228,6 +1288,24 @@ if [ "$ROLE" = relay ]; then
         backup_file /etc/dnsmasq.d/smart-dns.conf
         mv "$tmp" /etc/dnsmasq.d/smart-dns.conf; chmod 644 /etc/dnsmasq.d/smart-dns.conf
         info "wrote $(grep -c '^address=' /etc/dnsmasq.d/smart-dns.conf) domains"
+        DNSMASQ_CHANGED=1
+    fi
+
+    step "dnsmasq: the public resolvers"
+    # A file of its own, because the admin panel changes it (smartdns-sync
+    # writes the pick once it has checked it answers from here). So it is
+    # written only when missing, and an upgrade leaves the choice alone. No
+    # Google by default: 8.8.8.8 passes the asker's subnet on (ECS), and
+    # services that refuse Iran in their DNS - Tencent's games answer 0.0.0.1 -
+    # saw this relay's Iranian subnet and refused it.
+    if [ -f /etc/dnsmasq.d/upstream.conf ]; then
+        info "unchanged ($(grep '^server=' /etc/dnsmasq.d/upstream.conf | cut -d= -f2 | tr '\n' ' '))"
+    else
+        note_file /etc/dnsmasq.d/upstream.conf
+        printf '# the public resolvers - the admin panel changes these\nno-resolv\nserver=1.1.1.1\nserver=9.9.9.9\n' \
+            > /etc/dnsmasq.d/upstream.conf
+        chmod 644 /etc/dnsmasq.d/upstream.conf
+        info "wrote 1.1.1.1 and 9.9.9.9"
         DNSMASQ_CHANGED=1
     fi
 
@@ -1456,6 +1534,7 @@ if [ -n "${PANEL_DOMAIN:-}" ]; then
     [ -f "$CERT_PATH" ] || die "still no certificate at $CERT_PATH"
     remember panel-domain "$PANEL_DOMAIN"
 fi
+relay_doh
 
 # ----------------------------------------------------------------- panel
 if [ "$ROLE" = exit ]; then
@@ -1580,6 +1659,9 @@ EOF
                     warn "  8443    the sync API the relays connect to"
                     warn "  8445    the bot API"
                     warn "  8446    the exit's own route to Google over IPv6"
+                    warn " 18119    the exit's own route to Battle.net"
+                    warn "  1119    Battle.net's launcher"
+                    warn "  4070    Spotify's access point"
                     warn "on a relay, 3478 is taken as well."
                     warn "pick anything else, and open it in your firewall."
                     printf '\n'
@@ -1605,8 +1687,11 @@ EOF
                 8443) die "port 8443 is the sync API the relays connect to" ;;
                 8445) die "port 8445 is the bot API" ;;
                 8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
+                18119) die "port 18119 is the exit's own route to Battle.net" ;;
+                1119) die "port 1119 carries Battle.net's launcher" ;;
+                4070) die "port 4070 carries Spotify's access point" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
-    another. 22, 53, 80, 443, 8443, 8445 and 8446 are all taken." ;;
+    another. 22, 53, 80, 443, 1119, 4070, 8443, 8445, 8446 and 18119 are all taken." ;;
                 "${TUNNEL_PORT:-none}") die "port $ADMIN_PORT carries the tunnel - pick another" ;;
             esac
             # The path stays generated. Nobody types it from memory, and an
@@ -1763,9 +1848,17 @@ EOF
     install_payload DNS_PROFILE_UNIT /etc/systemd/system/smartdns-dns@.service || true
     mkdir -p /etc/smartdns-profiles
     install_payload SYNC_SERVICE /etc/systemd/system/smartdns-sync.service || true
+    # DNS over HTTPS and TLS. Harmless where the relay has no certificate:
+    # nginx only sends it anything once relay_doh has turned DoH on.
+    payload DOH > /usr/local/bin/smartdns-doh
+    chmod +x /usr/local/bin/smartdns-doh
+    note_file /usr/local/bin/smartdns-doh
+    install_payload DOH_SERVICE /etc/systemd/system/smartdns-doh.service || true
     systemctl daemon-reload
     enable_service smartdns-sync.service
     systemctl restart smartdns-sync.service
+    enable_service smartdns-doh.service
+    systemctl restart smartdns-doh.service
     sleep 3
     # Where the customer's panel ended up, for the summary at the end. It is
     # served over TLS or not at all - it asks for a password, and there is no
@@ -2120,26 +2213,16 @@ exit 0
 ##
 ## Add more with:  smartdns bypass <domain>
 #
-#server=/gosredirector.ea.com/1.1.1.1
-#server=/gosredirector.ea.com/9.9.9.9
-#server=/blaze.ea.com/1.1.1.1
-#server=/blaze.ea.com/9.9.9.9
-#server=/gameservices.ea.com/1.1.1.1
-#server=/gameservices.ea.com/9.9.9.9
-#server=/tnt-ea.com/1.1.1.1
-#server=/tnt-ea.com/9.9.9.9
-#server=/np.playstation.net/1.1.1.1
-#server=/np.playstation.net/9.9.9.9
-#server=/np.dl.playstation.net/1.1.1.1
-#server=/np.dl.playstation.net/9.9.9.9
-#server=/ol.epicgames.com/1.1.1.1
-#server=/ol.epicgames.com/9.9.9.9
-#server=/ogs.live.on.epicgames.com/1.1.1.1
-#server=/ogs.live.on.epicgames.com/9.9.9.9
-#server=/edea.live.use1a.on.epicgames.com/1.1.1.1
-#server=/edea.live.use1a.on.epicgames.com/9.9.9.9
-#server=/core.windows.net/1.1.1.1
-#server=/core.windows.net/9.9.9.9
+#server=/gosredirector.ea.com/#
+#server=/blaze.ea.com/#
+#server=/gameservices.ea.com/#
+#server=/tnt-ea.com/#
+#server=/np.playstation.net/#
+#server=/np.dl.playstation.net/#
+#server=/ol.epicgames.com/#
+#server=/ogs.live.on.epicgames.com/#
+#server=/edea.live.use1a.on.epicgames.com/#
+#server=/core.windows.net/#
 #
 ## Voice, and two control channels, none of which the relay can carry.
 ##
@@ -2160,12 +2243,9 @@ exit 0
 ##                   Error" for a sign-in that does eventually work. The store,
 ##                   the community and everything a person browses stay routed;
 ##                   only the sign-in channel goes direct.
-#server=/discord.media/1.1.1.1
-#server=/discord.media/9.9.9.9
-#server=/vivox.com/1.1.1.1
-#server=/vivox.com/9.9.9.9
-#server=/steamserver.net/1.1.1.1
-#server=/steamserver.net/9.9.9.9
+#server=/discord.media/#
+#server=/vivox.com/#
+#server=/steamserver.net/#
 #__END_BYPASS__
 
 #__BEGIN_NO_AAAA__
@@ -2217,7 +2297,7 @@ exit 0
 #
 #http {
 #    access_log off;
-#    resolver 1.1.1.1 ipv6=off;
+#    resolver __RESOLVERS__ ipv6=off;
 #    resolver_timeout 5s;
 #
 #    # Console download CDNs are served over plain HTTP. Both Sony and Microsoft
@@ -2273,6 +2353,30 @@ exit 0
 #        }
 #    }
 #
+#    # Battle.net's patch servers, which the launcher asks for its version on
+#    # 1119 in plain HTTP - see the 1119 block in the stream section. Loopback
+#    # only: nothing reaches this but that block. Blizzard's names only, so it
+#    # is no proxy to anywhere else.
+#    server {
+#        listen 127.0.0.1:18119;
+#        server_name ~^.*\.(battle\.net|blizzard\.com)$;
+#        location / {
+#            proxy_pass http://$host:1119$request_uri;
+#            proxy_set_header Host $http_host;
+#            proxy_http_version 1.1;
+#            proxy_set_header Connection "";
+#            proxy_buffering off;
+#            proxy_request_buffering off;
+#            proxy_connect_timeout 10s;
+#            proxy_read_timeout 10m;
+#        }
+#    }
+#    server {
+#        listen 127.0.0.1:18119 default_server;
+#        server_name _;
+#        return 403;
+#    }
+#
 #    # Everything else keeps the old behaviour.
 #    server {
 #        listen 80 default_server;
@@ -2314,7 +2418,7 @@ exit 0
 #
 #    # Only the Iran relay may use this proxy. Prevents open-proxy abuse.
 #    server {
-#        resolver 1.1.1.1 ipv6=off;
+#        resolver __RESOLVERS__ ipv6=off;
 #        listen 443;
 #        allow __RELAY_IP__;
 #        # The tunnel, when there is one: its end on this machine hands each
@@ -2338,13 +2442,37 @@ exit 0
 #    # out, so this follows them rather than pinning one region.
 #    server {
 #        listen 4070;
-#        resolver 1.1.1.1 ipv6=off;
+#        resolver __RESOLVERS__ ipv6=off;
 #        allow __RELAY_IP__;
 #        allow 127.0.0.1;
 #        deny all;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
 #        proxy_pass ap.spotify.com:4070;
+#    }
+#
+#    # Battle.net. The desktop launcher signs in to {region}.actual.battle.net
+#    # and asks {region}.patch.battle.net for versions, both on 1119 and on
+#    # nothing else, so with battle.net routed and 1119 not carried the
+#    # launcher never opened. The sign-in is TLS and names its host, and goes
+#    # on like 443; the version check is plain HTTP, named only in its Host
+#    # header, and goes to the loopback server in the http section that reads
+#    # it. Blizzard's names only: anything else on this port is dropped.
+#    map $ssl_preread_server_name $blizzard_upstream {
+#        ~^[a-z0-9.-]+\.(battle\.net|blizzard\.com)$  $ssl_preread_server_name:1119;
+#        ""       127.0.0.1:18119;
+#        default  "";
+#    }
+#    server {
+#        listen 1119;
+#        resolver __RESOLVERS__ ipv6=off;
+#        allow __RELAY_IP__;
+#        allow 127.0.0.1;
+#        deny all;
+#        ssl_preread on;
+#        proxy_connect_timeout 10s;
+#        proxy_timeout 10m;
+#        proxy_pass $blizzard_upstream;
 #    }
 #
 #    # google-v6 begin
@@ -2354,7 +2482,7 @@ exit 0
 #    # 8446 is on the list of ports the admin panel may not take.
 #    server {
 #        listen 127.0.0.1:8446;
-#        resolver 1.1.1.1 ipv4=off;
+#        resolver __RESOLVERS__ ipv4=off;
 #        ssl_preread on;
 #        proxy_connect_timeout 10s;
 #        proxy_pass $ssl_preread_server_name:443;
@@ -2388,6 +2516,16 @@ exit 0
 #}
 #
 #stream {
+#    # One line per connection, for the customer's "used by service" chart:
+#    # who, which port, which name they asked for, and how much went each way.
+#    # smartdns-sync reads it every half minute, adds it up by service and
+#    # deletes it - the raw lines never live longer than about a minute, and
+#    # the names never reach the database. In /run, which is memory: the
+#    # lines never touch the disk, and not under /var/log/nginx, where the
+#    # daily logrotate would have kept a copy for two weeks.
+#    log_format usage '$remote_addr $server_port $ssl_preread_server_name $bytes_sent $bytes_received';
+#    access_log /run/smartdns-usage usage buffer=32k flush=10s;
+#
 #    # tunnel begin
 #    # With a tunnel, its end on this machine is the way to the exit, and the
 #    # exit's own address is only the fallback: nginx turns to a backup server
@@ -2405,14 +2543,56 @@ exit 0
 #        server 127.0.0.1:14070;
 #        server __EXIT_IP__:4070 backup;
 #    }
+#    upstream to_exit_blizzard {
+#        server 127.0.0.1:11119;
+#        server __EXIT_IP__:1119 backup;
+#    }
 #    # tunnel end
 #
+#    # doh begin
+#    # Port 443 carries two things: everything a customer opens, which goes on
+#    # to the exit untouched, and DNS over HTTPS to this relay's own name, which
+#    # does not. nginx reads the name the client asked for - it decrypts nothing
+#    # to do it - and sends the relay's own name to the DoH server further down.
+#    # Every other name goes exactly where it always went, and a client that
+#    # sends no name at all goes to the exit, as before.
+#    map $ssl_preread_server_name $https_target {
+#        __DOH_HOST__  127.0.0.1:8453;
+#        default       __EXIT_HTTPS__;
+#    }
 #    server {
 #        listen 443;
+#        ssl_preread on;
+#        proxy_connect_timeout 10s;
+#        proxy_timeout 10m;
+#        proxy_pass $https_target;
+#    }
+#
+#    # DNS over TLS, for Android's "Private DNS". nginx ends TLS here with the
+#    # same certificate as the customer panel and hands the plain stream to
+#    # smartdns-doh with a PROXY line in front - which is how it knows whose
+#    # resolver to ask, since the connection itself now comes from loopback.
+#    server {
+#        listen 853 ssl;
+#        ssl_certificate     __DOH_CERT__;
+#        ssl_certificate_key __DOH_KEY__;
+#        ssl_protocols TLSv1.2 TLSv1.3;
+#        proxy_protocol on;
+#        proxy_connect_timeout 5s;
+#        proxy_timeout 2m;
+#        proxy_pass 127.0.0.1:8054;
+#    }
+#    # doh end
+#    # nodoh begin
+#    server {
+#        listen 443;
+#        # Only to read the name for the usage chart; nothing is decrypted.
+#        ssl_preread on;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
 #        proxy_pass __EXIT_HTTPS__;
 #    }
+#    # nodoh end
 #
 #    # Port 80 is forwarded rather than answered. It used to return a 301 to
 #    # https here, which broke PlayStation downloads: their CDN is HTTP-only and
@@ -2433,7 +2613,62 @@ exit 0
 #        proxy_timeout 10m;
 #        proxy_pass __EXIT_SPOTIFY__;
 #    }
+#
+#    # Battle.net on 1119 - see the exit's config for why.
+#    server {
+#        listen 1119;
+#        # Only to read the name for the usage chart; nothing is decrypted.
+#        ssl_preread on;
+#        proxy_connect_timeout 10s;
+#        proxy_timeout 10m;
+#        proxy_pass __EXIT_BLIZZARD__;
+#    }
 #}
+#
+## doh begin
+#http {
+#    access_log off;
+#    server_tokens off;
+#
+#    map "$request_method:$arg_dns" $doh_browser {
+#        "GET:"  1;
+#        default 0;
+#    }
+#
+#    # The DoH server, on loopback: the stream on 443 is the only way in, so
+#    # nothing reaches it that the gate has not already let through.
+#    server {
+#        listen 127.0.0.1:8453 ssl http2;
+#        server_name __DOH_HOST__;
+#        ssl_certificate     __DOH_CERT__;
+#        ssl_certificate_key __DOH_KEY__;
+#        ssl_protocols TLSv1.2 TLSv1.3;
+#        client_max_body_size 8k;
+#
+#        location /dns-query {
+#            # A browser that opened the address - somebody clicking it, or
+#            # pasting it in the wrong box - wants the setup page, not an error about a
+#            # missing query. A DoH client always sends dns= or POSTs.
+#            if ($doh_browser) {
+#                return 302 https://__DOH_HOST__:8443/doh-setup$uri;
+#            }
+#            proxy_pass http://127.0.0.1:8055;
+#            proxy_http_version 1.1;
+#            proxy_set_header Connection "";
+#            # Always 127.0.0.1 - the stream. smartdns-doh refuses anything
+#            # else, as something that found its way round the gate.
+#            proxy_set_header X-Real-IP $remote_addr;
+#            proxy_connect_timeout 3s;
+#            proxy_read_timeout 10s;
+#        }
+#
+#        # Somebody who types the relay's name into a browser wants the panel.
+#        location / {
+#            return 302 https://__DOH_HOST__:8443/;
+#        }
+#    }
+#}
+## doh end
 #__END_RELAY_NGINX__
 
 #__BEGIN_TURNSERVER__
@@ -2527,12 +2762,11 @@ exit 0
 #    [ $# -gt 0 ] || { echo "usage: smartdns bypass <domain> [domain ...]"; exit 1; }
 #    for d in "$@"; do
 #      d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
-#      if grep -qxF "server=/$d/1.1.1.1" "$BYPASS"; then
+#      if grep -q "^server=/$d/" "$BYPASS"; then
 #        echo "already bypassed: $d"
 #      else
-#        printf 'server=/%s/1.1.1.1
-#server=/%s/9.9.9.9
-#' "$d" "$d" >> "$BYPASS"
+#        # "#": the usual resolvers, whichever the admin panel picked.
+#        printf 'server=/%s/#\n' "$d" >> "$BYPASS"
 #        echo "bypassed (resolves to its real IP now): $d"
 #      fi
 #    done
@@ -2657,7 +2891,7 @@ exit 0
 #    chain count_in {
 #        type filter hook input priority 10 ; policy accept ;
 #        ip saddr @allowed udp dport 53 update @up { ip saddr counter }
-#        ip saddr @allowed tcp dport { 53, 80, 443, 4070 } update @up { ip saddr counter }
+#        ip saddr @allowed tcp dport { 53, 80, 443, 853, 1119, 4070 } update @up { ip saddr counter }
 #    }
 #
 #    # What we send back. nginx talks to the exit node as a local process, from
@@ -2666,7 +2900,7 @@ exit 0
 #    chain count_out {
 #        type filter hook output priority 10 ; policy accept ;
 #        ip daddr @allowed udp sport 53 update @down { ip daddr counter }
-#        ip daddr @allowed tcp sport { 53, 80, 443, 4070 } update @down { ip daddr counter }
+#        ip daddr @allowed tcp sport { 53, 80, 443, 853, 1119, 4070 } update @down { ip daddr counter }
 #    }
 #
 #    # Amplification defence, unchanged. An open resolver is worth roughly its
@@ -2968,7 +3202,7 @@ exit 0
 #add rule inet smartdns gate iif "lo" accept
 #
 #add rule inet smartdns gate ip saddr != @allowed udp dport 53 drop
-#add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443, 4070 } drop
+#add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443, 853, 1119, 4070 } drop
 #RULES
 #        nft flush chain $TABLE gate
 #        nft -f "$ENFORCE" || { rm -f "$ENFORCE"; die "nft refused the rules; nothing changed"; }
@@ -3580,6 +3814,37 @@ exit 0
 #    PRIMARY KEY (ip, relay)
 #);
 #
+#-- What each customer used, and when, for the charts on their page. Three
+#-- grains, kept for as long as each is worth drawing: five minutes for two
+#-- days, hours for a week, days for ninety. Buckets are Tehran time, because
+#-- "this evening" and "yesterday" mean the customer's evening and yesterday -
+#-- and Tehran is half an hour off the hour, so UTC hours would split every one
+#-- of theirs in two.
+#--
+#-- This is for looking at, not for billing. The bill is users.used_bytes, as
+#-- it always was, and nothing here feeds back into it.
+#CREATE TABLE IF NOT EXISTS usage (
+#    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    grain   TEXT NOT NULL,
+#    bucket  TEXT NOT NULL,
+#    up      INTEGER NOT NULL DEFAULT 0,
+#    down    INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (user_id, grain, bucket)
+#);
+#
+#-- Which service the traffic went to, per customer per day. Only this is kept:
+#-- the relay sends the names its customers' connections asked for, those are
+#-- turned into a catalogue service here and dropped. So what survives says
+#-- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
+#-- after thirty days not even that. Only the customer is shown it.
+#CREATE TABLE IF NOT EXISTS usage_service (
+#    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    day     TEXT NOT NULL,
+#    service TEXT NOT NULL,
+#    bytes   INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (user_id, day, service)
+#);
+#
 #-- Domains the operator added themselves, on top of the list that ships with
 #-- the installer. Kept here rather than edited on each relay so that one entry
 #-- reaches every relay, and survives a relay being rebuilt from scratch.
@@ -3801,6 +4066,15 @@ exit 0
 #    ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
 #    # When this account had its trial; one per account.
 #    ("users", "trial_at", "TEXT"),
+#    # The token in the customer's personal DNS-over-HTTPS address. It says
+#    # whose template to answer from, since a DoH request reaches the resolver
+#    # from nginx on loopback and the connection itself no longer says. It
+#    # does not let anybody in: the gate still wants a registered address.
+#    ("users", "doh_token", "TEXT"),
+#    # The last raw upload and download counters per address and relay, so the
+#    # charts can tell the two apart. The bill still comes from last_counter.
+#    ("ip_counters", "last_up", "INTEGER NOT NULL DEFAULT 0"),
+#    ("ip_counters", "last_down", "INTEGER NOT NULL DEFAULT 0"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -3843,6 +4117,10 @@ exit 0
 #    "plan_bytes": str(2 * GB),
 #    "plan_days": "30",
 #}
+#
+## The public resolvers until the operator picks others: neither sends the
+## asker's subnet on, which Google does and Tencent's games refuse Iran by.
+#DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
 #
 ## Fractions of the quota at which the user is warned, and the bit each one
 ## sets in users.warned.
@@ -4685,7 +4963,7 @@ exit 0
 #            ") last ON last.host = m.host AND last.at = m.at"
 #        )
 #
-#    def fold_counters(self, relay, counters):
+#    def fold_counters(self, relay, counters, split=None):
 #        """Turn raw per-address counters into per-user usage.
 #
 #        The kernel counts bytes per address since the element was created. What
@@ -4718,11 +4996,30 @@ exit 0
 #                        (delta, row["user_id"]),
 #                    )
 #                    touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
+#                # Upload and download apart, for the charts. The relay sends
+#                # both beside the total; one that does not is an older relay,
+#                # and its growth goes down as download rather than nowhere.
+#                pair = (split or {}).get(ip)
+#                if pair:
+#                    up, down = int(pair[0]), int(pair[1])
+#                    old = self.db.execute(
+#                        "SELECT last_up, last_down FROM ip_counters"
+#                        " WHERE ip = ? AND relay = ?", (ip, relay)).fetchone()
+#                    d_up = up - (old["last_up"] if old else 0)
+#                    d_down = down - (old["last_down"] if old else 0)
+#                    if d_up < 0 or d_down < 0:
+#                        d_up, d_down = up, down
+#                else:
+#                    up = down = 0
+#                    d_up, d_down = 0, max(delta, 0)
+#                if d_up or d_down:
+#                    record_usage(self.db, row["user_id"], d_up, d_down)
 #                self.db.execute(
-#                    "INSERT INTO ip_counters (ip, relay, last_counter)"
-#                    " VALUES (?, ?, ?) ON CONFLICT(ip, relay)"
-#                    " DO UPDATE SET last_counter = excluded.last_counter",
-#                    (ip, relay, total))
+#                    "INSERT INTO ip_counters (ip, relay, last_counter, last_up, last_down)"
+#                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(ip, relay)"
+#                    " DO UPDATE SET last_counter = excluded.last_counter,"
+#                    " last_up = excluded.last_up, last_down = excluded.last_down",
+#                    (ip, relay, total, up, down))
 #            self.db.commit()
 #        return touched
 #
@@ -4968,6 +5265,214 @@ exit 0
 #    store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
 #              (user_id, ip, now()))
 #    return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+#
+#
+## ----------------------------------------------------------------- usage
+## Tehran has kept +03:30 all year since 2022.
+#TEHRAN = timezone(timedelta(hours=3, minutes=30))
+## How long each grain is kept, in days.
+#USAGE_KEEP = {"5m": 2, "1h": 7, "1d": 90}
+#SERVICE_KEEP_DAYS = 30
+#
+#
+#def usage_buckets(when=None):
+#    t = (when or datetime.now(timezone.utc)).astimezone(TEHRAN)
+#    five = t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)
+#    return {"5m": five.strftime("%Y-%m-%dT%H:%M"),
+#            "1h": t.strftime("%Y-%m-%dT%H:00"),
+#            "1d": t.strftime("%Y-%m-%d")}
+#
+#
+#def record_usage(db, user_id, up, down, when=None):
+#    """Add a stretch of traffic to all three grains. Called with the lock held,
+#    inside fold_counters' own transaction."""
+#    for grain, bucket in usage_buckets(when).items():
+#        db.execute("INSERT INTO usage (user_id, grain, bucket, up, down)"
+#                   " VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, grain, bucket)"
+#                   " DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+#                   (user_id, grain, bucket, up, down))
+#
+#
+#def service_index(catalogue):
+#    """Every catalogue name, mapped to its service, for turning the names a
+#    relay's connections asked for into the service they belong to."""
+#    out = {}
+#    for svc in catalogue:
+#        for grp in svc.get("groups") or ():
+#            for d in grp.get("domains") or ():
+#                out[d] = svc["key"]
+#    return out
+#
+#
+## What the relay's own ports mean, for traffic that names no host.
+#PORT_SERVICES = {":80": "_http", ":4070": "spotify", ":853": "_dns",
+#                 # The launcher's version check, which names no host.
+#                 ":1119": "blizzard"}
+#
+#
+#def service_of(name, index):
+#    """The catalogue service a connection belongs to, by the longest name of
+#    ours that the host it asked for ends with."""
+#    if name in PORT_SERVICES:
+#        return PORT_SERVICES[name]
+#    name = name.lower().rstrip(".")
+#    parts = name.split(".")
+#    for i in range(len(parts) - 1):
+#        hit = index.get(".".join(parts[i:]))
+#        if hit:
+#            return hit
+#    return "_other"
+#
+#
+#def record_services(store, rows, catalogue):
+#    """What a relay's customers' connections asked for, since the last sync:
+#    {ip: {name: bytes}}. Turned into services here; the names go no further."""
+#    if not isinstance(rows, dict) or not rows:
+#        return
+#    index = service_index(catalogue)
+#    day = usage_buckets()["1d"]
+#    for ip, names in list(rows.items())[:5000]:
+#        if not isinstance(names, dict):
+#            continue
+#        owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+#        if not owner:
+#            continue
+#        per = {}
+#        for name, n in names.items():
+#            try:
+#                n = int(n)
+#            except (TypeError, ValueError):
+#                continue
+#            if n > 0:
+#                key = service_of(str(name), index)
+#                per[key] = per.get(key, 0) + n
+#        for key, n in per.items():
+#            store.run("INSERT INTO usage_service (user_id, day, service, bytes)"
+#                      " VALUES (?, ?, ?, ?) ON CONFLICT(user_id, day, service)"
+#                      " DO UPDATE SET bytes = bytes + excluded.bytes",
+#                      (owner["user_id"], day, key, n))
+#
+#
+#def prune_usage(store):
+#    """Drop what is older than each grain is kept for."""
+#    now_t = datetime.now(timezone.utc)
+#    for grain, days in USAGE_KEEP.items():
+#        cutoff = usage_buckets(now_t - timedelta(days=days))[grain]
+#        store.run("DELETE FROM usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
+#    cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
+#    store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
+#
+#
+#def usage_view(store, user, catalogue, with_services=True):
+#    """Everything a usage page draws, in one dict: the customer's page and the
+#    admin's user page both build from this."""
+#    uid = user["id"]
+#    now_t = datetime.now(timezone.utc)
+#
+#    def series(grain, since):
+#        cutoff = usage_buckets(since)[grain]
+#        return [(r["bucket"], r["up"], r["down"]) for r in store.q(
+#            "SELECT bucket, up, down FROM usage WHERE user_id = ? AND grain = ?"
+#            " AND bucket >= ? ORDER BY bucket", (uid, grain, cutoff))]
+#
+#    five = series("5m", now_t - timedelta(hours=24))
+#    hours = series("1h", now_t - timedelta(days=7))
+#    days = series("1d", now_t - timedelta(days=60))
+#
+#    # The latest five minutes that has anything in it, as a speed. Not
+#    # instantaneous - the relay reports every half minute - and said so.
+#    live = {"up_bps": 0, "down_bps": 0, "at": ""}
+#    current = usage_buckets(now_t)["5m"]
+#    if five and five[-1][0] == current:
+#        start = datetime.strptime(current, "%Y-%m-%dT%H:%M").replace(tzinfo=TEHRAN)
+#        took = max(30.0, (now_t - start).total_seconds())
+#        live = {"up_bps": int(five[-1][1] * 8 / took),
+#                "down_bps": int(five[-1][2] * 8 / took), "at": current}
+#
+#    today = usage_buckets(now_t)["1d"]
+#    by_day = {b: (u, d) for b, u, d in days}
+#
+#    def total(since_days, until_days=0):
+#        lo = usage_buckets(now_t - timedelta(days=since_days))["1d"]
+#        hi = usage_buckets(now_t - timedelta(days=until_days))["1d"]
+#        u = d = 0
+#        for b, (bu, bd) in by_day.items():
+#            if lo < b <= hi:
+#                u += bu
+#                d += bd
+#        return u, d
+#
+#    week, last_week = total(7), total(14, 7)
+#    month, last_month = total(30), total(60, 30)
+#
+#    # When the allowance runs out at the pace of the last seven days.
+#    runs_out = None
+#    quota, used = user["quota_bytes"] or 0, user["used_bytes"] or 0
+#    per_day = (week[0] + week[1]) / 7.0
+#    if quota and per_day > 0 and used < quota:
+#        runs_out = int((quota - used) / per_day)
+#
+#    out = {
+#        "five": five, "hours": hours, "days": days, "today": today,
+#        "live": live, "week": week, "last_week": last_week,
+#        "month": month, "last_month": last_month,
+#        "runs_out_days": runs_out,
+#        "expires": (user["expires_at"] or "")[:10],
+#        "quota": quota, "used": used,
+#    }
+#    if with_services:
+#        label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
+#        label.update({"_http": "دانلود کنسول و HTTP", "_dns": "DNS رمزگذاری‌شده",
+#                      "_other": "سایر"})
+#        cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
+#        out["services"] = [
+#            {"key": r["service"], "label": label.get(r["service"], r["service"]),
+#             "bytes": r["b"]}
+#            for r in store.q("SELECT service, SUM(bytes) b FROM usage_service"
+#                             " WHERE user_id = ? AND day >= ? GROUP BY service"
+#                             " ORDER BY b DESC", (uid, cutoff))]
+#    return out
+#
+#
+## ----------------------------------------------------------------- DoH
+#def doh_token(store, user):
+#    """The customer's personal DoH token, made the first time it is needed."""
+#    if user["doh_token"]:
+#        return user["doh_token"]
+#    token = secrets.token_urlsafe(16)
+#    store.run("UPDATE users SET doh_token = ? WHERE id = ? AND doh_token IS NULL",
+#              (token, user["id"]))
+#    row = store.one("SELECT doh_token FROM users WHERE id = ?", (user["id"],))
+#    return row["doh_token"]
+#
+#
+#def doh_hash(token):
+#    return hashlib.sha256(token.encode()).hexdigest()
+#
+#
+#def doh_view(store, user):
+#    host = store.setting("doh_host")
+#    if not host:
+#        return None
+#    return {"url": "https://%s/dns-query/%s" % (host, doh_token(store, user)),
+#            "dot_host": host}
+#
+#
+#def doh_tokens(store, profiles, default_id):
+#    """What the relays need to answer a personal address: the hash of each
+#    active customer's token, and the template whose resolver answers them.
+#
+#    Hashes, not tokens: a relay only has to recognise one, and a relay that
+#    is taken over should not hand out working addresses.
+#    """
+#    out = {}
+#    for u in store.q("SELECT id, doh_token, template_id FROM users"
+#                     " WHERE status = 'active'"):
+#        token = u["doh_token"] or doh_token(store, u)
+#        tid = str(u["template_id"] or default_id)
+#        out[doh_hash(token)] = {"uid": u["id"],
+#                                "profile": tid if tid in profiles else ""}
+#    return out
 #
 #
 ## ----------------------------------------------------------------- tickets
@@ -6046,7 +6551,12 @@ exit 0
 #                ip: int(v) for ip, v in counters.items() if valid_ip(ip) and int(v) >= 0
 #            }
 #            who = self.relay_name(body)
-#            self.store.fold_counters(who, clean)
+#            split = body.get("split") if isinstance(body.get("split"), dict) else None
+#            self.store.fold_counters(who, clean, split)
+#            try:
+#                record_services(self.store, body.get("services"), CATALOGUE)
+#            except Exception as e:
+#                log_exception("per-service usage not recorded: %r" % e)
 #            # The relay's own recent logs, now and then, for the logs page.
 #            if isinstance(body.get("logs"), str):
 #                tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
@@ -6068,6 +6578,20 @@ exit 0
 #            if re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url) and \
 #                    self.store.setting("customer_panel_url") != url:
 #                self.store.set_setting("customer_panel_url", url)
+#            # The same for DNS over HTTPS: which name has the certificate. Only
+#            # ever set, never cleared, so a second relay without DoH does not
+#            # flip it back and forth every half minute.
+#            doh_host = str(body.get("doh_host") or "")
+#            if doh_host and re.fullmatch(r"[a-z0-9.-]{3,253}", doh_host) and \
+#                    self.store.setting("doh_host") != doh_host:
+#                self.store.set_setting("doh_host", doh_host)
+#            # Which resolvers the relay asks and how the admin's last pick
+#            # went there, for the settings page. Written only when it changes.
+#            report = body.get("upstream")
+#            if isinstance(report, dict):
+#                text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
+#                if self.store.setting("upstream_state:" + who) != text:
+#                    self.store.set_setting("upstream_state:" + who, text)
 #            # The relay names itself by the address it connected from, so a
 #            # second relay appears on its own without any configuration.
 #            self.store.record_metrics(who, body.get("host") or {})
@@ -6077,6 +6601,13 @@ exit 0
 #                enforce_quotas(self.store)
 #            except Exception as e:
 #                log_exception("quota pass failed: %r" % e)
+#            # Once an hour is plenty for throwing away what is past keeping.
+#            if time.time() - PRUNED[0] > 3600:
+#                PRUNED[0] = time.time()
+#                try:
+#                    prune_usage(self.store)
+#                except Exception as e:
+#                    log_exception("usage prune failed: %r" % e)
 #            by_ip, profiles = self.store.profiles(CATALOGUE, DEFAULT_TEMPLATE[0])
 #            # The label goes into the nftables element as a comment, so that
 #            # `smartdns-acl list` on the relay is readable without the
@@ -6091,8 +6622,17 @@ exit 0
 #                       for ip, v in sorted(by_ip.items())]
 #            extra = [r["domain"] for r in self.store.q(
 #                "SELECT domain FROM custom_domains ORDER BY domain")]
+#            try:
+#                doh = doh_tokens(self.store, profiles, DEFAULT_TEMPLATE[0])
+#            except Exception as e:
+#                doh = {}
+#                log_exception("DoH tokens not built: %r" % e)
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
-#                                    "extra_domains": extra,
+#                                    "extra_domains": extra, "doh": doh,
+#                                    # The public resolvers the operator picked;
+#                                    # the relay checks them before it takes them.
+#                                    "upstream": (self.store.setting("dns_upstream")
+#                                                 or DEFAULT_UPSTREAM).split(),
 #                                    "templates": self.store.template_names(),
 #                                    "watch": watch_job(self.store),
 #                                    })
@@ -6119,6 +6659,13 @@ exit 0
 #            if not user:
 #                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
 #            return self.reply(200, link_code(self.store, user, body.get("password")))
+#        if self.path == "/user-usage":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            view = usage_view(self.store, user, CATALOGUE)
+#            view["ok"] = True
+#            return self.reply(200, view)
 #        if self.path == "/user-trial":
 #            user = self._session_user(body.get("session"))
 #            if not user:
@@ -6425,6 +6972,9 @@ exit 0
 #            "receipt_waiting": ({"at": waiting["created_at"][:16].replace("T", " "),
 #                                 "plan": waiting["name"] or ""}
 #                                if waiting else None),
+#            # The personal DoH address. The relay builds the full address from
+#            # its own name - it knows which relay the customer is looking at.
+#            "doh_token": doh_token(self.store, user),
 #        }
 #
 #
@@ -6524,6 +7074,10 @@ exit 0
 #        # customer's DNS has to point.
 #        "dns": list(relays),
 #        "trial": trial_view(store, user),
+#        # The personal encrypted-DNS addresses, for a bot to hand out: null
+#        # until a relay has DoH on. Like plain DNS they answer only on the
+#        # registered address; the token says whose template to answer from.
+#        "doh": doh_view(store, user),
 #        "tickets_answered": store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
 #                                      " AND status = 'answered'", (user["id"],))["c"],
 #        "receipt_waiting": ({"id": waiting["id"], "created_at": waiting["created_at"],
@@ -6725,6 +7279,7 @@ exit 0
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "add_receipt"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
@@ -7030,6 +7585,21 @@ exit 0
 #        res = login_link(self.store, user)
 #        return (200 if res["ok"] else 503), res
 #
+#    def api_usage(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        # Without the per-service part: a key is the operator's, and which
+#        # services a customer uses is the customer's to see on their own page.
+#        view = usage_view(self.store, user, CATALOGUE, with_services=False)
+#        view.pop("five", None)
+#        view["ok"] = True
+#        view["hours"] = [{"hour": b, "up": u, "down": d} for b, u, d in view["hours"]]
+#        view["days"] = [{"day": b, "up": u, "down": d} for b, u, d in view["days"]]
+#        for k in ("week", "last_week", "month", "last_month"):
+#            view[k] = {"up": view[k][0], "down": view[k][1]}
+#        return 200, view
+#
 #    def api_trial(self, body, tg):
 #        user, err = self.customer(tg)
 #        if err:
@@ -7217,6 +7787,8 @@ exit 0
 #
 #CATALOGUE = []
 #GAMES = []
+## When old usage was last thrown away.
+#PRUNED = [0.0]
 ## A one-element list so the API thread sees updates without a global statement.
 #DEFAULT_TEMPLATE = [0]
 #
@@ -7318,8 +7890,10 @@ exit 0
 #import http.server
 #import ipaddress
 #import json
+#import math
 #import os
 #import re
+#import socket
 #import ssl
 #import subprocess
 #import sys
@@ -7327,6 +7901,8 @@ exit 0
 #import time
 #import traceback
 #import urllib.parse
+#import uuid
+#from datetime import datetime, timedelta, timezone
 #
 #CONFIG = "/etc/smart-dns/sync.env"
 #ACL = "/usr/local/bin/smartdns-acl"
@@ -7895,7 +8471,8 @@ exit 0
 #        # itself - gosredirector.ea.com under a routed ea.com, say. Here the
 #        # subtraction does work: the profile's rule names a longer host than
 #        # the one hijacking the parent, so longest match prefers it.
-#        body += ["server=/%s/1.1.1.1" % d for d in spec.get("bypass", [])]
+#        # "#" is dnsmasq's "the usual resolvers": whatever upstream.conf says.
+#        body += ["server=/%s/#" % d for d in spec.get("bypass", [])]
 #        # Epic's pins, unless this template asked to route that backend. They
 #        # come last and are address= rules, so where they appear they win -
 #        # which is the point: a bypass sends the name to a public resolver,
@@ -7944,6 +8521,7 @@ exit 0
 #                  flush=True)
 #
 #    apply_redirects(ports, assignment, names)
+#    return ports
 #
 #
 ## Who was on which template at the last sync, so a move is logged once rather
@@ -8188,6 +8766,209 @@ exit 0
 #    return True
 #
 #
+## ------------------------------------------------------------------ DoH
+## What smartdns-doh needs to answer a query without asking anybody: which
+## resolver each personal address and each registered address belongs to, and
+## who is let in at all. Written here because this is where all of that is
+## already known, once per sync.
+#DOH_STATE = "/var/lib/smart-dns/doh.json"
+#ENFORCE_FILE = "/etc/nftables.d/30-smartdns-enforce.conf"
+#MAIN_DNS_PORT = 53
+#
+#
+#def write_doh_state(tokens, ports, assignment, allowed):
+#    ips = {ip: ports[prof] for ip, prof in assignment.items() if prof in ports}
+#    state = {
+#        # A customer whose template has no resolver running yet - nobody on it
+#        # had an address until now - is answered by the main one meanwhile.
+#        "tokens": {h: {"uid": t.get("uid"),
+#                       "port": ports.get(t.get("profile") or "", MAIN_DNS_PORT)}
+#                   for h, t in (tokens or {}).items()},
+#        "ips": ips,
+#        "allowed": sorted(allowed),
+#        "enforcing": os.path.exists(ENFORCE_FILE),
+#    }
+#    text = json.dumps(state, sort_keys=True)
+#    try:
+#        with open(DOH_STATE, encoding="utf-8") as fh:
+#            if fh.read() == text:
+#                return
+#    except OSError:
+#        pass
+#    tmp = DOH_STATE + ".tmp"
+#    with open(tmp, "w", encoding="utf-8") as fh:
+#        fh.write(text)
+#    os.chmod(tmp, 0o600)
+#    os.replace(tmp, DOH_STATE)
+#
+#
+## ---------------------------------------------------------------- upstream
+## The public resolvers everything this relay does not route is asked - by the
+## main resolver and, through the symlink in BASE_DIR, by every template's.
+## The admin panel picks them; this relay only takes a pick it has checked
+## answers from here, since a resolver that is fine from Frankfurt can be
+## filtered from Iran, and a relay that cannot resolve is a relay that is down.
+#UPSTREAM_CONF = "/etc/dnsmasq.d/upstream.conf"
+## How long a pick that did not fully work is left before it is tried again.
+#UPSTREAM_RETRY = 600
+#UPSTREAM = {"want": None, "tested": {}, "error": "", "at": 0.0}
+#
+#
+#def dns_probe(server, name="cloudflare.com", timeout=2.0):
+#    """How long `server` takes to answer an A query for `name`, in
+#    milliseconds; None when it does not answer, or answers with an error.
+#    Twice, so one lost packet does not condemn a resolver."""
+#    qid = os.urandom(2)
+#    query = (qid + bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+#             + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
+#             + bytes([0, 0, 1, 0, 1]))
+#    for _ in range(2):
+#        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#        s.settimeout(timeout)
+#        try:
+#            t0 = time.monotonic()
+#            s.sendto(query, (server, 53))
+#            while True:
+#                data, _ = s.recvfrom(4096)
+#                if len(data) >= 12 and data[:2] == qid:
+#                    break
+#            # An answer, no error, and at least one record in it.
+#            if data[2] & 0x80 and data[3] & 0x0F == 0 and (data[6] or data[7]):
+#                return max(1, int((time.monotonic() - t0) * 1000))
+#            return None
+#        except OSError:
+#            continue
+#        finally:
+#            s.close()
+#    return None
+#
+#
+#def current_upstream():
+#    try:
+#        with open(UPSTREAM_CONF) as fh:
+#            return [l.strip()[len("server="):] for l in fh
+#                    if l.strip().startswith("server=") and "/" not in l]
+#    except OSError:
+#        return []
+#
+#
+#def upstream_text(servers):
+#    return ("# generated by smartdns-sync from the admin panel's choice - do not edit\n"
+#            "no-resolv\n" + "".join("server=%s\n" % s for s in servers))
+#
+#
+#def wanted_upstream(raw):
+#    out = []
+#    for s in raw if isinstance(raw, list) else []:
+#        try:
+#            ip = ipaddress.IPv4Address(str(s))
+#        except ValueError:
+#            continue
+#        if ip.is_global and str(ip) not in out:
+#            out.append(str(ip))
+#    return out[:2]
+#
+#
+#def apply_upstream(raw):
+#    """Point the resolvers at what the panel picked; True when that changed
+#    something and every resolver on this machine needs a restart."""
+#    want = wanted_upstream(raw)
+#    if not want:
+#        return False
+#    if want == current_upstream():
+#        if UPSTREAM["want"] != want:
+#            UPSTREAM.update(want=want, error="", at=time.time())
+#        return False
+#    if want == UPSTREAM["want"] and time.time() - UPSTREAM["at"] < UPSTREAM_RETRY:
+#        return False
+#    tested = {s: dns_probe(s) for s in want}
+#    UPSTREAM.update(want=want, tested=tested, at=time.time())
+#    if tested[want[0]] is None:
+#        UPSTREAM["error"] = "%s از این رله جواب نداد؛ همان قبلی ماند" % want[0]
+#        log(WARN, "resolvers %s not taken: %s does not answer from here"
+#            % (" ".join(want), want[0]))
+#        return False
+#    use = [s for s in want if tested[s] is not None]
+#    UPSTREAM["error"] = ("" if use == want else
+#                         "%s از این رله جواب نداد؛ بدون آن اعمال شد" % want[1])
+#    try:
+#        with open(UPSTREAM_CONF) as fh:
+#            old = fh.read()
+#    except OSError:
+#        old = None
+#    with open(UPSTREAM_CONF + ".tmp", "w") as fh:
+#        fh.write(upstream_text(use))
+#    os.replace(UPSTREAM_CONF + ".tmp", UPSTREAM_CONF)
+#    if sh("dnsmasq", "--test").returncode != 0:
+#        # Cannot happen with two addresses, but a resolver that will not
+#        # start is the one thing this must never leave behind.
+#        if old is None:
+#            os.unlink(UPSTREAM_CONF)
+#        else:
+#            with open(UPSTREAM_CONF, "w") as fh:
+#                fh.write(old)
+#        UPSTREAM["error"] = "dnsmasq نپذیرفت؛ همان قبلی ماند"
+#        return False
+#    sh("systemctl", "restart", "dnsmasq")
+#    log(INFO, "resolvers now %s" % " ".join(use))
+#    return True
+#
+#
+#def upstream_report():
+#    return {"want": UPSTREAM["want"], "applied": current_upstream(),
+#            "tested": UPSTREAM["tested"], "error": UPSTREAM["error"]}
+#
+#
+## ---------------------------------------------------------------- usage
+## Where nginx writes it; see the note in relay-nginx.conf on why /run.
+#USAGE_LOG = "/run/smartdns-usage"
+#USAGE_TAKEN = USAGE_LOG + ".taken"
+## What was read but not yet delivered, so a sync that fails does not lose it.
+#USAGE_PENDING = {}
+#
+#
+#def take_usage():
+#    """What customers' connections asked for since last time: {ip: {name: bytes}}.
+#
+#    The file nginx is writing is moved aside and nginx told to start a new
+#    one; what was moved aside last time - when nginx had long since let go of
+#    it - is read, added up and deleted. So a line lives about a minute, and
+#    what leaves this machine is totals per name, never a list of visits.
+#    """
+#    if os.path.exists(USAGE_TAKEN):
+#        try:
+#            with open(USAGE_TAKEN, encoding="utf-8", errors="replace") as fh:
+#                for line in fh:
+#                    parts = line.split()
+#                    if len(parts) == 5:
+#                        ip, port, name, sent, got = parts
+#                    elif len(parts) == 4:          # no name was asked for
+#                        ip, port, sent, got = parts
+#                        name = "-"
+#                    else:
+#                        continue
+#                    if not name or name == "-":
+#                        name = ":" + port
+#                    try:
+#                        n = int(sent) + int(got)
+#                    except ValueError:
+#                        continue
+#                    per = USAGE_PENDING.setdefault(ip, {})
+#                    per[name] = per.get(name, 0) + n
+#        finally:
+#            try:
+#                os.remove(USAGE_TAKEN)
+#            except OSError:
+#                pass
+#    if os.path.exists(USAGE_LOG):
+#        try:
+#            os.replace(USAGE_LOG, USAGE_TAKEN)
+#            sh("nginx", "-s", "reopen")
+#        except OSError as e:
+#            log(WARN, "usage log not rotated: %s" % e)
+#    return dict(USAGE_PENDING)
+#
+#
 #def sync_once():
 #    rows = current_state()
 #    counters = {r["ip"]: r["total"] for r in rows}
@@ -8205,7 +8986,22 @@ exit 0
 #    url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
 #           if CFG.get("PANEL_DOMAIN") else "")
 #    payload = {"counters": counters, "host": host, "relay": CFG["SELF_IP"],
-#               "panel_url": url}
+#               "panel_url": url,
+#               # The name a bot should give out for DoH and DoT, once this
+#               # relay has the certificate for it; empty until then.
+#               "doh_host": (CFG.get("PANEL_DOMAIN") or "") if os.path.exists(DOH_FLAG) else "",
+#               # Upload and download apart, for the customer's charts. The
+#               # total above is still what the bill is made from.
+#               "split": {r["ip"]: [r.get("up", 0), r.get("down", 0)] for r in rows},
+#               # Which resolvers this relay asks, and how the last pick went.
+#               "upstream": upstream_report()}
+#    try:
+#        services = take_usage()
+#    except Exception as e:
+#        services = {}
+#        log(WARN, "usage not read: %s" % e)
+#    if services:
+#        payload["services"] = services
 #    if logs_due():
 #        payload["logs"] = recent_logs()
 #        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
@@ -8214,6 +9010,8 @@ exit 0
 #    if finished:
 #        payload["watch_result"] = finished
 #    answer = post("/sync", payload)
+#    if services:
+#        USAGE_PENDING.clear()
 #    # Delivered: the panel has it, so it is not sent again.
 #    if finished and WATCH_DONE["result"] is finished:
 #        WATCH_DONE["result"] = None
@@ -8238,13 +9036,25 @@ exit 0
 #    # allowlist below, so an address is pointed at the right resolver no later
 #    # than the moment it is let in.
 #    try:
+#        new_upstream = apply_upstream(answer.get("upstream"))
+#    except Exception as e:
+#        new_upstream = False
+#        log_exception("resolvers not applied: %s" % e)
+#    try:
 #        changed = apply_custom_domains(answer.get("extra_domains") or [])
 #        assignment = {a["ip"]: a.get("profile", "")
 #                      for a in answer.get("allowed", []) if a.get("profile")}
-#        apply_profiles(answer.get("profiles") or {}, assignment, restart=changed,
-#                       names=(answer.get("templates") or {}).get("names"))
+#        ports = apply_profiles(answer.get("profiles") or {}, assignment,
+#                               restart=changed or new_upstream,
+#                               names=(answer.get("templates") or {}).get("names"))
 #    except Exception as e:
+#        ports = {}
+#        assignment = {}
 #        log_exception("profiles failed: %s" % e)
+#    try:
+#        write_doh_state(answer.get("doh"), ports or {}, assignment, want)
+#    except Exception as e:
+#        log_exception("DoH state not written: %s" % e)
 #
 #    try:
 #        apply_speeds(answer.get("allowed") or [])
@@ -8429,8 +9239,42 @@ exit 0
 #details.pw[open]>summary::before{content:'▾'}
 #details.pw form{padding:0 16px 4px}
 #details.pw .note{padding:0 16px 14px;margin-top:8px}
+#details.pw h3{font-size:13px;margin:18px 16px 6px;color:var(--fg)}
+#details.pw>.btn{margin:0 16px;width:calc(100% - 32px)}
+#details.pw>.msg{margin:0 16px 12px}
+#.copy{display:flex;gap:6px;margin:0 16px 10px}
+#.copy input{flex:1;min-width:0;direction:ltr;font-size:12px;padding:9px 10px}
+#.copy button{width:auto;padding:8px 14px;margin:0;font-size:12px;flex:none}
+#button.small{width:auto;padding:6px 12px;margin:0;font-size:12px}
 #.ok{color:var(--accent)}.bad{color:var(--bad)}.warn{color:var(--warn)}
 #.shell{width:100%;max-width:440px}
+#.shell:has(.usage){max-width:600px}
+#h2{font-size:14px;font-weight:600;margin:26px 0 8px}
+#.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;
+# margin:14px 0 16px}
+#.tile{border:1px solid var(--line);border-radius:12px;padding:10px 14px;background:var(--bg)}
+#.tile .k{display:block;font-size:12px}
+#.tile .v{display:block;font-size:17px}
+#.tile small{display:block;color:var(--muted);font-size:11px;min-height:1em}
+#.legend{display:flex;gap:16px;font-size:12px;color:var(--dim);margin-bottom:4px}
+#.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-left:6px;
+# vertical-align:-1px}
+#svg.chart{display:block;width:100%;height:auto;direction:ltr}
+#svg.chart .grid{stroke:var(--row);stroke-width:1}
+#svg.chart .base{stroke:var(--line2);stroke-width:1}
+#svg.chart .axis{fill:var(--muted);font-size:13px;font-family:inherit}
+#.svcs{display:flex;flex-direction:column;gap:8px}
+#.svc{display:grid;grid-template-columns:minmax(90px,34%) 1fr auto;gap:10px;
+# align-items:center;font-size:13px}
+#.svc .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#.svc .track{height:10px;background:var(--track);border-radius:4px;overflow:hidden}
+#.svc .track i{display:block;height:100%;background:var(--accent2);border-radius:4px 0 0 4px}
+#.svc .num{color:var(--muted);font-size:12px;white-space:nowrap}
+#table.tbl{width:calc(100% - 32px);margin:0 16px 14px;border-collapse:collapse;font-size:12px}
+#table.tbl th,table.tbl td{padding:6px 4px;border-bottom:1px solid var(--row);text-align:right}
+#table.tbl th{color:var(--muted);font-weight:400}
+#.ping{padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);
+# font-size:13px}
 #.brand{text-align:center;margin:0 0 18px;direction:ltr;line-height:1.15}
 #.brand .mark{font-size:30px;vertical-align:middle;margin-right:8px}
 #.brand .name{display:inline-block;vertical-align:middle;font-size:clamp(32px,10vw,42px);
@@ -8936,6 +9780,436 @@ exit 0
 #        n /= 1024
 #
 #
+## ---------------------------------------------------------------- DoH page
+#def doh_url(info):
+#    """The customer's personal DNS-over-HTTPS address, on this relay's name."""
+#    token = info.get("doh_token") or ""
+#    host = CFG.get("PANEL_DOMAIN") or ""
+#    if not token or not host or not os.path.exists(DOH_FLAG):
+#        return ""
+#    return "https://%s/dns-query/%s" % (host, token)
+#
+#
+#def doh_token_known(token):
+#    """Whether a token is a customer's current one, by the hashes the panel
+#    sends - so the setup page cannot be used to guess at accounts."""
+#    try:
+#        with open(DOH_STATE, encoding="utf-8") as fh:
+#            tokens = json.load(fh).get("tokens") or {}
+#    except (OSError, ValueError):
+#        return False
+#    return hashlib.sha256(token.encode()).hexdigest() in tokens
+#
+#
+## Present when the installer turned DoH on for this relay.
+#DOH_FLAG = "/etc/smart-dns/doh"
+#
+#
+#def copy_field(value, label):
+#    """A value with a button that copies it. The field is selectable too, for
+#    a browser that will not let a page write to the clipboard."""
+#    v = html.escape(value)
+#    return ("<div class='copy'><input readonly value='%s' onclick='this.select()'"
+#            " aria-label='%s'><button type='button' class='ghost'"
+#            " onclick=\"var i=this.previousElementSibling;i.select();"
+#            "try{navigator.clipboard.writeText(i.value);this.textContent='کپی شد'}"
+#            "catch(e){document.execCommand('copy')}\">کپی</button></div>"
+#            % (v, html.escape(label)))
+#
+#
+#def windows_command(url):
+#    """PowerShell for Windows 11: register the address as the DoH template
+#    for this relay, and point every connected adapter at the relay."""
+#    me = CFG.get("SELF_IP") or ""
+#    return ('Add-DnsClientDohServerAddress -ServerAddress %s -DohTemplate "%s"'
+#            ' -AllowFallbackToUdp $false -AutoUpgrade $true; '
+#            'Get-NetAdapter | Where-Object Status -eq Up | '
+#            'Set-DnsClientServerAddress -ServerAddresses %s' % (me, url, me))
+#
+#
+#def doh_box(info, profile="/doh.mobileconfig", setup=False):
+#    """The encrypted-DNS section: folded away on the account page, open on
+#    the setup page a browser that opened the DoH address is sent to."""
+#    url = doh_url(info)
+#    if not url:
+#        return ""
+#    host = CFG.get("PANEL_DOMAIN") or ""
+#    return (
+#        "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده — وقتی اپراتور DNS را "
+#        "دست‌کاری می‌کند</summary>" % (" open" if setup else "") +
+#        "<p class='note'>برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند: "
+#        "همان سرویس، از راه رمزگذاری‌شده. مثل DNS معمولی فقط روی اینترنتی کار "
+#        "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله "
+#        "می‌گوید قالب شما کدام است.</p>"
+#        "<h3>DoH — DNS over HTTPS</h3>"
+#        + copy_field(url, "آدرس DoH شخصی") +
+#        # DoT has no path to carry a token: the relay answers it from the
+#        # template of the registered address it arrives from.
+#        "<h3>DoT — DNS over TLS</h3>"
+#        + copy_field(host, "نام DoT") +
+#        "<p class='note'>پورت ۸۵۳. برای Private DNS اندروید، و برنامه‌ها و مودم‌هایی "
+#        "که DoT دارند؛ بعضی‌ها آن را به شکل <code>tls://%s</code> می‌خواهند.</p>"
+#        % html.escape(host) +
+#        "<h3>آیفون و آیپد</h3>"
+#        "<a class='btn ghost' href='%s'>دریافت پروفایل</a>" % html.escape(profile) +
+#        "<p class='note'>بعد از دانلود: تنظیمات ← پروفایل دانلودشده ← نصب.</p>"
+#        "<h3>اندروید</h3>"
+#        "<p class='note'>در کروم: تنظیمات ← حریم خصوصی و امنیت ← استفاده از DNS امن "
+#        "← سفارشی، و آدرس DoH را بگذارید. یا برای کل گوشی: تنظیمات ← Private DNS ← "
+#        "نام میزبان، و نام DoT بالا را بگذارید.</p>"
+#        "<h3>ویندوز ۱۱</h3>"
+#        "<p class='note'>PowerShell را با Run as administrator باز کنید و این را "
+#        "بزنید:</p>" + copy_field(windows_command(url), "دستور ویندوز") +
+#        "<h3>فایرفاکس</h3>"
+#        "<p class='note'>Settings ← Privacy &amp; Security ← DNS over HTTPS ← Max "
+#        "Protection ← Custom، و آدرس DoH.</p>"
+#        "</details>")
+#
+#
+#def mobileconfig(info):
+#    """An iOS/macOS profile that turns the personal address on for the whole
+#    device. The UUIDs come from the token, so downloading it again replaces
+#    the profile rather than adding a second one."""
+#    url = doh_url(info)
+#    token = info.get("doh_token") or ""
+#    one = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-payload:" + token)).upper()
+#    two = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-profile:" + token)).upper()
+#    name = html.escape(brand())
+#    me = html.escape(CFG.get("SELF_IP") or "")
+#    return ("""<?xml version="1.0" encoding="UTF-8"?>
+#<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+#<plist version="1.0">
+#<dict>
+#  <key>PayloadContent</key>
+#  <array>
+#    <dict>
+#      <key>DNSSettings</key>
+#      <dict>
+#        <key>DNSProtocol</key>
+#        <string>HTTPS</string>
+#        <key>ServerURL</key>
+#        <string>%s</string>
+#        <key>ServerAddresses</key>
+#        <array><string>%s</string></array>
+#      </dict>
+#      <key>PayloadDisplayName</key>
+#      <string>%s DNS</string>
+#      <key>PayloadIdentifier</key>
+#      <string>com.doctordns.dns.%s</string>
+#      <key>PayloadType</key>
+#      <string>com.apple.dnsSettings.managed</string>
+#      <key>PayloadUUID</key>
+#      <string>%s</string>
+#      <key>PayloadVersion</key>
+#      <integer>1</integer>
+#    </dict>
+#  </array>
+#  <key>PayloadDisplayName</key>
+#  <string>%s</string>
+#  <key>PayloadIdentifier</key>
+#  <string>com.doctordns.profile.%s</string>
+#  <key>PayloadRemovalDisallowed</key>
+#  <false/>
+#  <key>PayloadType</key>
+#  <string>Configuration</string>
+#  <key>PayloadUUID</key>
+#  <string>%s</string>
+#  <key>PayloadVersion</key>
+#  <integer>1</integer>
+#</dict>
+#</plist>
+#""" % (html.escape(url), me, name, one, one, name, two, two))
+#
+#
+## Tehran has kept +03:30 all year since 2022; the panel buckets by it too.
+#TEHRAN = timezone(timedelta(hours=3, minutes=30))
+#
+#
+## ---------------------------------------------------------------- usage page
+## Charts drawn here as SVG, so the page loads nothing from anywhere else.
+## Download is the relay's blue and upload its green: the same two colours in
+## both themes' own shades, checked for colour-blind separation (protan and
+## deutan both above 20) and for contrast against the card (above 5).
+## Every mark carries a <title>, which is the hover on a phone as much as on a
+## desktop, and every chart has its numbers in a table underneath.
+#DOWN, UP = "var(--accent2)", "var(--accent)"
+#
+#
+#def mbit(bps):
+#    return "%.1f" % (bps / 1e6) if bps < 1e8 else "%.0f" % (bps / 1e6)
+#
+#
+#def short_size(n):
+#    n = float(n or 0)
+#    for unit in ("B", "KB", "MB", "GB", "TB"):
+#        if n < 1024 or unit == "TB":
+#            return ("%d %s" if unit == "B" or n == int(n) else "%.1f %s") % (n, unit)
+#        n /= 1024
+#
+#
+#def nice_max(v):
+#    """A round number at least as big as v, for the top of an axis."""
+#    if v <= 0:
+#        return 1
+#    mag = 10 ** math.floor(math.log10(v))
+#    for step in (1, 2, 2.5, 5, 10):
+#        if v <= step * mag:
+#            return step * mag
+#    return 10 * mag
+#
+#
+#def nice_bytes(v):
+#    """nice_max in the unit the axis will print, so the top reads 50 GB and
+#    not 46.6 GB."""
+#    unit = 1
+#    while v / unit >= 1024 and unit < 1024 ** 4:
+#        unit *= 1024
+#    return nice_max(v / float(unit)) * unit
+#
+#
+#def top_rounded(x, y, w, h, r=4):
+#    """A bar whose far end is rounded and whose base sits square on the axis."""
+#    r = min(r, w / 2.0, h)
+#    if h <= 0:
+#        return ""
+#    return ("M%.1f %.1fv%.1fh%.1fv%.1fq0 %.1f %.1f %.1fh%.1fq%.1f 0 %.1f %.1fz"
+#            % (x, y + h, -(h - r), w, h - r, -r, -r, -r, -(w - 2 * r), -r, -r, r))
+#
+#
+#def legend():
+#    return ("<div class='legend'><span><i style='background:%s'></i>دانلود</span>"
+#            "<span><i style='background:%s'></i>آپلود</span></div>" % (DOWN, UP))
+#
+#
+#def days_chart(days, n=30):
+#    """The last n days as stacked bars: download below, upload on top."""
+#    now_day = datetime.now(TEHRAN).date()
+#    by = {b: (u, d) for b, u, d in days}
+#    rows = []
+#    for i in range(n - 1, -1, -1):
+#        day = now_day - timedelta(days=i)
+#        u, d = by.get(day.strftime("%Y-%m-%d"), (0, 0))
+#        rows.append((day, u, d))
+#    W, H, L, B = 420, 170, 58, 22
+#    top = nice_bytes(max((u + d) for _, u, d in rows) or 1)
+#    slot = (W - L) / float(n)
+#    bw = max(3, slot - 2)
+#    out = ["<svg viewBox='0 0 %d %d' class='chart' role='img' aria-label='مصرف روزانه'>" % (W, H)]
+#    for frac in (0.5, 1.0):
+#        y = (H - B) - frac * (H - B - 8)
+#        out.append("<line x1='%d' x2='%d' y1='%.1f' y2='%.1f' class='grid'/>"
+#                   "<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
+#                   % (L, W, y, y, L - 6, y + 4, short_size(top * frac)))
+#    out.append("<line x1='%d' x2='%d' y1='%d' y2='%d' class='base'/>" % (L, W, H - B, H - B))
+#    scale = (H - B - 8) / float(top)
+#    for i, (day, u, d) in enumerate(rows):
+#        x = L + i * slot + (slot - bw) / 2
+#        hd, hu = d * scale, u * scale
+#        base = H - B
+#        tip = "%s — دانلود %s، آپلود %s" % (day.strftime("%m/%d"), human_fa(d), human_fa(u))
+#        out.append("<g><title>%s</title>" % html.escape(tip))
+#        if hu >= 1 and hd >= 1:
+#            # Download square on the base, a 2px gap of card, upload rounded on top.
+#            out.append("<rect x='%.1f' y='%.1f' width='%.1f' height='%.1f' fill='%s'/>"
+#                       % (x, base - hd, bw, hd, DOWN))
+#            out.append("<path d='%s' fill='%s'/>" % (top_rounded(x, base - hd - 2 - hu, bw, hu), UP))
+#        elif hd + hu >= 1:
+#            colour = DOWN if hd >= hu else UP
+#            out.append("<path d='%s' fill='%s'/>" % (top_rounded(x, base - hd - hu, bw, hd + hu), colour))
+#        # A hit target the size of the slot, so a thumb finds the tooltip.
+#        out.append("<rect x='%.1f' y='0' width='%.1f' height='%d' fill='transparent'/></g>"
+#                   % (L + i * slot, slot, H - B))
+#        if i % 5 == 4 or i == n - 1:
+#            last = i == n - 1
+#            out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
+#                       % (x + bw if last else x + bw / 2, H - 6,
+#                          "end" if last else "middle", day.strftime("%m/%d")))
+#    out.append("</svg>")
+#    return "".join(out), rows
+#
+#
+#def speed_chart(five):
+#    """The last day's average speed, five minutes at a time."""
+#    now_t = datetime.now(TEHRAN).replace(second=0, microsecond=0)
+#    start = now_t - timedelta(hours=24)
+#    by = {b: (u, d) for b, u, d in five}
+#    pts = []
+#    t = start.replace(minute=start.minute - start.minute % 5)
+#    while t <= now_t:
+#        u, d = by.get(t.strftime("%Y-%m-%dT%H:%M"), (0, 0))
+#        pts.append((t, u * 8 / 300.0, d * 8 / 300.0))
+#        t += timedelta(minutes=5)
+#    W, H, L, B = 420, 160, 68, 22
+#    top = nice_max(max(max(u, d) for _, u, d in pts) or 1)
+#    span = float(len(pts) - 1 or 1)
+#    out = ["<svg viewBox='0 0 %d %d' class='chart' role='img' aria-label='سرعت ۲۴ ساعت'>" % (W, H)]
+#    for frac in (0.5, 1.0):
+#        y = (H - B) - frac * (H - B - 8)
+#        out.append("<line x1='%d' x2='%d' y1='%.1f' y2='%.1f' class='grid'/>"
+#                   "<text x='%d' y='%.1f' class='axis' text-anchor='end'>%g Mbps</text>"
+#                   % (L, W, y, y, L - 6, y + 4, top * frac / 1e6))
+#    out.append("<line x1='%d' x2='%d' y1='%d' y2='%d' class='base'/>" % (L, W, H - B, H - B))
+#
+#    def xy(i, v):
+#        return (L + (W - L) * i / span, (H - B) - v / top * (H - B - 8))
+#
+#    for idx, colour in ((2, DOWN), (1, UP)):
+#        line = " ".join("%.1f,%.1f" % xy(i, p[idx]) for i, p in enumerate(pts))
+#        out.append("<polyline points='%s' fill='none' stroke='%s' stroke-width='2'"
+#                   " stroke-linejoin='round'/>" % (line, colour))
+#    # One hit target per half hour, with both numbers, so the hover reads the
+#    # pair at once instead of making the reader find the other line.
+#    step = 6
+#    for i in range(0, len(pts), step):
+#        chunk = pts[i:i + step]
+#        t0 = chunk[0][0]
+#        d = max(p[2] for p in chunk)
+#        u = max(p[1] for p in chunk)
+#        x0 = xy(i, 0)[0]
+#        x1 = xy(min(i + step, len(pts) - 1), 0)[0]
+#        out.append("<rect x='%.1f' y='0' width='%.1f' height='%d' fill='transparent'>"
+#                   "<title>%s — دانلود تا %s، آپلود تا %s مگابیت</title></rect>"
+#                   % (x0, max(1, x1 - x0), H - B, t0.strftime("%H:%M"), mbit(d), mbit(u)))
+#    for hours_back in (24, 18, 12, 6, 0):
+#        i = len(pts) - 1 - hours_back * 12
+#        if 0 <= i < len(pts):
+#            anchor = "end" if hours_back == 0 else "start" if hours_back == 24 else "middle"
+#            out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
+#                       % (xy(i, 0)[0], H - 6, anchor, pts[i][0].strftime("%H:%M")))
+#    out.append("</svg>")
+#    return "".join(out)
+#
+#
+#def heat_chart(hours):
+#    """The last seven days hour by hour, darker for more - when this account
+#    is busy. One hue, getting stronger, since it is only ever 'how much'."""
+#    by = {}
+#    for b, u, d in hours:
+#        by[b] = u + d
+#    today = datetime.now(TEHRAN).date()
+#    days = [today - timedelta(days=i) for i in range(6, -1, -1)]
+#    peak = max(by.values() or [1]) or 1
+#    W, H, L, T = 420, 7 * 22 + 24, 46, 4
+#    cw = (W - L) / 24.0
+#    out = ["<svg viewBox='0 0 %d %d' class='chart' role='img' aria-label='ساعت‌های پرمصرف'>" % (W, H)]
+#    for r, day in enumerate(days):
+#        y = T + r * 22
+#        out.append("<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
+#                   % (L - 6, y + 14, day.strftime("%m/%d")))
+#        for h in range(24):
+#            key = "%sT%02d:00" % (day.strftime("%Y-%m-%d"), h)
+#            v = by.get(key, 0)
+#            level = 0 if not v else 0.18 + 0.82 * (v / float(peak))
+#            out.append("<rect x='%.1f' y='%d' width='%.1f' height='18' rx='3' fill='%s'"
+#                       " fill-opacity='%.2f'><title>%s ساعت %02d — %s</title></rect>"
+#                       % (L + h * cw + 1, y, cw - 2, DOWN if v else "var(--line)",
+#                          level if v else 1, day.strftime("%m/%d"), h, human_fa(v)))
+#    for h in (0, 6, 12, 18, 23):
+#        out.append("<text x='%.1f' y='%d' class='axis' text-anchor='middle'>%02d</text>"
+#                   % (L + h * cw + cw / 2, H - 4, h))
+#    out.append("</svg>")
+#    return "".join(out)
+#
+#
+#def services_list(services):
+#    """What the traffic went to, biggest first, as plain bars: one measure,
+#    one colour, the number written beside each."""
+#    if not services:
+#        return ("<p class='note'>هنوز چیزی نیست. چند دقیقه بعد از اولین استفاده "
+#                "این‌جا پر می‌شود.</p>")
+#    top = max(s["bytes"] for s in services) or 1
+#    total = sum(s["bytes"] for s in services) or 1
+#    out = ["<div class='svcs'>"]
+#    for s in services[:12]:
+#        pct = 100.0 * s["bytes"] / total
+#        out.append("<div class='svc'><span class='name'>%s</span>"
+#                   "<span class='track'><i style='width:%.1f%%'></i></span>"
+#                   "<span class='num'>%s · %s٪</span></div>"
+#                   % (html.escape(s["label"]), 100.0 * s["bytes"] / top,
+#                      human_fa(s["bytes"]), "%.0f" % pct if pct >= 1 else "&lt;1"))
+#    out.append("</div>")
+#    return "".join(out)
+#
+#
+#def change_line(now_pair, before_pair, word):
+#    now_v, before_v = sum(now_pair), sum(before_pair)
+#    if not before_v:
+#        return ""
+#    pct = 100.0 * (now_v - before_v) / before_v
+#    if abs(pct) < 5:
+#        return "تقریباً همان %s قبل" % word
+#    return "%d٪ %s از %s قبل" % (abs(pct), "بیشتر" if pct > 0 else "کمتر", word)
+#
+#
+#def usage_page(view):
+#    live = view.get("live") or {}
+#    week, month = view.get("week") or (0, 0), view.get("month") or (0, 0)
+#    days_svg, day_rows = days_chart(view.get("days") or [])
+#    tiles = [
+#        ("سرعت الان", "<span dir='ltr'>↓ %s · ↑ %s</span>"
+#         % (mbit(live.get("down_bps", 0)), mbit(live.get("up_bps", 0))),
+#         "مگابیت بر ثانیه، میانگین ۵ دقیقهٔ اخیر"),
+#        ("۷ روز اخیر", human_fa(sum(week)),
+#         change_line(week, view.get("last_week") or (0, 0), "هفتهٔ")),
+#        ("۳۰ روز اخیر", human_fa(sum(month)),
+#         change_line(month, view.get("last_month") or (0, 0), "ماه")),
+#    ]
+#    out = ["<div class='usage'></div><h1>مصرف شما</h1>",
+#           "<p class='sub'><a href='/'>‹ برگشت به حساب</a></p>",
+#           "<div class='tiles'>"]
+#    for k, v, note in tiles:
+#        out.append("<div class='tile'><span class='k'>%s</span><span class='v'>%s</span>"
+#                   "<small>%s</small></div>" % (k, v, html.escape(note)))
+#    out.append("</div>")
+#
+#    # When the allowance runs out at this week's pace - worth a line only
+#    # when that is before the period ends, or when there is no end to it.
+#    days_left = view.get("runs_out_days")
+#    to_end = None
+#    try:
+#        end = datetime.strptime(view.get("expires") or "", "%Y-%m-%d").date()
+#        to_end = (end - datetime.now(TEHRAN).date()).days
+#    except ValueError:
+#        pass
+#    if days_left is not None and to_end is not None and days_left < to_end:
+#        out.append("<div class='msg warnbox'>با مصرف هفتهٔ اخیر، حجم باقی‌مانده حدود "
+#                   "<b>%d روز</b> دیگر تمام می‌شود — <b>%d روز قبل از پایان دوره</b>.</div>"
+#                   % (days_left, to_end - days_left))
+#    elif days_left is not None and to_end is not None:
+#        out.append("<div class='msg good'>با مصرف هفتهٔ اخیر، حجم تا پایان دوره کافی است.</div>")
+#    elif days_left is not None and days_left <= 365:
+#        out.append("<div class='msg good'>با مصرف هفتهٔ اخیر، حجم باقی‌مانده حدود "
+#                   "<b>%d روز</b> دیگر کافی است.</div>" % days_left)
+#
+#    out.append("<h2>روزانه</h2>" + legend() + days_svg)
+#    table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
+#                    % (d.strftime("%m/%d"), human_fa(dn), human_fa(u))
+#                    for d, u, dn in reversed(day_rows) if u or dn)
+#    if table:
+#        out.append("<details class='pw'><summary>جدول روزانه</summary>"
+#                   "<table class='tbl'><tr><th>روز</th><th>دانلود</th><th>آپلود</th></tr>"
+#                   "%s</table></details>" % table)
+#    out.append("<h2>سرعت ۲۴ ساعت اخیر</h2>" + legend() + speed_chart(view.get("five") or []))
+#    out.append("<p class='note'>میانگین هر ۵ دقیقه. رله هر نیم دقیقه گزارش می‌دهد، "
+#               "پس اوج لحظه‌ای کوتاه در این نمودار دیده نمی‌شود.</p>")
+#    out.append("<h2>ساعت‌های پرمصرف — ۷ روز اخیر</h2>" + heat_chart(view.get("hours") or []))
+#    out.append("<h2>به تفکیک سرویس — ۳۰ روز اخیر</h2>" + services_list(view.get("services")))
+#    out.append("<p class='note'>فقط خودتان این را می‌بینید. چیزی که نگه داشته می‌شود "
+#               "فقط «کدام سرویس، کدام روز، چقدر» است — نه اینکه چه سایتی را کِی باز "
+#               "کرده‌اید — و بعد از ۳۰ روز پاک می‌شود. «دانلود کنسول و HTTP» بیشتر "
+#               "دانلود بازی‌های پلی‌استیشن و ایکس‌باکس است.</p>")
+#    out.append("<h2>کیفیت اتصال</h2><div class='ping' id='ping'>در حال اندازه‌گیری…</div>"
+#               "<script>(function(){var t=[],n=0,el=document.getElementById('ping');"
+#               "function go(){var s=performance.now();fetch('/ping?'+n,{cache:'no-store'})"
+#               ".then(function(){t.push(performance.now()-s);next()},function(){next()})}"
+#               "function next(){n++;if(n<6){go();return}t.shift();t.sort(function(a,b){return a-b});"
+#               "if(!t.length){el.textContent='اندازه‌گیری نشد';return}"
+#               "var m=Math.round(t[Math.floor(t.length/2)]);"
+#               "el.innerHTML='پینگ شما تا سرور: <b>'+m+' میلی‌ثانیه</b> — '+"
+#               "(m<60?'عالی':m<120?'خوب':'ضعیف؛ اینترنت شما تا سرور کند است')}go()})()</script>")
+#    return "".join(out)
+#
+#
 #class UserPanel(http.server.BaseHTTPRequestHandler):
 #    """The page a customer sees.
 #
@@ -9096,6 +10370,20 @@ exit 0
 #        if path == "/logout":
 #            return self.send("", 303, {"Location": "/",
 #                                       "Set-Cookie": "sdu=; Path=/; Max-Age=0"})
+#
+#        if path == "/doh.mobileconfig":
+#            return self.send_profile()
+#
+#        if path.startswith("/doh-setup/"):
+#            return self.doh_setup(path)
+#
+#        if path == "/usage":
+#            return self.usage()
+#
+#        if path == "/ping":
+#            # For the connection check on the usage page: as little as the
+#            # server can answer, so the time measured is the line's.
+#            return self.send("", 204, {"Cache-Control": "no-store"})
 #
 #        if path.startswith("/go/"):
 #            # Not signed in here: a link preview fetching this address must
@@ -9476,6 +10764,59 @@ exit 0
 #        return self.redirect("/ticket?id=%d" % res.get("ticket_id", tid),
 #                             res.get("message", ""))
 #
+#    def usage(self):
+#        token = self.session()
+#        if not token:
+#            return self.redirect("/login")
+#        try:
+#            view = post("/user-usage", {"session": token})
+#        except Exception as e:
+#            log(ERROR, "panel: user-usage failed: %s" % e)
+#            return self.send_html(NOT_NOW, 502)
+#        if not view.get("ok"):
+#            return self.redirect("/")
+#        return self.send_html(usage_page(view))
+#
+#    def doh_setup(self, path):
+#        """Where nginx sends a browser that opened the DoH address - which
+#        would otherwise only say a query is missing. The token is what signs it in, the way it is
+#        what the DoH address itself runs on: nothing of the account is shown
+#        but the addresses, and a profile to install them."""
+#        last = path.rsplit("/", 1)[1]
+#        profile = last.endswith(".mobileconfig")
+#        token = last[:-len(".mobileconfig")] if profile else last
+#        info = {"doh_token": token}
+#        if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", token) or not doh_token_known(token) \
+#                or not doh_url(info):
+#            return self.send_html(
+#                "<div class='icon'>🔒</div><h1>این آدرس معتبر نیست</h1>"
+#                "<p class='sub'>آدرس تازه را از <a href='/'>حساب خود</a> بگیرید.</p>", 404)
+#        if profile:
+#            return self.send(mobileconfig(info), 200, {
+#                "Content-Type": "application/x-apple-aspen-config",
+#                "Content-Disposition": "attachment; filename=doctor-dns.mobileconfig",
+#                "Cache-Control": "no-store"})
+#        return self.send_html(
+#            "<h1>🔒 DNS امن</h1><div class='sub'>%s</div>" % html.escape(brand())
+#            + doh_box(info, profile="/doh-setup/%s.mobileconfig" % token, setup=True)
+#            + "<p class='alt'><a href='/'>ورود به حساب</a></p>")
+#
+#    def send_profile(self):
+#        token = self.session()
+#        if not token:
+#            return self.redirect("/login")
+#        try:
+#            info = post("/user-info", {"session": token, "ip": self.client_ip()})
+#        except Exception as e:
+#            log(ERROR, "panel: user-info failed: %s" % e)
+#            return self.send_html(NOT_NOW, 502)
+#        if not info.get("ok") or not doh_url(info):
+#            return self.redirect("/")
+#        return self.send(mobileconfig(info), 200, {
+#            "Content-Type": "application/x-apple-aspen-config",
+#            "Content-Disposition": "attachment; filename=doctor-dns.mobileconfig",
+#            "Cache-Control": "no-store"})
+#
 #    def dashboard(self):
 #        token = self.session()
 #        if not token:
@@ -9538,6 +10879,7 @@ exit 0
 #            body.append("<div class='row'><span class='k'>%s</span>"
 #                        "<span class='v'>%s</span></div>" % (k, v))
 #        body.append(gauge)
+#        body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
 #        body.append(dns_box())
 #
 #        if not info["ip"]:
@@ -9558,6 +10900,7 @@ exit 0
 #                "<p class='note'>آی‌پی شما درست ثبت شده. اگر مودم را ریست کردید و "
 #                "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
 #        body.append(manual_ip_box("/"))
+#        body.append(doh_box(info))
 #        body.append(trial_box(info))
 #        body.append(receipt_box(info))
 #        body.append(support_box(info))
@@ -9747,6 +11090,339 @@ exit 0
 #[Install]
 #WantedBy=multi-user.target
 #__END_SYNC_SERVICE__
+
+#__BEGIN_DOH__
+##!/usr/bin/env python3
+#"""smartdns-doh - DNS over HTTPS and over TLS, for the relay's customers.
+#
+#nginx holds TLS and HTTP/2 on both doors and hands this process plain
+#requests on loopback:
+#
+#  443  DoH. nginx reads the name the client asked for, and sends the relay's
+#       own name to its DoH server on 127.0.0.1:8453, which proxies /dns-query
+#       here on 127.0.0.1:8055. Every other name goes on to the exit as before.
+#
+#  853  DoT. nginx ends TLS and passes the stream here on 127.0.0.1:8054 with
+#       a PROXY protocol line in front, which says who connected.
+#
+#Both are behind the same gate as port 53: an address that is not registered
+#is dropped before it gets here. This adds a way in for customers who already
+#have one, not a way round the registration.
+#
+#Queries are answered by the same dnsmasq resolvers as port 53. On DoT the
+#connecting address says whose template to use; on DoH the connection comes
+#from nginx on loopback and says nothing, so the personal address carries a
+#token instead - it only says which customer's template to answer from.
+#
+#Nothing is logged about what anybody asked.
+#"""
+#import base64
+#import hashlib
+#import http.server
+#import json
+#import os
+#import re
+#import socket
+#import socketserver
+#import struct
+#import sys
+#import threading
+#import time
+#import urllib.parse
+#
+#STATE = "/var/lib/smart-dns/doh.json"
+#DOH_ADDR = ("127.0.0.1", 8055)
+#DOT_ADDR = ("127.0.0.1", 8054)
+#MAIN_PORT = 53
+#UPSTREAM_TIMEOUT = 4
+#DOT_IDLE = 30
+#MAX_QUERY = 4096
+#TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+## nginx on this machine: every DoH request arrives from here, after the gate
+## has let the customer in on 443.
+#LOOPBACK = {"127.0.0.1", "::1", ""}
+#
+#INFO, WARN, ERROR = 6, 4, 3
+#
+#
+#def log(level, msg):
+#    print("<%d>%s" % (level, msg), flush=True)
+#
+#
+## ---------------------------------------------------------------- state
+#class State:
+#    """What the sync agent last wrote: tokens, addresses, resolver ports.
+#
+#    Re-read when the file changes, so a customer the panel just created, or
+#    an address it just let in, is known here within a sync - no restart.
+#    """
+#
+#    def __init__(self, path=STATE):
+#        self.path = path
+#        self.stamp = None
+#        self.data = {"tokens": {}, "ips": {}, "allowed": [], "enforcing": True}
+#        self.allowed = set()
+#        self.lock = threading.Lock()
+#
+#    def current(self):
+#        try:
+#            st = os.stat(self.path)
+#            stamp = (st.st_mtime_ns, st.st_size)
+#        except OSError:
+#            return self.data
+#        if stamp != self.stamp:
+#            with self.lock:
+#                if stamp != self.stamp:
+#                    try:
+#                        with open(self.path, encoding="utf-8") as fh:
+#                            data = json.load(fh)
+#                        self.data = data
+#                        self.allowed = set(data.get("allowed") or [])
+#                        self.stamp = stamp
+#                    except (OSError, ValueError) as e:
+#                        log(WARN, "state not read: %s" % e)
+#        return self.data
+#
+#    def by_token(self, token):
+#        if not token:
+#            return None
+#        key = hashlib.sha256(token.encode()).hexdigest()
+#        entry = (self.current().get("tokens") or {}).get(key)
+#        return (key, entry) if entry else None
+#
+#    def port_for(self, ip):
+#        return int((self.current().get("ips") or {}).get(ip) or MAIN_PORT)
+#
+#    def is_allowed(self, ip):
+#        data = self.current()
+#        if not data.get("enforcing", True):
+#            return True
+#        return ip in self.allowed
+#
+#
+#STATE_NOW = State()
+#
+#
+## ---------------------------------------------------------------- resolving
+#def refused(query):
+#    """The query, turned into an answer that says REFUSED and nothing else."""
+#    if len(query) < 12:
+#        return b""
+#    flags = struct.unpack("!H", query[2:4])[0]
+#    flags = (flags | 0x8000 | 0x0080) & 0xFFF0 | 5     # QR, RA, RCODE=5
+#    return query[:2] + struct.pack("!H", flags) + query[4:12]
+#
+#
+#def ask(query, port):
+#    """Put the query to a local resolver and return its answer.
+#
+#    UDP first, as a client on port 53 would; TCP when the answer says it was
+#    cut short, because a truncated answer handed back over an encrypted
+#    channel would make the client retry over plain DNS - the thing it asked
+#    us to avoid.
+#    """
+#    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#    s.settimeout(UPSTREAM_TIMEOUT)
+#    try:
+#        s.sendto(query, ("127.0.0.1", port))
+#        while True:
+#            answer, _ = s.recvfrom(65535)
+#            if answer[:2] == query[:2]:
+#                break
+#    finally:
+#        s.close()
+#    if len(answer) >= 4 and answer[2] & 0x02:
+#        answer = ask_tcp(query, port)
+#    return answer
+#
+#
+#def ask_tcp(query, port):
+#    with socket.create_connection(("127.0.0.1", port), UPSTREAM_TIMEOUT) as s:
+#        s.sendall(struct.pack("!H", len(query)) + query)
+#        size = struct.unpack("!H", read_exact(s, 2))[0]
+#        return read_exact(s, size)
+#
+#
+#def read_exact(sock, n):
+#    out = b""
+#    while len(out) < n:
+#        chunk = sock.recv(n - len(out))
+#        if not chunk:
+#            raise ConnectionError("closed early")
+#        out += chunk
+#    return out
+#
+#
+## ---------------------------------------------------------------- DoH
+#def b64url(text):
+#    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+#
+#
+#class DoH(http.server.BaseHTTPRequestHandler):
+#    protocol_version = "HTTP/1.1"
+#    server_version = "doctor-dns"
+#    sys_version = ""
+#
+#    def log_message(self, fmt, *args):
+#        # What somebody asked is not ours to keep.
+#        pass
+#
+#    def fail(self, code, text=""):
+#        body = text.encode()
+#        self.send_response(code)
+#        self.send_header("Content-Type", "text/plain; charset=utf-8")
+#        self.send_header("Content-Length", str(len(body)))
+#        self.end_headers()
+#        self.wfile.write(body)
+#
+#    def route(self):
+#        path = urllib.parse.urlparse(self.path).path.rstrip("/")
+#        parts = path.split("/")
+#        if len(parts) < 2 or parts[1] != "dns-query" or len(parts) > 3:
+#            return None, "not here"
+#        token = parts[2] if len(parts) == 3 else ""
+#        if token and not TOKEN.match(token):
+#            return None, "no such address"
+#        return token, ""
+#
+#    def do_GET(self):
+#        token, why = self.route()
+#        if token is None:
+#            return self.fail(404, why)
+#        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("dns")
+#        if not q:
+#            return self.fail(400, "dns= is missing")
+#        try:
+#            query = b64url(q[0])
+#        except Exception:
+#            return self.fail(400, "dns= is not base64url")
+#        self.answer(token, query)
+#
+#    def do_POST(self):
+#        token, why = self.route()
+#        if token is None:
+#            return self.fail(404, why)
+#        if (self.headers.get("Content-Type") or "").split(";")[0].strip() \
+#                != "application/dns-message":
+#            return self.fail(415, "application/dns-message only")
+#        size = int(self.headers.get("Content-Length") or 0)
+#        if size <= 0 or size > MAX_QUERY:
+#            return self.fail(413, "no query, or too big")
+#        self.answer(token, self.rfile.read(size))
+#
+#    def answer(self, token, query):
+#        if len(query) < 12 or len(query) > MAX_QUERY:
+#            return self.fail(400, "not a DNS query")
+#        ip = (self.headers.get("X-Real-IP") or "").strip()
+#        # Only nginx reaches this, and only for somebody the gate let in; an
+#        # address arriving from anywhere else has found a way round it.
+#        if ip not in LOOPBACK:
+#            return self.fail(403, "not through the relay")
+#        state = STATE_NOW
+#        port = MAIN_PORT
+#        if token:
+#            found = state.by_token(token)
+#            if not found:
+#                # A revoked address has to stop working, and say so plainly
+#                # rather than answer with something that looks like DNS.
+#                return self.fail(403, "this address is no longer valid")
+#            port = int(found[1].get("port") or MAIN_PORT)
+#        try:
+#            reply = ask(query, port)
+#        except (OSError, ConnectionError) as e:
+#            log(WARN, "resolver on %d did not answer: %s" % (port, e))
+#            return self.fail(502, "the resolver did not answer")
+#        self.send_response(200)
+#        self.send_header("Content-Type", "application/dns-message")
+#        self.send_header("Content-Length", str(len(reply)))
+#        self.send_header("Cache-Control", "no-store")
+#        self.end_headers()
+#        self.wfile.write(reply)
+#
+#
+#class DoHServer(http.server.ThreadingHTTPServer):
+#    daemon_threads = True
+#    allow_reuse_address = True
+#
+#
+## ---------------------------------------------------------------- DoT
+#PROXY_LINE = re.compile(rb"^PROXY (TCP4|TCP6|UNKNOWN) ?(\S*) ?(\S*) ?(\d*) ?(\d*)\r\n$")
+#
+#
+#class DoT(socketserver.BaseRequestHandler):
+#    def read_proxy(self):
+#        line = b""
+#        while not line.endswith(b"\r\n"):
+#            ch = self.request.recv(1)
+#            if not ch or len(line) > 107:
+#                raise ConnectionError("no PROXY line")
+#            line += ch
+#        m = PROXY_LINE.match(line)
+#        if not m:
+#            raise ConnectionError("bad PROXY line")
+#        return m.group(2).decode() if m.group(1) != b"UNKNOWN" else ""
+#
+#    def handle(self):
+#        sock = self.request
+#        sock.settimeout(DOT_IDLE)
+#        try:
+#            ip = self.read_proxy()
+#            state = STATE_NOW
+#            ok = state.is_allowed(ip)
+#            port = state.port_for(ip)
+#            while True:
+#                head = sock.recv(2)
+#                if len(head) < 2:
+#                    return
+#                size = struct.unpack("!H", head)[0]
+#                if size < 12 or size > MAX_QUERY:
+#                    return
+#                query = read_exact(sock, size)
+#                # The gate drops strangers on 853 before they get here; this
+#                # is the second lock, for a relay whose gate is being changed.
+#                reply = ask(query, port) if ok else refused(query)
+#                sock.sendall(struct.pack("!H", len(reply)) + reply)
+#        except (OSError, ConnectionError):
+#            return
+#
+#
+#class DoTServer(socketserver.ThreadingTCPServer):
+#    daemon_threads = True
+#    allow_reuse_address = True
+#
+#
+#def main():
+#    doh = DoHServer(DOH_ADDR, DoH)
+#    dot = DoTServer(DOT_ADDR, DoT)
+#    threading.Thread(target=dot.serve_forever, daemon=True).start()
+#    log(INFO, "DoH on %s:%d, DoT on %s:%d" % (DOH_ADDR + DOT_ADDR))
+#    doh.serve_forever()
+#
+#
+#if __name__ == "__main__":
+#    main()
+#__END_DOH__
+
+#__BEGIN_DOH_SERVICE__
+#[Unit]
+#Description=Smart DNS over HTTPS and TLS - the relay's encrypted door
+#After=network-online.target dnsmasq.service
+#Wants=network-online.target
+#
+#[Service]
+#Type=simple
+#ExecStart=/usr/local/bin/smartdns-doh
+#Restart=always
+#RestartSec=3
+## Root only to wake the sync agent with a signal when a new device turns up;
+## it listens on loopback and nginx is the only thing that reaches it.
+#NoNewPrivileges=yes
+#ProtectHome=yes
+#PrivateTmp=yes
+#
+#[Install]
+#WantedBy=multi-user.target
+#__END_DOH_SERVICE__
 
 #__BEGIN_DNS_PROFILE_UNIT__
 #[Unit]
@@ -9962,9 +11638,11 @@ exit 0
 #import http.server
 #import ipaddress
 #import json
+#import math
 #import os
 #import re
 #import secrets
+#import socket
 #import sqlite3
 #import ssl
 #import subprocess
@@ -10056,7 +11734,9 @@ exit 0
 ## takes down the thing it exists to administer.
 #RESERVED_PORTS = {53: "DNS", 80: "HTTP", 443: "HTTPS",
 #                  8443: "the relays' sync API", 8445: "the bot API",
-#                  8446: "the exit's route to Google over IPv6", 22: "SSH"}
+#                  8446: "the exit's route to Google over IPv6",
+#                  18119: "the exit's route to Battle.net", 1119: "Battle.net's launcher",
+#                  4070: "Spotify's access point", 22: "SSH"}
 #
 #
 #def remaining_days(ts):
@@ -10324,6 +12004,364 @@ exit 0
 #PENDING = {}
 #
 #
+## Tehran has kept +03:30 all year since 2022; the panel buckets usage by it.
+#TEHRAN = timezone(timedelta(hours=3, minutes=30))
+#
+#
+## ---------------------------------------------------------------- usage
+## The customer page's charts, drawn the same way here (smartdns-sync has
+## the notes on why they look as they do). What the operator does not get
+## is the per-service breakdown: that one is the customer's alone.
+## Charts drawn here as SVG, so the page loads nothing from anywhere else.
+## Download is the relay's blue and upload its green: the same two colours in
+## both themes' own shades, checked for colour-blind separation (protan and
+## deutan both above 20) and for contrast against the card (above 5).
+## Every mark carries a <title>, which is the hover on a phone as much as on a
+## desktop, and every chart has its numbers in a table underneath.
+#DOWN, UP = "var(--accent2)", "var(--accent)"
+#
+#
+#def mbit(bps):
+#    return "%.1f" % (bps / 1e6) if bps < 1e8 else "%.0f" % (bps / 1e6)
+#
+#
+#def short_size(n):
+#    n = float(n or 0)
+#    for unit in ("B", "KB", "MB", "GB", "TB"):
+#        if n < 1024 or unit == "TB":
+#            return ("%d %s" if unit == "B" or n == int(n) else "%.1f %s") % (n, unit)
+#        n /= 1024
+#
+#
+#def nice_max(v):
+#    """A round number at least as big as v, for the top of an axis."""
+#    if v <= 0:
+#        return 1
+#    mag = 10 ** math.floor(math.log10(v))
+#    for step in (1, 2, 2.5, 5, 10):
+#        if v <= step * mag:
+#            return step * mag
+#    return 10 * mag
+#
+#
+#def nice_bytes(v):
+#    """nice_max in the unit the axis will print, so the top reads 50 GB and
+#    not 46.6 GB."""
+#    unit = 1
+#    while v / unit >= 1024 and unit < 1024 ** 4:
+#        unit *= 1024
+#    return nice_max(v / float(unit)) * unit
+#
+#
+#def top_rounded(x, y, w, h, r=4):
+#    """A bar whose far end is rounded and whose base sits square on the axis."""
+#    r = min(r, w / 2.0, h)
+#    if h <= 0:
+#        return ""
+#    return ("M%.1f %.1fv%.1fh%.1fv%.1fq0 %.1f %.1f %.1fh%.1fq%.1f 0 %.1f %.1fz"
+#            % (x, y + h, -(h - r), w, h - r, -r, -r, -r, -(w - 2 * r), -r, -r, r))
+#
+#
+#def legend():
+#    return ("<div class='legend'><span><i style='background:%s'></i>دانلود</span>"
+#            "<span><i style='background:%s'></i>آپلود</span></div>" % (DOWN, UP))
+#
+#
+#def days_chart(days, n=30):
+#    """The last n days as stacked bars: download below, upload on top."""
+#    now_day = datetime.now(TEHRAN).date()
+#    by = {b: (u, d) for b, u, d in days}
+#    rows = []
+#    for i in range(n - 1, -1, -1):
+#        day = now_day - timedelta(days=i)
+#        u, d = by.get(day.strftime("%Y-%m-%d"), (0, 0))
+#        rows.append((day, u, d))
+#    W, H, L, B = 420, 170, 58, 22
+#    top = nice_bytes(max((u + d) for _, u, d in rows) or 1)
+#    slot = (W - L) / float(n)
+#    bw = max(3, slot - 2)
+#    out = ["<svg viewBox='0 0 %d %d' class='chart' role='img' aria-label='مصرف روزانه'>" % (W, H)]
+#    for frac in (0.5, 1.0):
+#        y = (H - B) - frac * (H - B - 8)
+#        out.append("<line x1='%d' x2='%d' y1='%.1f' y2='%.1f' class='grid'/>"
+#                   "<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
+#                   % (L, W, y, y, L - 6, y + 4, short_size(top * frac)))
+#    out.append("<line x1='%d' x2='%d' y1='%d' y2='%d' class='base'/>" % (L, W, H - B, H - B))
+#    scale = (H - B - 8) / float(top)
+#    for i, (day, u, d) in enumerate(rows):
+#        x = L + i * slot + (slot - bw) / 2
+#        hd, hu = d * scale, u * scale
+#        base = H - B
+#        tip = "%s — دانلود %s، آپلود %s" % (day.strftime("%m/%d"), human(d), human(u))
+#        out.append("<g><title>%s</title>" % html.escape(tip))
+#        if hu >= 1 and hd >= 1:
+#            # Download square on the base, a 2px gap of card, upload rounded on top.
+#            out.append("<rect x='%.1f' y='%.1f' width='%.1f' height='%.1f' fill='%s'/>"
+#                       % (x, base - hd, bw, hd, DOWN))
+#            out.append("<path d='%s' fill='%s'/>" % (top_rounded(x, base - hd - 2 - hu, bw, hu), UP))
+#        elif hd + hu >= 1:
+#            colour = DOWN if hd >= hu else UP
+#            out.append("<path d='%s' fill='%s'/>" % (top_rounded(x, base - hd - hu, bw, hd + hu), colour))
+#        # A hit target the size of the slot, so a thumb finds the tooltip.
+#        out.append("<rect x='%.1f' y='0' width='%.1f' height='%d' fill='transparent'/></g>"
+#                   % (L + i * slot, slot, H - B))
+#        if i % 5 == 4 or i == n - 1:
+#            last = i == n - 1
+#            out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
+#                       % (x + bw if last else x + bw / 2, H - 6,
+#                          "end" if last else "middle", day.strftime("%m/%d")))
+#    out.append("</svg>")
+#    return "".join(out), rows
+#
+#
+#def speed_chart(five):
+#    """The last day's average speed, five minutes at a time."""
+#    now_t = datetime.now(TEHRAN).replace(second=0, microsecond=0)
+#    start = now_t - timedelta(hours=24)
+#    by = {b: (u, d) for b, u, d in five}
+#    pts = []
+#    t = start.replace(minute=start.minute - start.minute % 5)
+#    while t <= now_t:
+#        u, d = by.get(t.strftime("%Y-%m-%dT%H:%M"), (0, 0))
+#        pts.append((t, u * 8 / 300.0, d * 8 / 300.0))
+#        t += timedelta(minutes=5)
+#    W, H, L, B = 420, 160, 68, 22
+#    top = nice_max(max(max(u, d) for _, u, d in pts) or 1)
+#    span = float(len(pts) - 1 or 1)
+#    out = ["<svg viewBox='0 0 %d %d' class='chart' role='img' aria-label='سرعت ۲۴ ساعت'>" % (W, H)]
+#    for frac in (0.5, 1.0):
+#        y = (H - B) - frac * (H - B - 8)
+#        out.append("<line x1='%d' x2='%d' y1='%.1f' y2='%.1f' class='grid'/>"
+#                   "<text x='%d' y='%.1f' class='axis' text-anchor='end'>%g Mbps</text>"
+#                   % (L, W, y, y, L - 6, y + 4, top * frac / 1e6))
+#    out.append("<line x1='%d' x2='%d' y1='%d' y2='%d' class='base'/>" % (L, W, H - B, H - B))
+#
+#    def xy(i, v):
+#        return (L + (W - L) * i / span, (H - B) - v / top * (H - B - 8))
+#
+#    for idx, colour in ((2, DOWN), (1, UP)):
+#        line = " ".join("%.1f,%.1f" % xy(i, p[idx]) for i, p in enumerate(pts))
+#        out.append("<polyline points='%s' fill='none' stroke='%s' stroke-width='2'"
+#                   " stroke-linejoin='round'/>" % (line, colour))
+#    # One hit target per half hour, with both numbers, so the hover reads the
+#    # pair at once instead of making the reader find the other line.
+#    step = 6
+#    for i in range(0, len(pts), step):
+#        chunk = pts[i:i + step]
+#        t0 = chunk[0][0]
+#        d = max(p[2] for p in chunk)
+#        u = max(p[1] for p in chunk)
+#        x0 = xy(i, 0)[0]
+#        x1 = xy(min(i + step, len(pts) - 1), 0)[0]
+#        out.append("<rect x='%.1f' y='0' width='%.1f' height='%d' fill='transparent'>"
+#                   "<title>%s — دانلود تا %s، آپلود تا %s مگابیت</title></rect>"
+#                   % (x0, max(1, x1 - x0), H - B, t0.strftime("%H:%M"), mbit(d), mbit(u)))
+#    for hours_back in (24, 18, 12, 6, 0):
+#        i = len(pts) - 1 - hours_back * 12
+#        if 0 <= i < len(pts):
+#            anchor = "end" if hours_back == 0 else "start" if hours_back == 24 else "middle"
+#            out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
+#                       % (xy(i, 0)[0], H - 6, anchor, pts[i][0].strftime("%H:%M")))
+#    out.append("</svg>")
+#    return "".join(out)
+#
+#
+#def heat_chart(hours):
+#    """The last seven days hour by hour, darker for more - when this account
+#    is busy. One hue, getting stronger, since it is only ever 'how much'."""
+#    by = {}
+#    for b, u, d in hours:
+#        by[b] = u + d
+#    today = datetime.now(TEHRAN).date()
+#    days = [today - timedelta(days=i) for i in range(6, -1, -1)]
+#    peak = max(by.values() or [1]) or 1
+#    W, H, L, T = 420, 7 * 22 + 24, 46, 4
+#    cw = (W - L) / 24.0
+#    out = ["<svg viewBox='0 0 %d %d' class='chart' role='img' aria-label='ساعت‌های پرمصرف'>" % (W, H)]
+#    for r, day in enumerate(days):
+#        y = T + r * 22
+#        out.append("<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
+#                   % (L - 6, y + 14, day.strftime("%m/%d")))
+#        for h in range(24):
+#            key = "%sT%02d:00" % (day.strftime("%Y-%m-%d"), h)
+#            v = by.get(key, 0)
+#            level = 0 if not v else 0.18 + 0.82 * (v / float(peak))
+#            out.append("<rect x='%.1f' y='%d' width='%.1f' height='18' rx='3' fill='%s'"
+#                       " fill-opacity='%.2f'><title>%s ساعت %02d — %s</title></rect>"
+#                       % (L + h * cw + 1, y, cw - 2, DOWN if v else "var(--line)",
+#                          level if v else 1, day.strftime("%m/%d"), h, human(v)))
+#    for h in (0, 6, 12, 18, 23):
+#        out.append("<text x='%.1f' y='%d' class='axis' text-anchor='middle'>%02d</text>"
+#                   % (L + h * cw + cw / 2, H - 4, h))
+#    out.append("</svg>")
+#    return "".join(out)
+#
+#
+#
+#
+#def user_usage(uid):
+#    """The same numbers the customer's page is drawn from, straight from the
+#    panel's tables - this runs beside it, on the same database."""
+#    now_t = datetime.now(TEHRAN)
+#
+#    def series(grain, since, fmt):
+#        return [(r["bucket"], r["up"], r["down"]) for r in STORE.q(
+#            "SELECT bucket, up, down FROM usage WHERE user_id = ? AND grain = ?"
+#            " AND bucket >= ? ORDER BY bucket", (uid, grain, since.strftime(fmt)))]
+#
+#    return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
+#            "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
+#            "days": series("1d", now_t - timedelta(days=30), "%Y-%m-%d")}
+#
+#
+## ---------------------------------------------------------------- resolvers
+## The public resolvers the operator can pick: what the relays ask for every
+## name they do not route, and what this machine's nginx asks to find the
+## service a customer's connection is for. (provider, first, second, warning)
+#RESOLVERS = [
+#    ("Cloudflare", "1.1.1.1", "1.0.0.1", ""),
+#    ("Cloudflare — بدون بدافزار", "1.1.1.2", "1.0.0.2", ""),
+#    ("Cloudflare — خانواده", "1.1.1.3", "1.0.0.3",
+#     "سایت‌های بزرگسال را هم برای همهٔ مشتری‌ها می‌بندد."),
+#    ("Quad9", "9.9.9.9", "149.112.112.112", ""),
+#    ("Google", "8.8.8.8", "8.8.4.4",
+#     "زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید. سرویس‌هایی که ایران را در DNS "
+#     "رد می‌کنند — بازی‌های Tencent مثل PUBG Mobile — آی‌پی ایرانی رله را می‌بینند "
+#     "و جواب نمی‌دهند."),
+#    ("OpenDNS", "208.67.222.222", "208.67.220.220", ""),
+#    ("AdGuard", "94.140.14.14", "94.140.15.15",
+#     "تبلیغ و ردیاب را می‌بندد؛ بعضی بازی‌ها و فروشگاه‌ها که به همان دامنه‌ها "
+#     "نیاز دارند ممکن است درست کار نکنند."),
+#]
+#DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
+## What this machine's own nginx is, and where the pick is kept for the
+## installer, so an upgrade does not put the defaults back.
+#NGINX_CONF = "/etc/nginx/nginx.conf"
+#UPSTREAM_FILE = "/etc/smart-dns/upstream"
+#RESOLVER_LINE = re.compile(r"(\bresolver )[0-9. ]+?( ipv[46]=off;)")
+#
+#
+#def dns_probe(server, name="cloudflare.com", timeout=2.0):
+#    """How long `server` takes to answer an A query for `name`, in
+#    milliseconds; None when it does not answer, or answers with an error.
+#    Twice, so one lost packet does not condemn a resolver."""
+#    qid = os.urandom(2)
+#    query = (qid + bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+#             + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
+#             + bytes([0, 0, 1, 0, 1]))
+#    for _ in range(2):
+#        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#        s.settimeout(timeout)
+#        try:
+#            t0 = time.monotonic()
+#            s.sendto(query, (server, 53))
+#            while True:
+#                data, _ = s.recvfrom(4096)
+#                if len(data) >= 12 and data[:2] == qid:
+#                    break
+#            # An answer, no error, and at least one record in it.
+#            if data[2] & 0x80 and data[3] & 0x0F == 0 and (data[6] or data[7]):
+#                return max(1, int((time.monotonic() - t0) * 1000))
+#            return None
+#        except OSError:
+#            continue
+#        finally:
+#            s.close()
+#    return None
+#
+#
+#def resolver_name(ip):
+#    for name, a, b, _ in RESOLVERS:
+#        if ip in (a, b):
+#            return name
+#    return "دلخواه"
+#
+#
+#def set_exit_resolvers(picks):
+#    """Point this machine's nginx at the picked resolvers; "" or why not.
+#    Checked with nginx -t before the reload, and put back if it fails."""
+#    try:
+#        with open(NGINX_CONF) as fh:
+#            text = fh.read()
+#    except OSError as e:
+#        return "nginx.conf خوانده نشد: %s" % e
+#    new = RESOLVER_LINE.sub(lambda m: m.group(1) + " ".join(picks) + m.group(2), text)
+#    if new != text:
+#        with open(NGINX_CONF, "w") as fh:
+#            fh.write(new)
+#        test = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=30)
+#        if test.returncode != 0:
+#            with open(NGINX_CONF, "w") as fh:
+#                fh.write(text)
+#            return "nginx نپذیرفت؛ چیزی عوض نشد: %s" % (test.stderr.strip()[-200:])
+#        subprocess.run(["systemctl", "reload", "nginx"], capture_output=True, timeout=60)
+#    os.makedirs(os.path.dirname(UPSTREAM_FILE), exist_ok=True)
+#    with open(UPSTREAM_FILE, "w") as fh:
+#        fh.write(" ".join(picks) + "\n")
+#    return ""
+#
+#
+#def upstream_card():
+#    """The settings page's card for picking the public resolvers."""
+#    p = CFG["ADMIN_PATH"]
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'dns_upstream'")
+#    picks = ((row["value"] if row and row["value"] else DEFAULT_UPSTREAM).split() + [""])[:2]
+#    known = {ip for _, a, b, _ in RESOLVERS for ip in (a, b)}
+#
+#    def select(name, current):
+#        opts = ["<option value=''%s>— هیچ —</option>" % ("" if current else " selected")
+#                ] if name == "backup" else []
+#        for prov, a, b, _ in RESOLVERS:
+#            opts.append("<optgroup label='%s'>%s</optgroup>" % (html.escape(prov), "".join(
+#                "<option value='%s'%s>%s</option>"
+#                % (ip, " selected" if ip == current else "", ip) for ip in (a, b))))
+#        custom = current if current and current not in known else ""
+#        return ("<select name='%s' dir='ltr'>%s</select> <input name='%s_custom'"
+#                " value='%s' placeholder='یا آی‌پی دلخواه' dir='ltr' size='15'>"
+#                % (name, "".join(opts), name, html.escape(custom)))
+#
+#    out = ["<div class='card'><h2>DNS بالادستی</h2>",
+#           "<p class='muted'>هر اسمی که رله‌ها مسیریابی نمی‌کنند از این‌ها پرسیده "
+#           "می‌شود، و nginx همین سرور هم برای پیدا کردن آدرس سرویس‌ها از آن‌ها "
+#           "می‌پرسد. پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از "
+#           "اعمال، خودش از ایران امتحان می‌کند — اگر جواب ندهد همان قبلی را "
+#           "نگه می‌دارد.</p>",
+#           "<form method='post' action='/%s/dns-upstream'>" % p,
+#           "<div class='f'><label>اصلی</label>%s</div>" % select("primary", picks[0]),
+#           "<div class='f'><label>پشتیبان</label>%s</div>" % select("backup", picks[1]),
+#           "<button class='ghost'>آزمایش و ذخیره</button></form>"]
+#    notes = ["<li><b>%s</b> (%s، %s): %s</li>" % (html.escape(n), a, b, html.escape(w))
+#             for n, a, b, w in RESOLVERS if w]
+#    out.append("<ul class='muted'>%s</ul>" % "".join(notes))
+#
+#    rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
+#                   " ORDER BY key")
+#    if rows:
+#        out.append("<table><tr><th>رله</th><th>در حال استفاده</th><th>وضعیت</th></tr>")
+#        for r in rows:
+#            try:
+#                st = json.loads(r["value"])
+#            except ValueError:
+#                continue
+#            applied = st.get("applied") or []
+#            tested = st.get("tested") or {}
+#            used = "، ".join("<code>%s</code>%s" % (
+#                html.escape(ip), " <span class='muted'>%sms</span>" % tested[ip]
+#                if isinstance(tested.get(ip), int) else "") for ip in applied) or "-"
+#            wanted = [x for x in picks if x]
+#            if st.get("error"):
+#                state = "<span class='warn'>%s</span>" % html.escape(st["error"])
+#            elif applied == wanted:
+#                state = "<span class='ok'>اعمال شد</span>"
+#            else:
+#                state = "<span class='muted'>در انتظار همگام‌سازی</span>"
+#            out.append("<tr><td><code>%s</code></td><td dir='ltr'>%s</td><td>%s</td></tr>"
+#                       % (html.escape(r["key"].split(":", 1)[1]), used, state))
+#        out.append("</table>")
+#    out.append("</div>")
+#    return "".join(out)
+#
+#
 #CATALOGUE = []
 #GAMES = []
 #SECTIONS = []
@@ -10449,6 +12487,13 @@ exit 0
 # padding:8px 14px}
 #form.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 #.muted{color:var(--muted);font-size:12px}
+#.legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-bottom:4px}
+#.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-left:6px;
+# vertical-align:-1px}
+#svg.chart{display:block;width:100%;max-width:760px;height:auto;direction:ltr}
+#svg.chart .grid{stroke:var(--line);stroke-width:1;opacity:.6}
+#svg.chart .base{stroke:var(--line2);stroke-width:1}
+#svg.chart .axis{fill:var(--muted);font-size:12px;font-family:inherit}
 #.ok{color:var(--accent)}.bad{color:var(--bad)}.warn{color:var(--warn)}
 #.msg{padding:11px 14px;border-radius:9px;margin-bottom:16px;font-size:13px}
 #.msg.good{background:var(--good-bg);border:1px solid var(--btn)}
@@ -11915,7 +13960,8 @@ exit 0
 #                 "bot": ("ربات تلگرام", self.bot_page),
 #                 "settings": ("تنظیمات", self.settings),
 #                 "restore": ("بازگردانی", self.restore_page),
-#                 "logs": ("لاگ", self.logs)}
+#                 "logs": ("لاگ", self.logs),
+#                 "usage": ("مصرف کاربر", self.user_usage_page)}
 #        if rest not in pages:
 #            return self.lost()
 #        title, fn = pages[rest]
@@ -11961,6 +14007,43 @@ exit 0
 #                       (r["uptime"] or 0) // 86400))
 #            out.append("</table>")
 #        out.append("</div>")
+#        return "".join(out)
+#
+#    def user_usage_page(self):
+#        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#        try:
+#            uid = int((q.get("u") or ["0"])[0])
+#        except ValueError:
+#            uid = 0
+#        user = STORE.one("SELECT * FROM users WHERE id = ?", (uid,))
+#        if not user:
+#            return "<div class='card'><p class='muted'>این کاربر پیدا نشد.</p></div>"
+#        view = user_usage(uid)
+#        who = user["username"] or user["phone"] or user["telegram_id"] or "#%d" % uid
+#        days_svg, rows = days_chart(view["days"])
+#        month = [sum(r[i] for r in rows) for i in (1, 2)]
+#        week = [sum(r[i] for r in rows[-7:]) for i in (1, 2)]
+#        out = ["<div class='card'><h2>مصرف %s</h2>" % html.escape(str(who)),
+#               "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a> — "
+#               "روز و ساعت به وقت تهران. تفکیک سرویس را فقط خود کاربر می‌بیند.</p>"
+#               % CFG["ADMIN_PATH"], "<div class='grid'>"]
+#        for n, l in ((human(week[1]) + " / " + human(week[0]), "۷ روز اخیر — دانلود / آپلود"),
+#                     (human(month[1]) + " / " + human(month[0]), "۳۰ روز اخیر — دانلود / آپلود"),
+#                     (human(user["used_bytes"]), "مصرف این دوره")):
+#            out.append("<div class='stat'><div class='n' dir='ltr'>%s</div>"
+#                       "<div class='l'>%s</div></div>" % (n, l))
+#        out.append("</div></div>")
+#        out.append("<div class='card'><h2>روزانه</h2>%s%s</div>" % (legend(), days_svg))
+#        out.append("<div class='card'><h2>سرعت ۲۴ ساعت اخیر</h2>%s%s</div>"
+#                   % (legend(), speed_chart(view["five"])))
+#        out.append("<div class='card'><h2>ساعت‌های پرمصرف — ۷ روز اخیر</h2>%s</div>"
+#                   % heat_chart(view["hours"]))
+#        table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
+#                        % (d.strftime("%Y-%m-%d"), human(dn), human(u))
+#                        for d, u, dn in reversed(rows) if u or dn)
+#        if table:
+#            out.append("<div class='card'><h2>جدول روزانه</h2><table><tr><th>روز</th>"
+#                       "<th>دانلود</th><th>آپلود</th></tr>%s</table></div>" % table)
 #        return "".join(out)
 #
 #    def users(self):
@@ -12066,7 +14149,8 @@ exit 0
 #                % (html.escape(who),
 #                   html.escape(r["first_name"] or ""),
 #                   html.escape(r["ip"] or "-"), operator_label(r["ip"]),
-#                   human(r["used_bytes"]),
+#                   "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
+#                   % (p, r["id"], human(r["used_bytes"])),
 #                   r["id"], p, r["id"], r["id"], r["id"], quota_gb,
 #                   r["id"], speed_mb, r["id"], left,
 #                   p, r["id"], sel, plan_cell(r, plans), cls, html.escape(label),
@@ -12788,6 +14872,8 @@ exit 0
 #                   % (p, " checked" if on else "",
 #                      "" if bot else "<p class='bad'>هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ "
 #                      "تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.</p>"))
+#
+#        out.append(upstream_card())
 #
 #        out.append("<div class='card'><h2>آدرس این پنل</h2>"
 #                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
@@ -13557,6 +15643,36 @@ exit 0
 #                "از این به بعد خرید و تمدید در پنل وب تلگرام وصل‌شده می‌خواهد" if on
 #                else "وصل کردن تلگرام دیگر اجباری نیست"))
 #
+#        if rest == "dns-upstream":
+#            picks = []
+#            for k in ("primary", "backup"):
+#                v = (one(k + "_custom") or one(k)).strip()
+#                if not v:
+#                    continue
+#                try:
+#                    ip = ipaddress.IPv4Address(v)
+#                except ValueError:
+#                    return self.redirect("settings?m=!%s آی‌پی درستی نیست" % v[:40])
+#                if not ip.is_global:
+#                    return self.redirect("settings?m=!%s آی‌پی عمومی نیست" % ip)
+#                if str(ip) not in picks:
+#                    picks.append(str(ip))
+#            if not picks:
+#                return self.redirect("settings?m=!دست‌کم یک DNS لازم است")
+#            dead = [ip for ip in picks if dns_probe(ip) is None]
+#            if dead:
+#                return self.redirect("settings?m=!%s از این سرور جواب نداد؛ چیزی عوض نشد"
+#                                     % "، ".join(dead))
+#            err = set_exit_resolvers(picks)
+#            if err:
+#                return self.redirect("settings?m=!" + err)
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('dns_upstream', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      (" ".join(picks),))
+#            return self.redirect("settings?m=%s" % (
+#                "DNS بالادستی: %s. رله‌ها ظرف یک دقیقه خودشان امتحان و اعمال می‌کنند"
+#                % " و ".join("%s (%s)" % (ip, resolver_name(ip)) for ip in picks)))
+#
 #        if rest == "pay-save":
 #            text = one("text").replace("\r\n", "\n").strip()
 #            if len(text) > PAY_TEXT_MAX:
@@ -13784,6 +15900,9 @@ exit 0
 #        8443) die "port 8443 is the sync API the relays talk to" ;;
 #        8445) die "port 8445 is the bot API" ;;
 #        8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
+#        18119) die "port 18119 is the exit's own route to Battle.net" ;;
+#        1119) die "port 1119 carries Battle.net's launcher" ;;
+#        4070) die "port 4070 carries Spotify's access point" ;;
 #        22) die "port 22 is ssh" ;;
 #    esac
 #    old="$(get ADMIN_PORT)"
@@ -15820,8 +17939,9 @@ exit 0
 #B_SUPPORT = "🎫 پشتیبانی"
 #B_HELP = "❓ راهنما"
 #B_WEB = "🔑 پنل وب"
+#B_DOH = "🔒 DNS امن"
 #B_CANCEL = "انصراف"
-#MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_SUPPORT], [B_WEB, B_HELP]],
+#MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_DOH], [B_SUPPORT, B_WEB], [B_HELP]],
 #        "resize_keyboard": True}
 #CANCEL = {"keyboard": [[B_CANCEL]], "resize_keyboard": True}
 #STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال ✅",
@@ -15998,7 +18118,9 @@ exit 0
 #            return self.got_name(chat, sender, text)
 #        if waiting == "onb_user":
 #            return self.got_username(chat, sender, text, extra)
-#        if text in (B_ACCOUNT, B_BUY, B_IP, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
+#        if text == "/doh":
+#            text = B_DOH
+#        if text in (B_ACCOUNT, B_BUY, B_IP, B_DOH, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
 #            return
 #        if waiting == "ip":
 #            return self.got_ip(chat, sender, text)
@@ -16023,6 +18145,8 @@ exit 0
 #            return self.ip_help(chat, sender)
 #        if text == B_WEB:
 #            return self.show_web(chat, sender)
+#        if text == B_DOH:
+#            return self.show_doh(chat, sender)
 #        if text == B_SUPPORT:
 #            return self.show_tickets(chat, sender)
 #        if text == B_HELP:
@@ -16112,11 +18236,38 @@ exit 0
 #                 {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
 #                                       {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 #
+#    def show_doh(self, chat, sender):
+#        """The customer's personal encrypted-DNS addresses. The panel sends
+#        them only once a relay has DoH on; the iPhone profile is on the web
+#        page, which is what the login button is for."""
+#        u = self.account(sender)
+#        doh = u.get("doh")
+#        if not doh:
+#            return self.say(chat, "🔒 DNS امن هنوز روی این سرویس فعال نیست. از DNS معمولی "
+#                            "(«حساب من») استفاده کنید.", MENU)
+#        lines = ["🔒 DNS امن (رمزگذاری‌شده)",
+#                 "برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند. مثل DNS معمولی "
+#                 "فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید.",
+#                 "",
+#                 "📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان:",
+#                 doh["dot_host"],
+#                 "",
+#                 "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما:",
+#                 doh["url"],
+#                 "",
+#                 "پروفایل آماده‌ی آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است.",
+#                 "این آدرس مخصوص حساب شماست؛ آن را به کسی ندهید."]
+#        if not u["ips"]:
+#            lines.append("\n⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ بدون آن کار نمی‌کند.")
+#        self.say(chat, "\n".join(lines),
+#                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]]})
+#
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
 #                "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
 #                "🌐 ثبت آی‌پی: سرویس فقط روی آی‌پی ثبت‌شده کار می‌کند\n"
 #                "🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی\n"
+#                "🔒 DNS امن: آدرس DoH و DoT، برای وقتی اپراتور DNS را دست‌کاری می‌کند\n"
 #                "🔑 پنل وب: نام کاربری، ورود با یک کلیک و رمز تازه\n\n"
 #                "حساب پنل وب دارید؟ در پنل «اتصال حساب به تلگرام» را بزنید و کد را "
 #                "همین‌جا بفرستید." + ("\n\n" + self.cfg["support"] if self.cfg["support"] else ""))

@@ -285,6 +285,20 @@ message(CUSTOMER, "۵.۱۲۰.۱.۲")
 check("a real one, even in Persian digits, is registered",
       store.one("SELECT ip FROM ips")["ip"] == "5.120.1.2")
 
+print("encrypted DNS")
+message(CUSTOMER, "/doh")
+check("before a relay has DoH, the bot says so", "فعال نیست" in tg.last(CUSTOMER)["text"])
+store.set_setting("doh_host", "user.example.com")
+message(CUSTOMER, botmod.B_DOH)
+doh_text = tg.last(CUSTOMER)["text"]
+token = store.one("SELECT doh_token FROM users WHERE telegram_id = ?", (CUSTOMER,))["doh_token"]
+check("then the personal DoH address, and the DoT name for Android",
+      "https://user.example.com/dns-query/%s" % token in doh_text
+      and "\nuser.example.com\n" in doh_text and "آی‌پی ثبت نکرده" not in doh_text)
+check("with a way into the web page, for the iPhone profile",
+      tg.buttons(CUSTOMER)[0]["callback_data"] == "login")
+check("and the button is on the menu", botmod.B_DOH in sum(botmod.MENU["keyboard"], []))
+
 print("support")
 message(CUSTOMER, botmod.B_SUPPORT)
 tap(CUSTOMER, "tknew")

@@ -100,6 +100,9 @@ port)
         8443) die "port 8443 is the sync API the relays talk to" ;;
         8445) die "port 8445 is the bot API" ;;
         8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
+        18119) die "port 18119 is the exit's own route to Battle.net" ;;
+        1119) die "port 1119 carries Battle.net's launcher" ;;
+        4070) die "port 4070 carries Spotify's access point" ;;
         22) die "port 22 is ssh" ;;
     esac
     old="$(get ADMIN_PORT)"

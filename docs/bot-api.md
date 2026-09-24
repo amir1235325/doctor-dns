@@ -104,6 +104,7 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789
   "expires_at": "2026-10-21T17:52:55+00:00",
   "ips": ["5.120.1.2"], "max_ips": 1, "wallet": 0,
   "dns": ["203.0.113.4"],
+  "doh": {"url": "https://user.example.com/dns-query/Xk3...", "dot_host": "user.example.com"},
   "tickets_answered": 0,
   "trial": null,
   "receipt_waiting": null
@@ -119,8 +120,29 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789
 | `suspended` | ادمین مسدودش کرده |
 
 - `dns` همان آدرسی است که مشتری باید در کنسول یا مودم به‌عنوان DNS بگذارد (آدرس رله‌ها).
+- `doh` آدرس‌های DNS رمزگذاری‌شدهٔ خود مشتری: `url` برای DoH (آیفون، ویندوز، مرورگرها) و `dot_host` برای DoT («DNS خصوصی» اندروید). تا وقتی هیچ رله‌ای DoH روشن نکرده `null` است. مثل DNS معمولی فقط روی آی‌پی ثبت‌شده کار می‌کند؛ توکن داخل آدرس فقط می‌گوید قالب کدام مشتری را جواب بدهد. مخصوص همان مشتری است و نباید جای دیگری نشان داده شود.
 - `receipt_waiting` اگر رسیدی منتظر تأیید باشد: `{"id", "created_at", "amount", "plan"}`.
 - مشتری ناشناس: `404` با `user_not_found`.
+
+### `GET /users/{telegram_id}/usage` — مصرف مشتری
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" $API/users/123456789/usage
+```
+```json
+{"ok": true,
+ "live": {"up_bps": 120000, "down_bps": 4800000, "at": "2026-09-24T21:35"},
+ "week": {"up": 1200000000, "down": 38000000000},
+ "last_week": {"up": 900000000, "down": 31000000000},
+ "month": {"up": 4100000000, "down": 150000000000},
+ "last_month": {"up": 0, "down": 0},
+ "runs_out_days": 12, "expires": "2026-10-21",
+ "quota": 107374182400, "used": 5368709120, "today": "2026-09-24",
+ "days": [{"day": "2026-09-24", "up": 210000000, "down": 6100000000}],
+ "hours": [{"hour": "2026-09-24T21:00", "up": 40000000, "down": 900000000}]}
+```
+
+روز و ساعت به وقت تهران. `days` تا ۶۰ روز و `hours` تا ۷ روز. `runs_out_days` یعنی با سرعت مصرف ۷ روز اخیر حجم چند روز دیگر تمام می‌شود (`null` برای نامحدود یا بی‌مصرف). `live` میانگین ۵ دقیقهٔ اخیر است، نه لحظه‌ای. مصرف به تفکیک سرویس اینجا نیست: آن را فقط خود مشتری در پنل وب می‌بیند.
 
 ### `POST /users/{telegram_id}/ips` — ثبت آی‌پی
 

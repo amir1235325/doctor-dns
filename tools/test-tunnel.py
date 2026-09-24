@@ -57,7 +57,7 @@ def function(name):
 
 tmp = tempfile.mkdtemp()
 variables = "\n".join(re.findall(
-    r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|LOCAL_API|LOCAL_SPOTIFY"
+    r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|LOCAL_API|LOCAL_SPOTIFY|LOCAL_BLIZZARD"
     r"|REVERSE_TRANSPORTS|DIRECT_TRANSPORTS))=.*$",
     LOGIC, re.M))
 names = ["tunnel_transport_ok", "tunnel_port_problem", "parse_tunnel_spec",
@@ -148,7 +148,8 @@ for p in ("8444", "2083", "9443", "31337"):
 for p, why in (("22", "ssh"), ("53", "dns"), ("80", "proxy"), ("443", "proxy"),
                ("8443", "sync"), ("8446", "Google"), ("8402", "certificates"),
                ("3478", "STUN"), ("18443", "tunnel"), ("18080", "tunnel"),
-               ("18843", "tunnel"),
+               ("18843", "tunnel"), ("14070", "tunnel"), ("11119", "tunnel"),
+               ("1119", "Battle.net"), ("4070", "Spotify"), ("18119", "Battle.net"),
                ("5300", "resolvers"), ("5350", "resolvers"),
                ("abc", "number"), ("0", "port"), ("70000", "port")):
     got = sh('tunnel_port_problem %s' % p)
@@ -184,15 +185,15 @@ for role in ("relay", "exit"):
 rr, xr, rd, xd = confs["relay", "reverse"], confs["exit", "reverse"], confs["relay", "direct"], confs["exit", "direct"]
 check("reverse: the relay listens on the tunnel port",
       "[server]" in rr and 'bind_addr = "0.0.0.0:8444"' in rr, rr)
-check("  and hands the exit's 443, 80, sync API and Spotify's 4070 to loopback only",
+check("  and hands the exit's 443, 80, sync API, Spotify's 4070 and Battle.net's 1119 to loopback only",
       'ports = ["127.0.0.1:18443=443", "127.0.0.1:18080=80",'
-      ' "127.0.0.1:18843=8443", "127.0.0.1:14070=4070"]' in rr, rr)
+      ' "127.0.0.1:18843=8443", "127.0.0.1:14070=4070", "127.0.0.1:11119=1119"]' in rr, rr)
 check("reverse: the exit dials the relay",
       "[client]" in xr and 'remote_addr = "198.51.100.1:8444"' in xr, xr)
 check("direct: the relay dials the exit, with the same local ports",
       'role = "iran"' in rd and 'addr = "203.0.113.2:8444"' in rd
       and "127.0.0.1:18443=443" in rd and "127.0.0.1:18843=8443" in rd
-      and "127.0.0.1:14070=4070" in rd, rd)
+      and "127.0.0.1:14070=4070" in rd and "127.0.0.1:11119=1119" in rd, rd)
 check("direct: the exit listens", 'role = "kharej"' in xd and 'addr = "0.0.0.0:8444"' in xd, xd)
 tokens = {re.search(r'token = "(\w+)"', c).group(1) for c in confs.values()}
 check("every end carries the same token", len(tokens) == 1, str(tokens))
@@ -208,48 +209,97 @@ print("the relay's nginx, both ways")
 nginx = read("templates", "relay-nginx.conf")
 
 
-def render(tunnel):
+def render(tunnel, doh=False):
+    """The relay's nginx the way install_payload fills it: the tunnel blocks
+    kept or cut, and either the DoH blocks or the plain 443 block."""
     out = []
     skip = False
+    cut = [] if tunnel else [("# tunnel begin", "# tunnel end")]
+    cut.append(("# nodoh begin", "# nodoh end") if doh else ("# doh begin", "# doh end"))
     for line in nginx.splitlines():
-        if not tunnel and "# tunnel begin" in line:
+        if any(a in line and not ("nodoh" in line and "nodoh" not in a)
+               for a, _ in cut):
             skip = True
         if not skip:
             out.append(line)
-        if not tunnel and "# tunnel end" in line:
+        if any(b in line and not ("nodoh" in line and "nodoh" not in b)
+               for _, b in cut):
             skip = False
     text = "\n".join(out).replace("__EXIT_IP__", "203.0.113.2")
-    https, http, spot = (("to_exit_https", "to_exit_http", "to_exit_spotify") if tunnel
-                         else ("203.0.113.2:443", "203.0.113.2:80", "203.0.113.2:4070"))
-    return (text.replace("__EXIT_HTTPS__", https).replace("__EXIT_HTTP__", http)
-                .replace("__EXIT_SPOTIFY__", spot))
+    https, http, spot, blz = (
+        ("to_exit_https", "to_exit_http", "to_exit_spotify", "to_exit_blizzard") if tunnel
+        else ("203.0.113.2:443", "203.0.113.2:80", "203.0.113.2:4070", "203.0.113.2:1119"))
+    text = (text.replace("__EXIT_HTTPS__", https).replace("__EXIT_HTTP__", http)
+                .replace("__EXIT_SPOTIFY__", spot).replace("__EXIT_BLIZZARD__", blz))
+    if doh:
+        text = (text.replace("__DOH_HOST__", "users.example.com")
+                    .replace("__DOH_CERT__", "/etc/letsencrypt/live/users.example.com/fullchain.pem")
+                    .replace("__DOH_KEY__", "/etc/letsencrypt/live/users.example.com/privkey.pem"))
+    return text
 
 
 on, off = render(True), render(False)
 check("with a tunnel, every port goes through it",
       "proxy_pass to_exit_https;" in on and "proxy_pass to_exit_http;" in on
-      and "proxy_pass to_exit_spotify;" in on, on[-600:])
+      and "proxy_pass to_exit_spotify;" in on and "proxy_pass to_exit_blizzard;" in on, on[-600:])
 check("  with the exit itself as the fallback",
       "server 203.0.113.2:443 backup;" in on and "server 203.0.113.2:80 backup;" in on)
 check("  and the tunnel's end first", on.index("127.0.0.1:18443") < on.index("203.0.113.2:443 backup"))
 check("without one, straight to the exit as before",
       "proxy_pass 203.0.113.2:443;" in off and "proxy_pass 203.0.113.2:80;" in off
-      and "proxy_pass 203.0.113.2:4070;" in off)
+      and "proxy_pass 203.0.113.2:4070;" in off and "proxy_pass 203.0.113.2:1119;" in off)
 check("  and no trace of the tunnel", "to_exit" not in off and "18443" not in off)
+print("the relay's nginx with DNS over HTTPS")
+don, doff = render(True, doh=True), render(False, doh=True)
+check("443 reads the name and nothing more",
+      "ssl_preread on;" in don and "proxy_pass $https_target;" in don)
+check("  the relay's own name goes to the DoH server",
+      "users.example.com  127.0.0.1:8453;" in don)
+check("  every other name goes where it always went, through the tunnel",
+      "default       to_exit_https;" in don)
+check("  or straight to the exit without one",
+      "default       203.0.113.2:443;" in doff)
+check("  and the plain 443 block is gone, so 443 is not listened on twice",
+      don.count("listen 443;") == 1 and doff.count("listen 443;") == 1)
+check("853 ends TLS and says who connected",
+      "listen 853 ssl;" in don and "proxy_protocol on;" in don
+      and "proxy_pass 127.0.0.1:8054;" in don)
+check("the DoH server speaks HTTP/2, on loopback only - the gate is the way in",
+      "listen 127.0.0.1:8453 ssl http2;" in don and "X-Real-IP $remote_addr" in don
+      and "proxy_pass http://127.0.0.1:8055;" in don)
+check("without a certificate there is no trace of DoH",
+      "8453" not in on and "853" not in on and "https_target" not in on
+      and "\nhttp {" not in on and on.count("listen 443;") == 1)
+for name, text in (("with DoH", don), ("with DoH, no tunnel", doff)):
+    check("%s: no placeholder left, braces balanced" % name,
+          "__" not in text.replace("__MODULE_PATH__", "") and text.count("{") == text.count("}"))
+check("the filler cuts one DoH shape or the other",
+      "${NO_DOH:+/# doh begin/,/# doh end/d}" in LOGIC
+      and "${DOH_ON:+/# nodoh begin/,/# nodoh end/d}" in LOGIC)
+
 for name, text in (("with", on), ("without", off)):
     check("%s: no placeholder left, braces balanced" % name,
           "__" not in text.replace("__MODULE_PATH__", "") and text.count("{") == text.count("}"))
 check("install_payload fills and trims the same way",
       "__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}" in LOGIC
+      and "__EXIT_BLIZZARD__#${EXIT_BLIZZARD:-__EXIT_BLIZZARD__}" in LOGIC
       and "__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}" in LOGIC
       and "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" in LOGIC)
 
 print("the exit lets the tunnel's own end in")
 exitng = read("templates", "exit-nginx.conf")
 check("the relay is allowed into every block that listens outward",
-      exitng.count("allow 127.0.0.1;") == 3 and exitng.count("allow __RELAY_IP__;") == 3)
+      exitng.count("allow 127.0.0.1;") == 4 and exitng.count("allow __RELAY_IP__;") == 4)
 check("and Spotify's access point is where 4070 goes",
       "listen 4070;" in exitng and "proxy_pass ap.spotify.com:4070;" in exitng)
+check("and Battle.net's 1119: the sign-in by its TLS name, Blizzard's names only",
+      "listen 1119;" in exitng and "proxy_pass $blizzard_upstream;" in exitng
+      and "\\.(battle\\.net|blizzard\\.com)$  $ssl_preread_server_name:1119;" in exitng
+      and 'default  "";' in exitng)
+check("  the version check, which is plain HTTP, by its Host on a loopback server",
+      '""       127.0.0.1:18119;' in exitng and "listen 127.0.0.1:18119;" in exitng
+      and "proxy_pass http://$host:1119$request_uri;" in exitng
+      and "listen 127.0.0.1:18119 default_server;" in exitng)
 for m in re.finditer(r"allow __RELAY_IP__;(.*?)deny all;", exitng, re.S):
     check("  loopback sits between the relay and the deny", "allow 127.0.0.1;" in m.group(1))
 
@@ -266,7 +316,8 @@ check("and checks the hash before installing anything",
 check("a download that fails leaves the run on the direct path",
       "! install_backpack" in LOGIC and 'TUNNEL=off; TUNNEL_SPEC=""' in LOGIC)
 check("that happens before nginx is written",
-      LOGIC.index("! install_backpack") < LOGIC.index("install_payload RELAY_NGINX"))
+      LOGIC.index("! install_backpack")
+      < LOGIC.index("install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1"))
 check("only the exit is asked, and never on an upgrade or with ASSUME_YES",
       '[ "$ROLE" = exit ] && [ -z "$TUNNEL" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]' in LOGIC)
 check("the exit's pairing token carries the spec",

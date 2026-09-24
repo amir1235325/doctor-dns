@@ -194,6 +194,37 @@ CREATE TABLE IF NOT EXISTS ip_counters (
     PRIMARY KEY (ip, relay)
 );
 
+-- What each customer used, and when, for the charts on their page. Three
+-- grains, kept for as long as each is worth drawing: five minutes for two
+-- days, hours for a week, days for ninety. Buckets are Tehran time, because
+-- "this evening" and "yesterday" mean the customer's evening and yesterday -
+-- and Tehran is half an hour off the hour, so UTC hours would split every one
+-- of theirs in two.
+--
+-- This is for looking at, not for billing. The bill is users.used_bytes, as
+-- it always was, and nothing here feeds back into it.
+CREATE TABLE IF NOT EXISTS usage (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    grain   TEXT NOT NULL,
+    bucket  TEXT NOT NULL,
+    up      INTEGER NOT NULL DEFAULT 0,
+    down    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, grain, bucket)
+);
+
+-- Which service the traffic went to, per customer per day. Only this is kept:
+-- the relay sends the names its customers' connections asked for, those are
+-- turned into a catalogue service here and dropped. So what survives says
+-- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
+-- after thirty days not even that. Only the customer is shown it.
+CREATE TABLE IF NOT EXISTS usage_service (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day     TEXT NOT NULL,
+    service TEXT NOT NULL,
+    bytes   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day, service)
+);
+
 -- Domains the operator added themselves, on top of the list that ships with
 -- the installer. Kept here rather than edited on each relay so that one entry
 -- reaches every relay, and survives a relay being rebuilt from scratch.
@@ -415,6 +446,15 @@ MIGRATIONS = [
     ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
     # When this account had its trial; one per account.
     ("users", "trial_at", "TEXT"),
+    # The token in the customer's personal DNS-over-HTTPS address. It says
+    # whose template to answer from, since a DoH request reaches the resolver
+    # from nginx on loopback and the connection itself no longer says. It
+    # does not let anybody in: the gate still wants a registered address.
+    ("users", "doh_token", "TEXT"),
+    # The last raw upload and download counters per address and relay, so the
+    # charts can tell the two apart. The bill still comes from last_counter.
+    ("ip_counters", "last_up", "INTEGER NOT NULL DEFAULT 0"),
+    ("ip_counters", "last_down", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -457,6 +497,10 @@ DEFAULT_SETTINGS = {
     "plan_bytes": str(2 * GB),
     "plan_days": "30",
 }
+
+# The public resolvers until the operator picks others: neither sends the
+# asker's subnet on, which Google does and Tencent's games refuse Iran by.
+DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
 
 # Fractions of the quota at which the user is warned, and the bit each one
 # sets in users.warned.
@@ -1299,7 +1343,7 @@ class Store:
             ") last ON last.host = m.host AND last.at = m.at"
         )
 
-    def fold_counters(self, relay, counters):
+    def fold_counters(self, relay, counters, split=None):
         """Turn raw per-address counters into per-user usage.
 
         The kernel counts bytes per address since the element was created. What
@@ -1332,11 +1376,30 @@ class Store:
                         (delta, row["user_id"]),
                     )
                     touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
+                # Upload and download apart, for the charts. The relay sends
+                # both beside the total; one that does not is an older relay,
+                # and its growth goes down as download rather than nowhere.
+                pair = (split or {}).get(ip)
+                if pair:
+                    up, down = int(pair[0]), int(pair[1])
+                    old = self.db.execute(
+                        "SELECT last_up, last_down FROM ip_counters"
+                        " WHERE ip = ? AND relay = ?", (ip, relay)).fetchone()
+                    d_up = up - (old["last_up"] if old else 0)
+                    d_down = down - (old["last_down"] if old else 0)
+                    if d_up < 0 or d_down < 0:
+                        d_up, d_down = up, down
+                else:
+                    up = down = 0
+                    d_up, d_down = 0, max(delta, 0)
+                if d_up or d_down:
+                    record_usage(self.db, row["user_id"], d_up, d_down)
                 self.db.execute(
-                    "INSERT INTO ip_counters (ip, relay, last_counter)"
-                    " VALUES (?, ?, ?) ON CONFLICT(ip, relay)"
-                    " DO UPDATE SET last_counter = excluded.last_counter",
-                    (ip, relay, total))
+                    "INSERT INTO ip_counters (ip, relay, last_counter, last_up, last_down)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(ip, relay)"
+                    " DO UPDATE SET last_counter = excluded.last_counter,"
+                    " last_up = excluded.last_up, last_down = excluded.last_down",
+                    (ip, relay, total, up, down))
             self.db.commit()
         return touched
 
@@ -1582,6 +1645,214 @@ def register_ip(store, user_id, ip):
     store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
               (user_id, ip, now()))
     return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+
+
+# ----------------------------------------------------------------- usage
+# Tehran has kept +03:30 all year since 2022.
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
+# How long each grain is kept, in days.
+USAGE_KEEP = {"5m": 2, "1h": 7, "1d": 90}
+SERVICE_KEEP_DAYS = 30
+
+
+def usage_buckets(when=None):
+    t = (when or datetime.now(timezone.utc)).astimezone(TEHRAN)
+    five = t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)
+    return {"5m": five.strftime("%Y-%m-%dT%H:%M"),
+            "1h": t.strftime("%Y-%m-%dT%H:00"),
+            "1d": t.strftime("%Y-%m-%d")}
+
+
+def record_usage(db, user_id, up, down, when=None):
+    """Add a stretch of traffic to all three grains. Called with the lock held,
+    inside fold_counters' own transaction."""
+    for grain, bucket in usage_buckets(when).items():
+        db.execute("INSERT INTO usage (user_id, grain, bucket, up, down)"
+                   " VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, grain, bucket)"
+                   " DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+                   (user_id, grain, bucket, up, down))
+
+
+def service_index(catalogue):
+    """Every catalogue name, mapped to its service, for turning the names a
+    relay's connections asked for into the service they belong to."""
+    out = {}
+    for svc in catalogue:
+        for grp in svc.get("groups") or ():
+            for d in grp.get("domains") or ():
+                out[d] = svc["key"]
+    return out
+
+
+# What the relay's own ports mean, for traffic that names no host.
+PORT_SERVICES = {":80": "_http", ":4070": "spotify", ":853": "_dns",
+                 # The launcher's version check, which names no host.
+                 ":1119": "blizzard"}
+
+
+def service_of(name, index):
+    """The catalogue service a connection belongs to, by the longest name of
+    ours that the host it asked for ends with."""
+    if name in PORT_SERVICES:
+        return PORT_SERVICES[name]
+    name = name.lower().rstrip(".")
+    parts = name.split(".")
+    for i in range(len(parts) - 1):
+        hit = index.get(".".join(parts[i:]))
+        if hit:
+            return hit
+    return "_other"
+
+
+def record_services(store, rows, catalogue):
+    """What a relay's customers' connections asked for, since the last sync:
+    {ip: {name: bytes}}. Turned into services here; the names go no further."""
+    if not isinstance(rows, dict) or not rows:
+        return
+    index = service_index(catalogue)
+    day = usage_buckets()["1d"]
+    for ip, names in list(rows.items())[:5000]:
+        if not isinstance(names, dict):
+            continue
+        owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+        if not owner:
+            continue
+        per = {}
+        for name, n in names.items():
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                key = service_of(str(name), index)
+                per[key] = per.get(key, 0) + n
+        for key, n in per.items():
+            store.run("INSERT INTO usage_service (user_id, day, service, bytes)"
+                      " VALUES (?, ?, ?, ?) ON CONFLICT(user_id, day, service)"
+                      " DO UPDATE SET bytes = bytes + excluded.bytes",
+                      (owner["user_id"], day, key, n))
+
+
+def prune_usage(store):
+    """Drop what is older than each grain is kept for."""
+    now_t = datetime.now(timezone.utc)
+    for grain, days in USAGE_KEEP.items():
+        cutoff = usage_buckets(now_t - timedelta(days=days))[grain]
+        store.run("DELETE FROM usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
+    cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
+    store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
+
+
+def usage_view(store, user, catalogue, with_services=True):
+    """Everything a usage page draws, in one dict: the customer's page and the
+    admin's user page both build from this."""
+    uid = user["id"]
+    now_t = datetime.now(timezone.utc)
+
+    def series(grain, since):
+        cutoff = usage_buckets(since)[grain]
+        return [(r["bucket"], r["up"], r["down"]) for r in store.q(
+            "SELECT bucket, up, down FROM usage WHERE user_id = ? AND grain = ?"
+            " AND bucket >= ? ORDER BY bucket", (uid, grain, cutoff))]
+
+    five = series("5m", now_t - timedelta(hours=24))
+    hours = series("1h", now_t - timedelta(days=7))
+    days = series("1d", now_t - timedelta(days=60))
+
+    # The latest five minutes that has anything in it, as a speed. Not
+    # instantaneous - the relay reports every half minute - and said so.
+    live = {"up_bps": 0, "down_bps": 0, "at": ""}
+    current = usage_buckets(now_t)["5m"]
+    if five and five[-1][0] == current:
+        start = datetime.strptime(current, "%Y-%m-%dT%H:%M").replace(tzinfo=TEHRAN)
+        took = max(30.0, (now_t - start).total_seconds())
+        live = {"up_bps": int(five[-1][1] * 8 / took),
+                "down_bps": int(five[-1][2] * 8 / took), "at": current}
+
+    today = usage_buckets(now_t)["1d"]
+    by_day = {b: (u, d) for b, u, d in days}
+
+    def total(since_days, until_days=0):
+        lo = usage_buckets(now_t - timedelta(days=since_days))["1d"]
+        hi = usage_buckets(now_t - timedelta(days=until_days))["1d"]
+        u = d = 0
+        for b, (bu, bd) in by_day.items():
+            if lo < b <= hi:
+                u += bu
+                d += bd
+        return u, d
+
+    week, last_week = total(7), total(14, 7)
+    month, last_month = total(30), total(60, 30)
+
+    # When the allowance runs out at the pace of the last seven days.
+    runs_out = None
+    quota, used = user["quota_bytes"] or 0, user["used_bytes"] or 0
+    per_day = (week[0] + week[1]) / 7.0
+    if quota and per_day > 0 and used < quota:
+        runs_out = int((quota - used) / per_day)
+
+    out = {
+        "five": five, "hours": hours, "days": days, "today": today,
+        "live": live, "week": week, "last_week": last_week,
+        "month": month, "last_month": last_month,
+        "runs_out_days": runs_out,
+        "expires": (user["expires_at"] or "")[:10],
+        "quota": quota, "used": used,
+    }
+    if with_services:
+        label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
+        label.update({"_http": "دانلود کنسول و HTTP", "_dns": "DNS رمزگذاری‌شده",
+                      "_other": "سایر"})
+        cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
+        out["services"] = [
+            {"key": r["service"], "label": label.get(r["service"], r["service"]),
+             "bytes": r["b"]}
+            for r in store.q("SELECT service, SUM(bytes) b FROM usage_service"
+                             " WHERE user_id = ? AND day >= ? GROUP BY service"
+                             " ORDER BY b DESC", (uid, cutoff))]
+    return out
+
+
+# ----------------------------------------------------------------- DoH
+def doh_token(store, user):
+    """The customer's personal DoH token, made the first time it is needed."""
+    if user["doh_token"]:
+        return user["doh_token"]
+    token = secrets.token_urlsafe(16)
+    store.run("UPDATE users SET doh_token = ? WHERE id = ? AND doh_token IS NULL",
+              (token, user["id"]))
+    row = store.one("SELECT doh_token FROM users WHERE id = ?", (user["id"],))
+    return row["doh_token"]
+
+
+def doh_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def doh_view(store, user):
+    host = store.setting("doh_host")
+    if not host:
+        return None
+    return {"url": "https://%s/dns-query/%s" % (host, doh_token(store, user)),
+            "dot_host": host}
+
+
+def doh_tokens(store, profiles, default_id):
+    """What the relays need to answer a personal address: the hash of each
+    active customer's token, and the template whose resolver answers them.
+
+    Hashes, not tokens: a relay only has to recognise one, and a relay that
+    is taken over should not hand out working addresses.
+    """
+    out = {}
+    for u in store.q("SELECT id, doh_token, template_id FROM users"
+                     " WHERE status = 'active'"):
+        token = u["doh_token"] or doh_token(store, u)
+        tid = str(u["template_id"] or default_id)
+        out[doh_hash(token)] = {"uid": u["id"],
+                                "profile": tid if tid in profiles else ""}
+    return out
 
 
 # ----------------------------------------------------------------- tickets
@@ -2660,7 +2931,12 @@ class API(http.server.BaseHTTPRequestHandler):
                 ip: int(v) for ip, v in counters.items() if valid_ip(ip) and int(v) >= 0
             }
             who = self.relay_name(body)
-            self.store.fold_counters(who, clean)
+            split = body.get("split") if isinstance(body.get("split"), dict) else None
+            self.store.fold_counters(who, clean, split)
+            try:
+                record_services(self.store, body.get("services"), CATALOGUE)
+            except Exception as e:
+                log_exception("per-service usage not recorded: %r" % e)
             # The relay's own recent logs, now and then, for the logs page.
             if isinstance(body.get("logs"), str):
                 tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
@@ -2682,6 +2958,20 @@ class API(http.server.BaseHTTPRequestHandler):
             if re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url) and \
                     self.store.setting("customer_panel_url") != url:
                 self.store.set_setting("customer_panel_url", url)
+            # The same for DNS over HTTPS: which name has the certificate. Only
+            # ever set, never cleared, so a second relay without DoH does not
+            # flip it back and forth every half minute.
+            doh_host = str(body.get("doh_host") or "")
+            if doh_host and re.fullmatch(r"[a-z0-9.-]{3,253}", doh_host) and \
+                    self.store.setting("doh_host") != doh_host:
+                self.store.set_setting("doh_host", doh_host)
+            # Which resolvers the relay asks and how the admin's last pick
+            # went there, for the settings page. Written only when it changes.
+            report = body.get("upstream")
+            if isinstance(report, dict):
+                text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
+                if self.store.setting("upstream_state:" + who) != text:
+                    self.store.set_setting("upstream_state:" + who, text)
             # The relay names itself by the address it connected from, so a
             # second relay appears on its own without any configuration.
             self.store.record_metrics(who, body.get("host") or {})
@@ -2691,6 +2981,13 @@ class API(http.server.BaseHTTPRequestHandler):
                 enforce_quotas(self.store)
             except Exception as e:
                 log_exception("quota pass failed: %r" % e)
+            # Once an hour is plenty for throwing away what is past keeping.
+            if time.time() - PRUNED[0] > 3600:
+                PRUNED[0] = time.time()
+                try:
+                    prune_usage(self.store)
+                except Exception as e:
+                    log_exception("usage prune failed: %r" % e)
             by_ip, profiles = self.store.profiles(CATALOGUE, DEFAULT_TEMPLATE[0])
             # The label goes into the nftables element as a comment, so that
             # `smartdns-acl list` on the relay is readable without the
@@ -2705,8 +3002,17 @@ class API(http.server.BaseHTTPRequestHandler):
                        for ip, v in sorted(by_ip.items())]
             extra = [r["domain"] for r in self.store.q(
                 "SELECT domain FROM custom_domains ORDER BY domain")]
+            try:
+                doh = doh_tokens(self.store, profiles, DEFAULT_TEMPLATE[0])
+            except Exception as e:
+                doh = {}
+                log_exception("DoH tokens not built: %r" % e)
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
-                                    "extra_domains": extra,
+                                    "extra_domains": extra, "doh": doh,
+                                    # The public resolvers the operator picked;
+                                    # the relay checks them before it takes them.
+                                    "upstream": (self.store.setting("dns_upstream")
+                                                 or DEFAULT_UPSTREAM).split(),
                                     "templates": self.store.template_names(),
                                     "watch": watch_job(self.store),
                                     })
@@ -2733,6 +3039,13 @@ class API(http.server.BaseHTTPRequestHandler):
             if not user:
                 return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
             return self.reply(200, link_code(self.store, user, body.get("password")))
+        if self.path == "/user-usage":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            view = usage_view(self.store, user, CATALOGUE)
+            view["ok"] = True
+            return self.reply(200, view)
         if self.path == "/user-trial":
             user = self._session_user(body.get("session"))
             if not user:
@@ -3039,6 +3352,9 @@ class API(http.server.BaseHTTPRequestHandler):
             "receipt_waiting": ({"at": waiting["created_at"][:16].replace("T", " "),
                                  "plan": waiting["name"] or ""}
                                 if waiting else None),
+            # The personal DoH address. The relay builds the full address from
+            # its own name - it knows which relay the customer is looking at.
+            "doh_token": doh_token(self.store, user),
         }
 
 
@@ -3138,6 +3454,10 @@ def user_view(store, user, relays):
         # customer's DNS has to point.
         "dns": list(relays),
         "trial": trial_view(store, user),
+        # The personal encrypted-DNS addresses, for a bot to hand out: null
+        # until a relay has DoH on. Like plain DNS they answer only on the
+        # registered address; the token says whose template to answer from.
+        "doh": doh_view(store, user),
         "tickets_answered": store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
                                       " AND status = 'answered'", (user["id"],))["c"],
         "receipt_waiting": ({"id": waiting["id"], "created_at": waiting["created_at"],
@@ -3339,6 +3659,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "add_receipt"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
@@ -3644,6 +3965,21 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         res = login_link(self.store, user)
         return (200 if res["ok"] else 503), res
 
+    def api_usage(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        # Without the per-service part: a key is the operator's, and which
+        # services a customer uses is the customer's to see on their own page.
+        view = usage_view(self.store, user, CATALOGUE, with_services=False)
+        view.pop("five", None)
+        view["ok"] = True
+        view["hours"] = [{"hour": b, "up": u, "down": d} for b, u, d in view["hours"]]
+        view["days"] = [{"day": b, "up": u, "down": d} for b, u, d in view["days"]]
+        for k in ("week", "last_week", "month", "last_month"):
+            view[k] = {"up": view[k][0], "down": view[k][1]}
+        return 200, view
+
     def api_trial(self, body, tg):
         user, err = self.customer(tg)
         if err:
@@ -3831,6 +4167,8 @@ def watch_self(store):
 
 CATALOGUE = []
 GAMES = []
+# When old usage was last thrown away.
+PRUNED = [0.0]
 # A one-element list so the API thread sees updates without a global statement.
 DEFAULT_TEMPLATE = [0]
 

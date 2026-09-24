@@ -46,6 +46,8 @@ PAYLOADS = [
     ("PANEL_SERVICE", "templates/smartdns-panel.service"),
     ("SYNC", "templates/smartdns-sync"),
     ("SYNC_SERVICE", "templates/smartdns-sync.service"),
+    ("DOH", "templates/smartdns-doh"),
+    ("DOH_SERVICE", "templates/smartdns-doh.service"),
     ("DNS_PROFILE_UNIT", "templates/smartdns-dns@.service"),
     ("CERT", "templates/smartdns-cert"),
     ("CERT_SERVICE", "templates/smartdns-cert.service"),

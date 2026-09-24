@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.4"
+VERSION="0.7.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -87,6 +87,44 @@ backup_file() {
 # Write payload $1 to file $2, substituting the two addresses. Backs up whatever
 # was there, and skips the write when the content is identical so re-runs do not
 # churn files or trigger needless restarts. Returns 0 only if it changed.
+# Where the relay's certificate is, and so whether it can serve DoH. The
+# name is the customer panel's: one certificate, one name, for the panel on
+# 8443 and for DNS on 443 and 853.
+doh_paths() {
+    DOH_ON=""; NO_DOH=1; DOH_HOST=""; DOH_CERT=""; DOH_KEY=""
+    [ "$ROLE" = relay ] && [ -n "${PANEL_DOMAIN:-}" ] || return 0
+    if [ -n "${PANEL_CERT:-}" ]; then
+        DOH_CERT="$PANEL_CERT"; DOH_KEY="${PANEL_KEY:-}"
+    else
+        DOH_CERT="/etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem"
+        DOH_KEY="/etc/letsencrypt/live/$PANEL_DOMAIN/privkey.pem"
+    fi
+    if [ -f "$DOH_CERT" ] && [ -f "$DOH_KEY" ]; then
+        DOH_ON=1; NO_DOH=""; DOH_HOST="$PANEL_DOMAIN"
+    fi
+}
+
+# Once the certificate exists: nginx with the DoH blocks in, and the flag
+# that tells the customer panel to offer the addresses. On a first install
+# this is what turns DoH on; on an upgrade the nginx step already had the
+# certificate and this only confirms it.
+relay_doh() {
+    [ "$ROLE" = relay ] || return 0
+    local was="$DOH_ON"
+    doh_paths
+    if [ -z "$DOH_ON" ]; then
+        rm -f /etc/smart-dns/doh
+        return 0
+    fi
+    if [ -z "$was" ]; then
+        install_payload RELAY_NGINX /etc/nginx/nginx.conf || true
+        nginx -t || die "nginx rejected the DoH config; the previous one is in $BACKUP_DIR"
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    fi
+    touch /etc/smart-dns/doh
+    info "DNS over HTTPS on https://$DOH_HOST/dns-query, over TLS on $DOH_HOST:853"
+}
+
 install_payload() {
     local name="$1" dest="$2" tmp
     tmp="$(mktemp)"
@@ -103,8 +141,15 @@ install_payload() {
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
               -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
               -e "s#__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}#g" \
+              -e "s#__EXIT_BLIZZARD__#${EXIT_BLIZZARD:-__EXIT_BLIZZARD__}#g" \
               -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
               -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
+              -e "s#__DOH_HOST__#${DOH_HOST:-doh.invalid}#g" \
+              -e "s#__DOH_CERT__#${DOH_CERT:-/nonexistent}#g" \
+              -e "s#__DOH_KEY__#${DOH_KEY:-/nonexistent}#g" \
+              -e "${NO_DOH:+/# doh begin/,/# doh end/d}" \
+              -e "${DOH_ON:+/# nodoh begin/,/# nodoh end/d}" \
+              -e "s#__RESOLVERS__#${RESOLVERS:-1.1.1.1 9.9.9.9}#g" \
         > "$tmp"
     [ -s "$tmp" ] || die "payload $name is empty - is this file complete?"
     # Whether this file was ours or already here decides what uninstall does
@@ -215,6 +260,8 @@ TUNNEL_LOCAL_API=18843
 # with everything else, because on a line where 4070 is filtered the direct
 # path is exactly what is broken.
 TUNNEL_LOCAL_SPOTIFY=14070
+# Battle.net's launcher, on 1119 - the same story as Spotify's port.
+TUNNEL_LOCAL_BLIZZARD=11119
 # Which transports each direction has. A direct tunnel has four; BackPack's
 # spoofing carrier is a different kind of tunnel and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
@@ -240,9 +287,12 @@ tunnel_port_problem() {
         8443) echo "the sync API and the customer panel" ;;
         8445) echo "the bot API" ;;
         8446) echo "the exit's route to Google over IPv6" ;;
+        18119) echo "the exit's route to Battle.net's version check" ;;
+        1119) echo "Battle.net's launcher" ;;
+        4070) echo "Spotify's access point" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
-        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API") echo "the tunnel's own end on the relay" ;;
+        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API"|"$TUNNEL_LOCAL_SPOTIFY"|"$TUNNEL_LOCAL_BLIZZARD") echo "the tunnel's own end on the relay" ;;
     esac
     { [ "$p" -ge 5300 ] && [ "$p" -le 5399 ]; } && echo "the templates' resolvers on the relay"
     admin="$(sed -n 's/^ADMIN_PORT=//p' /etc/smart-dns/admin.env 2>/dev/null | head -1 || true)"
@@ -394,15 +444,15 @@ tunnel_toml() {
     printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY" "$TUNNEL_LOCAL_BLIZZARD"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     elif [ "$TUNNEL_DIRECTION" = reverse ]; then
         printf '[client]\nremote_addr = "%s:%s"\n' "$RELAY_IP" "$TUNNEL_PORT"
     elif [ "$ROLE" = relay ]; then
         printf '[direct]\nrole = "iran"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY" "$TUNNEL_LOCAL_BLIZZARD"
     else
         printf '[direct]\nrole = "kharej"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
@@ -1189,8 +1239,21 @@ if [ "$TUNNEL" = backpack ] && ! install_backpack; then
 fi
 if [ "$ROLE" = relay ] && [ "$TUNNEL" = backpack ]; then
     NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http; EXIT_SPOTIFY=to_exit_spotify
+    EXIT_BLIZZARD=to_exit_blizzard
 else
     NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"; EXIT_SPOTIFY="$EXIT_IP:4070"
+    EXIT_BLIZZARD="$EXIT_IP:1119"
+fi
+# DNS over HTTPS and TLS, on a relay that has a name and a certificate for
+# it. On a first install the certificate comes later in this run, so this is
+# decided again once it is there - see relay_doh.
+doh_paths
+# The exit's public resolvers, as the admin panel last set them - so an
+# upgrade does not put the defaults back over the operator's choice.
+RESOLVERS=""
+if [ "$ROLE" = exit ] && [ -f /etc/smart-dns/upstream ]; then
+    RESOLVERS="$(head -n 1 /etc/smart-dns/upstream \
+        | grep -Ex '([0-9]{1,3}\.){3}[0-9]{1,3}( ([0-9]{1,3}\.){3}[0-9]{1,3})?' || true)"
 fi
 if [ "$ROLE" = relay ]; then
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
@@ -1210,11 +1273,8 @@ if [ "$ROLE" = relay ]; then
         # No timestamp in here. It would make the file differ on every run, so
         # every run would rewrite it and restart dnsmasq for no reason.
         printf '# generated by the smart-dns installer - do not edit by hand\n'
-        # No Google. 8.8.8.8 passes the asker's subnet on (ECS), and services
-        # that refuse Iran in their DNS - Tencent's games answer 0.0.0.1 - saw
-        # this relay's Iranian subnet and refused it. Neither of these two
-        # sends it, and dnsmasq takes turns between them.
-        printf 'no-resolv\nserver=1.1.1.1\nserver=9.9.9.9\n'
+        # The upstream resolvers are in upstream.conf, below: the admin panel
+        # changes them, and this file is rewritten on every upgrade.
         printf 'cache-size=10000\ndomain-needed\nbogus-priv\nno-hosts\n'
         printf 'bind-interfaces\nlisten-address=127.0.0.1,%s\n\n' "$RELAY_IP"
         printf '# domains answered with this relay, so the traffic leaves via the exit\n'
@@ -1228,6 +1288,24 @@ if [ "$ROLE" = relay ]; then
         backup_file /etc/dnsmasq.d/smart-dns.conf
         mv "$tmp" /etc/dnsmasq.d/smart-dns.conf; chmod 644 /etc/dnsmasq.d/smart-dns.conf
         info "wrote $(grep -c '^address=' /etc/dnsmasq.d/smart-dns.conf) domains"
+        DNSMASQ_CHANGED=1
+    fi
+
+    step "dnsmasq: the public resolvers"
+    # A file of its own, because the admin panel changes it (smartdns-sync
+    # writes the pick once it has checked it answers from here). So it is
+    # written only when missing, and an upgrade leaves the choice alone. No
+    # Google by default: 8.8.8.8 passes the asker's subnet on (ECS), and
+    # services that refuse Iran in their DNS - Tencent's games answer 0.0.0.1 -
+    # saw this relay's Iranian subnet and refused it.
+    if [ -f /etc/dnsmasq.d/upstream.conf ]; then
+        info "unchanged ($(grep '^server=' /etc/dnsmasq.d/upstream.conf | cut -d= -f2 | tr '\n' ' '))"
+    else
+        note_file /etc/dnsmasq.d/upstream.conf
+        printf '# the public resolvers - the admin panel changes these\nno-resolv\nserver=1.1.1.1\nserver=9.9.9.9\n' \
+            > /etc/dnsmasq.d/upstream.conf
+        chmod 644 /etc/dnsmasq.d/upstream.conf
+        info "wrote 1.1.1.1 and 9.9.9.9"
         DNSMASQ_CHANGED=1
     fi
 
@@ -1456,6 +1534,7 @@ if [ -n "${PANEL_DOMAIN:-}" ]; then
     [ -f "$CERT_PATH" ] || die "still no certificate at $CERT_PATH"
     remember panel-domain "$PANEL_DOMAIN"
 fi
+relay_doh
 
 # ----------------------------------------------------------------- panel
 if [ "$ROLE" = exit ]; then
@@ -1580,6 +1659,9 @@ EOF
                     warn "  8443    the sync API the relays connect to"
                     warn "  8445    the bot API"
                     warn "  8446    the exit's own route to Google over IPv6"
+                    warn " 18119    the exit's own route to Battle.net"
+                    warn "  1119    Battle.net's launcher"
+                    warn "  4070    Spotify's access point"
                     warn "on a relay, 3478 is taken as well."
                     warn "pick anything else, and open it in your firewall."
                     printf '\n'
@@ -1605,8 +1687,11 @@ EOF
                 8443) die "port 8443 is the sync API the relays connect to" ;;
                 8445) die "port 8445 is the bot API" ;;
                 8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
+                18119) die "port 18119 is the exit's own route to Battle.net" ;;
+                1119) die "port 1119 carries Battle.net's launcher" ;;
+                4070) die "port 4070 carries Spotify's access point" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
-    another. 22, 53, 80, 443, 8443, 8445 and 8446 are all taken." ;;
+    another. 22, 53, 80, 443, 1119, 4070, 8443, 8445, 8446 and 18119 are all taken." ;;
                 "${TUNNEL_PORT:-none}") die "port $ADMIN_PORT carries the tunnel - pick another" ;;
             esac
             # The path stays generated. Nobody types it from memory, and an
@@ -1763,9 +1848,17 @@ EOF
     install_payload DNS_PROFILE_UNIT /etc/systemd/system/smartdns-dns@.service || true
     mkdir -p /etc/smartdns-profiles
     install_payload SYNC_SERVICE /etc/systemd/system/smartdns-sync.service || true
+    # DNS over HTTPS and TLS. Harmless where the relay has no certificate:
+    # nginx only sends it anything once relay_doh has turned DoH on.
+    payload DOH > /usr/local/bin/smartdns-doh
+    chmod +x /usr/local/bin/smartdns-doh
+    note_file /usr/local/bin/smartdns-doh
+    install_payload DOH_SERVICE /etc/systemd/system/smartdns-doh.service || true
     systemctl daemon-reload
     enable_service smartdns-sync.service
     systemctl restart smartdns-sync.service
+    enable_service smartdns-doh.service
+    systemctl restart smartdns-doh.service
     sleep 3
     # Where the customer's panel ended up, for the summary at the end. It is
     # served over TLS or not at all - it asks for a password, and there is no

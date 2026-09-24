@@ -45,12 +45,11 @@ case "${1:-}" in
     [ $# -gt 0 ] || { echo "usage: smartdns bypass <domain> [domain ...]"; exit 1; }
     for d in "$@"; do
       d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
-      if grep -qxF "server=/$d/1.1.1.1" "$BYPASS"; then
+      if grep -q "^server=/$d/" "$BYPASS"; then
         echo "already bypassed: $d"
       else
-        printf 'server=/%s/1.1.1.1
-server=/%s/9.9.9.9
-' "$d" "$d" >> "$BYPASS"
+        # "#": the usual resolvers, whichever the admin panel picked.
+        printf 'server=/%s/#\n' "$d" >> "$BYPASS"
         echo "bypassed (resolves to its real IP now): $d"
       fi
     done
