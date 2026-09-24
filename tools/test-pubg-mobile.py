@@ -48,7 +48,12 @@ def load(path, mod):
 
 import importlib.machinery  # noqa: E402
 
-GAME = {"gcloudcs.com", "igamecj.com", "pubgmobile.com"}
+# The three the game itself talks to, and three more from the platform around
+# it - the shop and Tencent's international API - each checked on 443 with a
+# certificate of its own before being let in. The group is off by default
+# either way, so nothing here routes until an operator asks for it.
+GAME = {"gcloudcs.com", "igamecj.com", "pubgmobile.com",
+        "cloudpvp.com", "igamebuy.com", "intlgame.com"}
 NOT_443 = {"tdatamaster.com": "telemetry, port 8013",
            "proximabeta.com": "login, ports 8085/8086"}
 

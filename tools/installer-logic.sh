@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.3"
+VERSION="0.6.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -102,6 +102,7 @@ install_payload() {
               -e "s#__MODULE_PATH__#${MOD:-__MODULE_PATH__}#g" \
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
               -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
+              -e "s#__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}#g" \
               -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
               -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
         > "$tmp"
@@ -209,6 +210,11 @@ TUNNEL_LOCAL_HTTP=18080
 # arrived, while the same bytes went through the tunnel untouched - so the
 # sync goes through the tunnel too when there is one.
 TUNNEL_LOCAL_API=18843
+# Spotify's access point, which the PlayStation app reaches on 4070 and
+# nowhere else - see the nginx configs for why. It goes through the tunnel
+# with everything else, because on a line where 4070 is filtered the direct
+# path is exactly what is broken.
+TUNNEL_LOCAL_SPOTIFY=14070
 # Which transports each direction has. A direct tunnel has four; BackPack's
 # spoofing carrier is a different kind of tunnel and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
@@ -388,15 +394,15 @@ tunnel_toml() {
     printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     elif [ "$TUNNEL_DIRECTION" = reverse ]; then
         printf '[client]\nremote_addr = "%s:%s"\n' "$RELAY_IP" "$TUNNEL_PORT"
     elif [ "$ROLE" = relay ]; then
         printf '[direct]\nrole = "iran"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
     else
         printf '[direct]\nrole = "kharej"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
@@ -1182,9 +1188,9 @@ if [ "$TUNNEL" = backpack ] && ! install_backpack; then
     TUNNEL=off; TUNNEL_SPEC=""; TUNNEL_OUT="none - BackPack could not be installed"
 fi
 if [ "$ROLE" = relay ] && [ "$TUNNEL" = backpack ]; then
-    NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http
+    NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http; EXIT_SPOTIFY=to_exit_spotify
 else
-    NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"
+    NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"; EXIT_SPOTIFY="$EXIT_IP:4070"
 fi
 if [ "$ROLE" = relay ]; then
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true

@@ -34,6 +34,7 @@ archive.ubuntu.com
 arcraiders.com
 arcsystemworks.com
 arduino.cc
+arena.net
 arenabreakout.com
 arenabreakoutinfinite.com
 arma3.com
@@ -50,6 +51,7 @@ atvi.com
 audio-ak-spotify-com.akamaized.net
 aws.amazon.com
 b4x.com
+badguitarstudio.com
 baeldung.com
 bandainamco.co.jp
 bandainamcoent.com
@@ -266,6 +268,7 @@ fbsbx.com
 fcmobile.com
 fiber.google.com
 figma.com
+finalfantasyxiv.com
 firebase.com
 firebase.google.com
 flurry.com
@@ -340,8 +343,10 @@ gryphline.com
 gst.prod.dl.playstation.net
 gstatic.com
 gtaonline.com
+guildwars2.com
 guiltygear.com
 gvt1.com
+gvt2.com
 hackerrank.com
 halowaypoint.com
 hashicorp.com
@@ -396,6 +401,8 @@ kaggle.com
 kaggle.net
 kaggleusercontent.com
 khanacademy.org
+kick.com
+kickstream.com
 kineticgames.co.uk
 konami.com
 konami.net
@@ -569,6 +576,7 @@ riotcdn.net
 riotgames.co.kr
 riotgames.com
 riotgames.com.tr
+riotgames.jp
 riotgames.zendesk.com
 robertsspaceindustries.com
 roblox.cn
@@ -603,6 +611,7 @@ slack-edge.com
 slack.com
 sledgehammergames.com
 smilegate.com
+sndcdn.com
 socket.io
 softlayer.com
 softonic.com
@@ -610,6 +619,7 @@ sonarsource.com
 sonatype.org
 sonyentertainmentnetwork.com
 soulframe.com
+soundcloud.com
 sparkjava.com
 spiceworks.com
 splunk.com
@@ -620,6 +630,7 @@ spring.io
 springer.com
 squadbusters.game
 squadbustersgame.com
+square-enix.com
 sstatic.net
 st.com
 stackexchange.com

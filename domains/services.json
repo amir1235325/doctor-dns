@@ -307,6 +307,7 @@
             "riotgames.co.kr",
             "riotgames.com",
             "riotgames.com.tr",
+            "riotgames.jp",
             "riotgames.zendesk.com",
             "valorant.com",
             "valorantesports.com"
@@ -442,8 +443,11 @@
           "opt_in": true,
           "note": "مستقیم کار می‌کند؛ فقط برای مشتری‌های اپراتوری روشن کنید که بازی رویش باز نمی‌شود — آپدیت‌های بازی هم از سرورها رد می‌شود",
           "domains": [
+            "cloudpvp.com",
             "gcloudcs.com",
+            "igamebuy.com",
             "igamecj.com",
+            "intlgame.com",
             "pubgmobile.com"
           ]
         }
@@ -793,6 +797,22 @@
           "domains": [
             "toweroffantasy-global.com"
           ]
+        },
+        {
+          "key": "guildwars2",
+          "label": "Guild Wars 2",
+          "domains": [
+            "arena.net",
+            "guildwars2.com"
+          ]
+        },
+        {
+          "key": "ffxiv",
+          "label": "Final Fantasy XIV",
+          "domains": [
+            "finalfantasyxiv.com",
+            "square-enix.com"
+          ]
         }
       ],
       "section": "games"
@@ -1124,6 +1144,7 @@
           "key": "misc",
           "label": "Odds and ends",
           "domains": [
+            "badguitarstudio.com",
             "battlecode.org",
             "gameranger.com",
             "incredibuild.com"
@@ -1150,6 +1171,21 @@
       "section": "media"
     },
     {
+      "key": "kick",
+      "label": "Kick",
+      "section": "media",
+      "groups": [
+        {
+          "key": "main",
+          "label": "همه",
+          "domains": [
+            "kick.com",
+            "kickstream.com"
+          ]
+        }
+      ]
+    },
+    {
       "key": "twitch",
       "label": "Twitch",
       "groups": [
@@ -1165,6 +1201,21 @@
         }
       ],
       "section": "media"
+    },
+    {
+      "key": "soundcloud",
+      "label": "SoundCloud",
+      "section": "media",
+      "groups": [
+        {
+          "key": "main",
+          "label": "همه",
+          "domains": [
+            "sndcdn.com",
+            "soundcloud.com"
+          ]
+        }
+      ]
     },
     {
       "key": "spotify",
@@ -1490,7 +1541,6 @@
             "googletagservices.com",
             "googleusercontent.com",
             "gstatic.com",
-            "gvt1.com",
             "issuetracker.google.com",
             "labs.google",
             "marketingplantform.google.com",
@@ -1503,6 +1553,15 @@
             "tagmanager.google.com",
             "withgoogle.com"
           ]
+        },
+        {
+          "key": "download",
+          "label": "دانلود و آپدیت",
+          "domains": [
+            "gvt1.com",
+            "gvt2.com"
+          ],
+          "section": "downloads"
         }
       ],
       "section": "infra"

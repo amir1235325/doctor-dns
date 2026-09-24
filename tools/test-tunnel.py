@@ -57,7 +57,7 @@ def function(name):
 
 tmp = tempfile.mkdtemp()
 variables = "\n".join(re.findall(
-    r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|LOCAL_API"
+    r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|LOCAL_API|LOCAL_SPOTIFY"
     r"|REVERSE_TRANSPORTS|DIRECT_TRANSPORTS))=.*$",
     LOGIC, re.M))
 names = ["tunnel_transport_ok", "tunnel_port_problem", "parse_tunnel_spec",
@@ -184,14 +184,15 @@ for role in ("relay", "exit"):
 rr, xr, rd, xd = confs["relay", "reverse"], confs["exit", "reverse"], confs["relay", "direct"], confs["exit", "direct"]
 check("reverse: the relay listens on the tunnel port",
       "[server]" in rr and 'bind_addr = "0.0.0.0:8444"' in rr, rr)
-check("  and hands the exit's 443, 80 and sync API to loopback only",
+check("  and hands the exit's 443, 80, sync API and Spotify's 4070 to loopback only",
       'ports = ["127.0.0.1:18443=443", "127.0.0.1:18080=80",'
-      ' "127.0.0.1:18843=8443"]' in rr, rr)
+      ' "127.0.0.1:18843=8443", "127.0.0.1:14070=4070"]' in rr, rr)
 check("reverse: the exit dials the relay",
       "[client]" in xr and 'remote_addr = "198.51.100.1:8444"' in xr, xr)
 check("direct: the relay dials the exit, with the same local ports",
       'role = "iran"' in rd and 'addr = "203.0.113.2:8444"' in rd
-      and "127.0.0.1:18443=443" in rd and "127.0.0.1:18843=8443" in rd, rd)
+      and "127.0.0.1:18443=443" in rd and "127.0.0.1:18843=8443" in rd
+      and "127.0.0.1:14070=4070" in rd, rd)
 check("direct: the exit listens", 'role = "kharej"' in xd and 'addr = "0.0.0.0:8444"' in xd, xd)
 tokens = {re.search(r'token = "(\w+)"', c).group(1) for c in confs.values()}
 check("every end carries the same token", len(tokens) == 1, str(tokens))
@@ -218,30 +219,37 @@ def render(tunnel):
         if not tunnel and "# tunnel end" in line:
             skip = False
     text = "\n".join(out).replace("__EXIT_IP__", "203.0.113.2")
-    https, http = ("to_exit_https", "to_exit_http") if tunnel else ("203.0.113.2:443", "203.0.113.2:80")
-    return text.replace("__EXIT_HTTPS__", https).replace("__EXIT_HTTP__", http)
+    https, http, spot = (("to_exit_https", "to_exit_http", "to_exit_spotify") if tunnel
+                         else ("203.0.113.2:443", "203.0.113.2:80", "203.0.113.2:4070"))
+    return (text.replace("__EXIT_HTTPS__", https).replace("__EXIT_HTTP__", http)
+                .replace("__EXIT_SPOTIFY__", spot))
 
 
 on, off = render(True), render(False)
-check("with a tunnel, both ports go through it",
-      "proxy_pass to_exit_https;" in on and "proxy_pass to_exit_http;" in on, on[-600:])
+check("with a tunnel, every port goes through it",
+      "proxy_pass to_exit_https;" in on and "proxy_pass to_exit_http;" in on
+      and "proxy_pass to_exit_spotify;" in on, on[-600:])
 check("  with the exit itself as the fallback",
       "server 203.0.113.2:443 backup;" in on and "server 203.0.113.2:80 backup;" in on)
 check("  and the tunnel's end first", on.index("127.0.0.1:18443") < on.index("203.0.113.2:443 backup"))
 check("without one, straight to the exit as before",
-      "proxy_pass 203.0.113.2:443;" in off and "proxy_pass 203.0.113.2:80;" in off)
+      "proxy_pass 203.0.113.2:443;" in off and "proxy_pass 203.0.113.2:80;" in off
+      and "proxy_pass 203.0.113.2:4070;" in off)
 check("  and no trace of the tunnel", "to_exit" not in off and "18443" not in off)
 for name, text in (("with", on), ("without", off)):
     check("%s: no placeholder left, braces balanced" % name,
           "__" not in text.replace("__MODULE_PATH__", "") and text.count("{") == text.count("}"))
 check("install_payload fills and trims the same way",
-      "__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}" in LOGIC
+      "__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}" in LOGIC
+      and "__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}" in LOGIC
       and "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" in LOGIC)
 
 print("the exit lets the tunnel's own end in")
 exitng = read("templates", "exit-nginx.conf")
-check("in both blocks the relay is allowed in",
-      exitng.count("allow 127.0.0.1;") == 2 and exitng.count("allow __RELAY_IP__;") == 2)
+check("the relay is allowed into every block that listens outward",
+      exitng.count("allow 127.0.0.1;") == 3 and exitng.count("allow __RELAY_IP__;") == 3)
+check("and Spotify's access point is where 4070 goes",
+      "listen 4070;" in exitng and "proxy_pass ap.spotify.com:4070;" in exitng)
 for m in re.finditer(r"allow __RELAY_IP__;(.*?)deny all;", exitng, re.S):
     check("  loopback sits between the relay and the deny", "allow 127.0.0.1;" in m.group(1))
 

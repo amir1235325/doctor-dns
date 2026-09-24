@@ -75,7 +75,8 @@ EXPLICIT = {
     # the customers of an operator that blocks them. Its telemetry
     # (tdatamaster.com, 8013) and login (proximabeta.com, 8085/8086) are not
     # here at all: the relay carries 80 and 443 only.
-    "pubgmobile.main": ["gcloudcs.com", "igamecj.com", "pubgmobile.com"],
+    "pubgmobile.main": ["gcloudcs.com", "igamecj.com", "pubgmobile.com",
+                        "cloudpvp.com", "igamebuy.com", "intlgame.com"],
     "xbox.download": [
         "dl.delivery.mp.microsoft.com",
         "assets1.xboxlive.com",

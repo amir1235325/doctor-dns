@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.3"
+VERSION="0.6.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -102,6 +102,7 @@ install_payload() {
               -e "s#__MODULE_PATH__#${MOD:-__MODULE_PATH__}#g" \
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
               -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
+              -e "s#__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}#g" \
               -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
               -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
         > "$tmp"
@@ -209,6 +210,11 @@ TUNNEL_LOCAL_HTTP=18080
 # arrived, while the same bytes went through the tunnel untouched - so the
 # sync goes through the tunnel too when there is one.
 TUNNEL_LOCAL_API=18843
+# Spotify's access point, which the PlayStation app reaches on 4070 and
+# nowhere else - see the nginx configs for why. It goes through the tunnel
+# with everything else, because on a line where 4070 is filtered the direct
+# path is exactly what is broken.
+TUNNEL_LOCAL_SPOTIFY=14070
 # Which transports each direction has. A direct tunnel has four; BackPack's
 # spoofing carrier is a different kind of tunnel and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
@@ -388,15 +394,15 @@ tunnel_toml() {
     printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     elif [ "$TUNNEL_DIRECTION" = reverse ]; then
         printf '[client]\nremote_addr = "%s:%s"\n' "$RELAY_IP" "$TUNNEL_PORT"
     elif [ "$ROLE" = relay ]; then
         printf '[direct]\nrole = "iran"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
-               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY"
     else
         printf '[direct]\nrole = "kharej"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
@@ -1182,9 +1188,9 @@ if [ "$TUNNEL" = backpack ] && ! install_backpack; then
     TUNNEL=off; TUNNEL_SPEC=""; TUNNEL_OUT="none - BackPack could not be installed"
 fi
 if [ "$ROLE" = relay ] && [ "$TUNNEL" = backpack ]; then
-    NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http
+    NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http; EXIT_SPOTIFY=to_exit_spotify
 else
-    NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"
+    NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"; EXIT_SPOTIFY="$EXIT_IP:4070"
 fi
 if [ "$ROLE" = relay ]; then
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
@@ -2319,6 +2325,28 @@ exit 0
 #        proxy_connect_timeout 10s;
 #        proxy_pass $upstream;
 #    }
+#    # Spotify's access point. The desktop and phone apps ask apresolve for one
+#    # and are handed the same host on 4070, 443 and 80; they try 4070 first and
+#    # fall back, which is why they work through a relay that carries only 80
+#    # and 443. The PlayStation app does not fall back - it waits on 4070 and
+#    # the app never opens, on a line where 4070 is filtered.
+#    #
+#    # Nothing on this port names its destination: Spotify's own framing has no
+#    # SNI and no Host header, so there is nothing to read a hostname out of.
+#    # The port itself is the answer instead - only Spotify's access points are
+#    # reached on it - and ap.spotify.com is the name Spotify's own GSLB hands
+#    # out, so this follows them rather than pinning one region.
+#    server {
+#        listen 4070;
+#        resolver 1.1.1.1 ipv6=off;
+#        allow __RELAY_IP__;
+#        allow 127.0.0.1;
+#        deny all;
+#        proxy_connect_timeout 10s;
+#        proxy_timeout 10m;
+#        proxy_pass ap.spotify.com:4070;
+#    }
+#
 #    # google-v6 begin
 #
 #    # The IPv6 hop: the same pass-through, asking the resolver for AAAA
@@ -2373,6 +2401,10 @@ exit 0
 #        server 127.0.0.1:18080;
 #        server __EXIT_IP__:80 backup;
 #    }
+#    upstream to_exit_spotify {
+#        server 127.0.0.1:14070;
+#        server __EXIT_IP__:4070 backup;
+#    }
 #    # tunnel end
 #
 #    server {
@@ -2392,6 +2424,14 @@ exit 0
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
 #        proxy_pass __EXIT_HTTP__;
+#    }
+#
+#    # Spotify on 4070 - see the exit's config for why this port exists at all.
+#    server {
+#        listen 4070;
+#        proxy_connect_timeout 10s;
+#        proxy_timeout 10m;
+#        proxy_pass __EXIT_SPOTIFY__;
 #    }
 #}
 #__END_RELAY_NGINX__
@@ -2617,7 +2657,7 @@ exit 0
 #    chain count_in {
 #        type filter hook input priority 10 ; policy accept ;
 #        ip saddr @allowed udp dport 53 update @up { ip saddr counter }
-#        ip saddr @allowed tcp dport { 53, 80, 443 } update @up { ip saddr counter }
+#        ip saddr @allowed tcp dport { 53, 80, 443, 4070 } update @up { ip saddr counter }
 #    }
 #
 #    # What we send back. nginx talks to the exit node as a local process, from
@@ -2626,7 +2666,7 @@ exit 0
 #    chain count_out {
 #        type filter hook output priority 10 ; policy accept ;
 #        ip daddr @allowed udp sport 53 update @down { ip daddr counter }
-#        ip daddr @allowed tcp sport { 53, 80, 443 } update @down { ip daddr counter }
+#        ip daddr @allowed tcp sport { 53, 80, 443, 4070 } update @down { ip daddr counter }
 #    }
 #
 #    # Amplification defence, unchanged. An open resolver is worth roughly its
@@ -2928,7 +2968,7 @@ exit 0
 #add rule inet smartdns gate iif "lo" accept
 #
 #add rule inet smartdns gate ip saddr != @allowed udp dport 53 drop
-#add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443 } drop
+#add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443, 4070 } drop
 #RULES
 #        nft flush chain $TABLE gate
 #        nft -f "$ENFORCE" || { rm -f "$ENFORCE"; die "nft refused the rules; nothing changed"; }
@@ -16682,6 +16722,7 @@ exit 0
 #arcraiders.com
 #arcsystemworks.com
 #arduino.cc
+#arena.net
 #arenabreakout.com
 #arenabreakoutinfinite.com
 #arma3.com
@@ -16698,6 +16739,7 @@ exit 0
 #audio-ak-spotify-com.akamaized.net
 #aws.amazon.com
 #b4x.com
+#badguitarstudio.com
 #baeldung.com
 #bandainamco.co.jp
 #bandainamcoent.com
@@ -16914,6 +16956,7 @@ exit 0
 #fcmobile.com
 #fiber.google.com
 #figma.com
+#finalfantasyxiv.com
 #firebase.com
 #firebase.google.com
 #flurry.com
@@ -16988,8 +17031,10 @@ exit 0
 #gst.prod.dl.playstation.net
 #gstatic.com
 #gtaonline.com
+#guildwars2.com
 #guiltygear.com
 #gvt1.com
+#gvt2.com
 #hackerrank.com
 #halowaypoint.com
 #hashicorp.com
@@ -17044,6 +17089,8 @@ exit 0
 #kaggle.net
 #kaggleusercontent.com
 #khanacademy.org
+#kick.com
+#kickstream.com
 #kineticgames.co.uk
 #konami.com
 #konami.net
@@ -17217,6 +17264,7 @@ exit 0
 #riotgames.co.kr
 #riotgames.com
 #riotgames.com.tr
+#riotgames.jp
 #riotgames.zendesk.com
 #robertsspaceindustries.com
 #roblox.cn
@@ -17251,6 +17299,7 @@ exit 0
 #slack.com
 #sledgehammergames.com
 #smilegate.com
+#sndcdn.com
 #socket.io
 #softlayer.com
 #softonic.com
@@ -17258,6 +17307,7 @@ exit 0
 #sonatype.org
 #sonyentertainmentnetwork.com
 #soulframe.com
+#soundcloud.com
 #sparkjava.com
 #spiceworks.com
 #splunk.com
@@ -17268,6 +17318,7 @@ exit 0
 #springer.com
 #squadbusters.game
 #squadbustersgame.com
+#square-enix.com
 #sstatic.net
 #st.com
 #stackexchange.com
@@ -17719,6 +17770,7 @@ exit 0
 #            "riotgames.co.kr",
 #            "riotgames.com",
 #            "riotgames.com.tr",
+#            "riotgames.jp",
 #            "riotgames.zendesk.com",
 #            "valorant.com",
 #            "valorantesports.com"
@@ -17854,8 +17906,11 @@ exit 0
 #          "opt_in": true,
 #          "note": "مستقیم کار می‌کند؛ فقط برای مشتری‌های اپراتوری روشن کنید که بازی رویش باز نمی‌شود — آپدیت‌های بازی هم از سرورها رد می‌شود",
 #          "domains": [
+#            "cloudpvp.com",
 #            "gcloudcs.com",
+#            "igamebuy.com",
 #            "igamecj.com",
+#            "intlgame.com",
 #            "pubgmobile.com"
 #          ]
 #        }
@@ -18205,6 +18260,22 @@ exit 0
 #          "domains": [
 #            "toweroffantasy-global.com"
 #          ]
+#        },
+#        {
+#          "key": "guildwars2",
+#          "label": "Guild Wars 2",
+#          "domains": [
+#            "arena.net",
+#            "guildwars2.com"
+#          ]
+#        },
+#        {
+#          "key": "ffxiv",
+#          "label": "Final Fantasy XIV",
+#          "domains": [
+#            "finalfantasyxiv.com",
+#            "square-enix.com"
+#          ]
 #        }
 #      ],
 #      "section": "games"
@@ -18536,6 +18607,7 @@ exit 0
 #          "key": "misc",
 #          "label": "Odds and ends",
 #          "domains": [
+#            "badguitarstudio.com",
 #            "battlecode.org",
 #            "gameranger.com",
 #            "incredibuild.com"
@@ -18562,6 +18634,21 @@ exit 0
 #      "section": "media"
 #    },
 #    {
+#      "key": "kick",
+#      "label": "Kick",
+#      "section": "media",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "kick.com",
+#            "kickstream.com"
+#          ]
+#        }
+#      ]
+#    },
+#    {
 #      "key": "twitch",
 #      "label": "Twitch",
 #      "groups": [
@@ -18577,6 +18664,21 @@ exit 0
 #        }
 #      ],
 #      "section": "media"
+#    },
+#    {
+#      "key": "soundcloud",
+#      "label": "SoundCloud",
+#      "section": "media",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "sndcdn.com",
+#            "soundcloud.com"
+#          ]
+#        }
+#      ]
 #    },
 #    {
 #      "key": "spotify",
@@ -18902,7 +19004,6 @@ exit 0
 #            "googletagservices.com",
 #            "googleusercontent.com",
 #            "gstatic.com",
-#            "gvt1.com",
 #            "issuetracker.google.com",
 #            "labs.google",
 #            "marketingplantform.google.com",
@@ -18915,6 +19016,15 @@ exit 0
 #            "tagmanager.google.com",
 #            "withgoogle.com"
 #          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود و آپدیت",
+#          "domains": [
+#            "gvt1.com",
+#            "gvt2.com"
+#          ],
+#          "section": "downloads"
 #        }
 #      ],
 #      "section": "infra"
@@ -20418,6 +20528,26 @@ exit 0
 #      "kind": "game",
 #      "needs": [
 #        "anime/oncehuman",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "guildwars2",
+#      "name": "گیلد وارز ۲",
+#      "en": "Guild Wars 2",
+#      "kind": "game",
+#      "needs": [
+#        "anime/guildwars2",
+#        "steam/main"
+#      ]
+#    },
+#    {
+#      "key": "ffxiv",
+#      "name": "فاینال فانتزی XIV",
+#      "en": "Final Fantasy XIV",
+#      "kind": "game",
+#      "needs": [
+#        "anime/ffxiv",
 #        "steam/main"
 #      ]
 #    },

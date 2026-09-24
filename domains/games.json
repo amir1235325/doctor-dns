@@ -989,6 +989,26 @@
       ]
     },
     {
+      "key": "guildwars2",
+      "name": "گیلد وارز ۲",
+      "en": "Guild Wars 2",
+      "kind": "game",
+      "needs": [
+        "anime/guildwars2",
+        "steam/main"
+      ]
+    },
+    {
+      "key": "ffxiv",
+      "name": "فاینال فانتزی XIV",
+      "en": "Final Fantasy XIV",
+      "kind": "game",
+      "needs": [
+        "anime/ffxiv",
+        "steam/main"
+      ]
+    },
+    {
       "key": "lostark",
       "name": "لاست آرک",
       "en": "Lost Ark",
