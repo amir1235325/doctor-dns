@@ -1063,6 +1063,51 @@ def upstream_report():
             "tested": UPSTREAM["tested"], "error": UPSTREAM["error"]}
 
 
+# ---------------------------------------------------------------- DNS seen
+def dns_seen():
+    """How many bytes of DNS each registered address has sent this relay
+    since the set was made: {ip: bytes}. The panel only looks at whether it
+    grew, which is what says a customer's queries are reaching us."""
+    r = nft("-j", "list", "set", "inet", "smartdns", "dns")
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for item in json.loads(r.stdout or "{}").get("nftables", []):
+        for e in (item.get("set") or {}).get("elem") or []:
+            e = e.get("elem") if isinstance(e, dict) else None
+            if isinstance(e, dict) and isinstance(e.get("val"), str):
+                out[e["val"]] = int((e.get("counter") or {}).get("bytes") or 0)
+    return out
+
+
+# What smartdns-doh counted: how many queries each customer made, never
+# which names. Read, delivered, then gone, like the usage lines.
+DOH_STATS_DIR = "/run/smartdns-doh-stats"
+DOH_PENDING = {"doh": {}, "dot": {}}
+
+
+def take_doh_stats():
+    try:
+        names = sorted(n for n in os.listdir(DOH_STATS_DIR) if n.endswith(".json"))
+    except OSError:
+        names = []
+    for n in names:
+        path = os.path.join(DOH_STATS_DIR, n)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                got = json.load(fh)
+            for kind in ("doh", "dot"):
+                for key, count in (got.get(kind) or {}).items():
+                    DOH_PENDING[kind][key] = DOH_PENDING[kind].get(key, 0) + int(count)
+        except (OSError, ValueError) as e:
+            log(WARN, "DoH counts not read: %s" % e)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return {k: dict(v) for k, v in DOH_PENDING.items()}
+
+
 # ---------------------------------------------------------------- usage
 # Where nginx writes it; see the note in relay-nginx.conf on why /run.
 USAGE_LOG = "/run/smartdns-usage"
@@ -1146,6 +1191,13 @@ def sync_once():
         log(WARN, "usage not read: %s" % e)
     if services:
         payload["services"] = services
+    try:
+        payload["dns_seen"] = dns_seen()
+    except Exception as e:
+        log(WARN, "DNS counters not read: %s" % e)
+    doh_stats = take_doh_stats()
+    if doh_stats["doh"] or doh_stats["dot"]:
+        payload["doh_stats"] = doh_stats
     if logs_due():
         payload["logs"] = recent_logs()
         payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
@@ -1156,6 +1208,9 @@ def sync_once():
     answer = post("/sync", payload)
     if services:
         USAGE_PENDING.clear()
+    if "doh_stats" in payload:
+        DOH_PENDING["doh"].clear()
+        DOH_PENDING["dot"].clear()
     # Delivered: the panel has it, so it is not sent again.
     if finished and WATCH_DONE["result"] is finished:
         WATCH_DONE["result"] = None
@@ -1925,6 +1980,63 @@ def human_fa(n):
 
 
 # ---------------------------------------------------------------- DoH page
+# How recent a query has to be to count as "reaching us". Long enough that a
+# console left on is not flagged between two lookups, short enough that a
+# relay the customer has lost says so the same evening.
+DNS_FRESH = 3600
+
+
+def seconds_since(ts):
+    try:
+        t = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return max(0, (datetime.now(timezone.utc) - t).total_seconds())
+
+
+def ago(seconds):
+    if seconds < 90:
+        return "همین الان"
+    if seconds < 3600:
+        return "%d دقیقه پیش" % (seconds // 60)
+    if seconds < 86400:
+        return "%d ساعت پیش" % (seconds // 3600)
+    return "%d روز پیش" % (seconds // 86400)
+
+
+def dns_check(info):
+    """Whether the registered internet's DNS reaches this relay.
+
+    Not a test the page runs - a browser cannot put a DNS query to anybody,
+    let alone see who answered - but what the relay itself has seen: the
+    kernel counts each registered address's queries on port 53, and
+    smartdns-doh counts the encrypted ones. Nothing arriving means the DNS
+    was never set, or the operator answers it before it gets here.
+    """
+    if not info.get("ip"):
+        return ""
+    plain = seconds_since(info.get("dns_seen_at"))
+    safe = seconds_since(info.get("doh_seen_at"))
+    added = seconds_since(info.get("ip_added_at"))
+    if plain is not None and plain < DNS_FRESH:
+        return ("<p class='note'>✅ DNS اینترنت ثبت‌شده‌تان به ما می‌رسد — آخرین "
+                "درخواست %s.</p>" % ago(plain))
+    if safe is not None and safe < DNS_FRESH:
+        return ("<p class='note'>✅ از DNS رمزگذاری‌شده استفاده می‌کنید — آخرین "
+                "درخواست %s.</p>" % ago(safe))
+    if plain is None and added is not None and added < 900:
+        return ("<p class='note'>⏳ هنوز درخواست DNS از اینترنت ثبت‌شده‌تان نرسیده. "
+                "DNS را روی مودم یا کنسول بگذارید؛ چند دقیقه بعد این‌جا تأیید "
+                "می‌شود.</p>")
+    return ("<div class='msg warnbox'>⚠️ در یک ساعت اخیر هیچ درخواست DNS از اینترنت "
+            "ثبت‌شده‌تان به ما نرسیده%s. اگر دستگاهتان روشن است و سرویس کار نمی‌کند: "
+            "یا DNS را روی مودم یا کنسول نگذاشته‌اید، یا اپراتور اینترنتتان DNS را "
+            "می‌رباید. در این صورت از «DNS رمزگذاری‌شده» پایین همین صفحه استفاده "
+            "کنید.</div>" % (" (آخرین: %s)" % ago(plain) if plain is not None else ""))
+
+
 def doh_url(info):
     """The customer's personal DNS-over-HTTPS address, on this relay's name."""
     token = info.get("doh_token") or ""
@@ -1986,7 +2098,15 @@ def doh_box(info, profile="/doh.mobileconfig", setup=False):
         "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله "
         "می‌گوید قالب شما کدام است.</p>"
         "<h3>DoH — DNS over HTTPS</h3>"
-        + copy_field(url, "آدرس DoH شخصی") +
+        + copy_field(url, "آدرس DoH شخصی")
+        # Not on the setup page: that one is opened by the address itself,
+        # and whoever holds the address should not be able to replace it.
+        + ("" if setup else
+           "<form method='post' action='/doh-reset' style='margin:0 16px 4px' onsubmit="
+           "\"return confirm('آدرس فعلی از کار می‌افتد و باید آدرس تازه را روی "
+           "دستگاه‌هایتان بگذارید. ادامه می‌دهید؟')\"><button class='ghost small'>"
+           "ساختن آدرس تازه</button></form><p class='note'>اگر آدرس به دست کس "
+           "دیگری افتاده. آدرس قبلی تا یک دقیقه بعد دیگر کار نمی‌کند.</p>") +
         # DoT has no path to carry a token: the relay answers it from the
         # template of the registered address it arrives from.
         "<h3>DoT — DNS over TLS</h3>"
@@ -2669,6 +2789,14 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
             return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 
+        if path == "/doh-reset":
+            if not self.session():
+                return self.redirect("/login")
+            res = self.ask_panel("/user-doh-reset", {})
+            if res is None:
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
         if path == "/telegram-unlink":
             if not self.session():
                 return self.redirect("/login")
@@ -3025,6 +3153,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         body.append(gauge)
         body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
         body.append(dns_box())
+        body.append(dns_check(info))
 
         if not info["ip"]:
             body.append(

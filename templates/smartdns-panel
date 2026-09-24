@@ -217,6 +217,20 @@ CREATE TABLE IF NOT EXISTS usage (
 -- turned into a catalogue service here and dropped. So what survives says
 -- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
 -- after thirty days not even that. Only the customer is shown it.
+-- DoH and DoT, per day: how many queries of each, and who used them at all -
+-- for the admin panel's figures. Counts only; nothing of what was asked.
+CREATE TABLE IF NOT EXISTS doh_daily (
+    day     TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    queries INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, kind)
+);
+CREATE TABLE IF NOT EXISTS doh_users (
+    day     TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (day, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS usage_service (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     day     TEXT NOT NULL,
@@ -455,6 +469,12 @@ MIGRATIONS = [
     # charts can tell the two apart. The bill still comes from last_counter.
     ("ip_counters", "last_up", "INTEGER NOT NULL DEFAULT 0"),
     ("ip_counters", "last_down", "INTEGER NOT NULL DEFAULT 0"),
+    # The relay's count of DNS bytes from this address, and when it last
+    # grew: the customer's page says whether their DNS reaches us.
+    ("ip_counters", "last_dns", "INTEGER NOT NULL DEFAULT 0"),
+    ("ips", "dns_seen_at", "TEXT"),
+    # When this account last used DoH or DoT.
+    ("users", "doh_seen_at", "TEXT"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -1733,6 +1753,70 @@ def record_services(store, rows, catalogue):
                       (owner["user_id"], day, key, n))
 
 
+def record_dns(store, relay, seen):
+    """A relay's DNS counters, {ip: bytes}: an address whose count moved has
+    had its queries reach us, which is what the customer's page reports."""
+    if not isinstance(seen, dict):
+        return
+    for ip, n in list(seen.items())[:5000]:
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        row = store.one("SELECT last_dns FROM ip_counters WHERE ip = ? AND relay = ?",
+                        (ip, relay))
+        if row is None or n == row["last_dns"]:
+            continue
+        # Grown, or smaller because the set was rebuilt: either way queries
+        # arrived since the last reading.
+        if n > 0:
+            store.run("UPDATE ips SET dns_seen_at = ? WHERE ip = ?", (now(), ip))
+        store.run("UPDATE ip_counters SET last_dns = ? WHERE ip = ? AND relay = ?",
+                  (n, ip, relay))
+
+
+def record_doh(store, stats):
+    """smartdns-doh's counts from a relay: DoH by account, DoT by address."""
+    if not isinstance(stats, dict):
+        return
+    day = usage_buckets()["1d"]
+    totals = {"doh": 0, "dot": 0}
+    users = set()
+    for uid, n in list((stats.get("doh") or {}).items())[:5000]:
+        try:
+            uid, n = int(uid), int(n)
+        except (TypeError, ValueError):
+            continue
+        totals["doh"] += max(0, n)
+        if uid > 0:
+            users.add(uid)
+    for ip, n in list((stats.get("dot") or {}).items())[:5000]:
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        totals["dot"] += max(0, n)
+        owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (str(ip),))
+        if owner:
+            users.add(owner["user_id"])
+    for kind, n in totals.items():
+        if n:
+            store.run("INSERT INTO doh_daily (day, kind, queries) VALUES (?, ?, ?)"
+                      " ON CONFLICT(day, kind) DO UPDATE SET queries = queries + excluded.queries",
+                      (day, kind, n))
+    for uid in users:
+        if store.one("SELECT 1 FROM users WHERE id = ?", (uid,)):
+            store.run("INSERT OR IGNORE INTO doh_users (day, user_id) VALUES (?, ?)", (day, uid))
+            store.run("UPDATE users SET doh_seen_at = ? WHERE id = ?", (now(), uid))
+
+
+def new_doh_token(store, user):
+    """A fresh personal address; the old one stops at the relay's next sync."""
+    token = secrets.token_urlsafe(16)
+    store.run("UPDATE users SET doh_token = ? WHERE id = ?", (token, user["id"]))
+    return token
+
+
 def prune_usage(store):
     """Drop what is older than each grain is kept for."""
     now_t = datetime.now(timezone.utc)
@@ -1741,6 +1825,9 @@ def prune_usage(store):
         store.run("DELETE FROM usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
     cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
     store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
+    cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
+    store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
+    store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 
 
 def usage_view(store, user, catalogue, with_services=True):
@@ -2937,6 +3024,11 @@ class API(http.server.BaseHTTPRequestHandler):
                 record_services(self.store, body.get("services"), CATALOGUE)
             except Exception as e:
                 log_exception("per-service usage not recorded: %r" % e)
+            try:
+                record_dns(self.store, who, body.get("dns_seen"))
+                record_doh(self.store, body.get("doh_stats"))
+            except Exception as e:
+                log_exception("DNS counts not recorded: %r" % e)
             # The relay's own recent logs, now and then, for the logs page.
             if isinstance(body.get("logs"), str):
                 tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
@@ -3046,6 +3138,13 @@ class API(http.server.BaseHTTPRequestHandler):
             view = usage_view(self.store, user, CATALOGUE)
             view["ok"] = True
             return self.reply(200, view)
+        if self.path == "/user-doh-reset":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            new_doh_token(self.store, user)
+            return self.reply(200, {"ok": True, "message": "آدرس تازه ساخته شد؛ تا یک دقیقه "
+                                    "دیگر کار می‌کند و آدرس قبلی دیگر نه"})
         if self.path == "/user-trial":
             user = self._session_user(body.get("session"))
             if not user:
@@ -3355,6 +3454,11 @@ class API(http.server.BaseHTTPRequestHandler):
             # The personal DoH address. The relay builds the full address from
             # its own name - it knows which relay the customer is looking at.
             "doh_token": doh_token(self.store, user),
+            # Whether that address's DNS reaches us, and whether this account
+            # uses the encrypted kind: the page's "your DNS arrives" line.
+            "dns_seen_at": ips[0]["dns_seen_at"] if ips else None,
+            "ip_added_at": ips[0]["added_at"] if ips else None,
+            "doh_seen_at": user["doh_seen_at"],
         }
 
 
@@ -3660,6 +3764,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
@@ -3979,6 +4084,16 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         for k in ("week", "last_week", "month", "last_month"):
             view[k] = {"up": view[k][0], "down": view[k][1]}
         return 200, view
+
+    def api_doh_reset(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        new_doh_token(self.store, user)
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, {"ok": True, "message": "آدرس تازه ساخته شد؛ تا یک دقیقه دیگر کار "
+                     "می‌کند و آدرس قبلی دیگر نه",
+                     "user": user_view(self.store, user, self.relays)}
 
     def api_trial(self, body, tg):
         user, err = self.customer(tg)

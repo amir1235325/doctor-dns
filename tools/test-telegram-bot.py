@@ -298,6 +298,10 @@ check("then the personal DoH address, and the DoT name for Android",
 check("with a way into the web page, for the iPhone profile",
       tg.buttons(CUSTOMER)[0]["callback_data"] == "login")
 check("and the button is on the menu", botmod.B_DOH in sum(botmod.MENU["keyboard"], []))
+tap(CUSTOMER, "dohnew")
+fresh = store.one("SELECT doh_token FROM users WHERE telegram_id = ?", (CUSTOMER,))["doh_token"]
+check("the new-address button replaces it, and shows the new one",
+      fresh != token and "https://user.example.com/dns-query/%s" % fresh in tg.last(CUSTOMER)["text"])
 
 print("support")
 message(CUSTOMER, botmod.B_SUPPORT)

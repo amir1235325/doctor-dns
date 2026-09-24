@@ -590,6 +590,43 @@ def heat_chart(hours):
 
 
 
+def doh_card():
+    """DoH and DoT over the last week: queries of each, and how many
+    customers used them at all. Counts only - nothing of what was asked."""
+    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
+    try:
+        rows = STORE.q("SELECT day, kind, queries FROM doh_daily WHERE day >= ?"
+                       " ORDER BY day DESC", (since,))
+        people = STORE.q("SELECT day, count(*) c FROM doh_users WHERE day >= ?"
+                         " GROUP BY day", (since,))
+        week = STORE.one("SELECT count(DISTINCT user_id) c FROM doh_users WHERE day >= ?",
+                         (since,))["c"]
+    except sqlite3.OperationalError:
+        return ""          # a panel that has not made the tables yet
+    if not rows:
+        return ("<div class='card'><h2>DNS امن (DoH و DoT)</h2><p class='muted'>در ۷ روز "
+                "اخیر کسی از DNS امن استفاده نکرده.</p></div>")
+    by = {}
+    for r in rows:
+        by.setdefault(r["day"], {})[r["kind"]] = r["queries"]
+    users = {r["day"]: r["c"] for r in people}
+    doh = sum(v.get("doh", 0) for v in by.values())
+    dot = sum(v.get("dot", 0) for v in by.values())
+    out = ["<div class='card'><h2>DNS امن (DoH و DoT) — ۷ روز اخیر</h2><div class='grid'>"]
+    for n, l in ((week, "مشتری"), (format(doh, ","), "کوئری DoH"),
+                 (format(dot, ","), "کوئری DoT")):
+        out.append("<div class='stat'><div class='n'>%s</div><div class='l'>%s</div></div>"
+                   % (n, l))
+    out.append("</div><table><tr><th>روز</th><th>DoH</th><th>DoT</th><th>مشتری</th></tr>")
+    for day in sorted(by, reverse=True):
+        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>"
+                   % (day, format(by[day].get("doh", 0), ","),
+                      format(by[day].get("dot", 0), ","), users.get(day, 0)))
+    out.append("</table><p class='muted'>فقط تعداد؛ اینکه چه اسمی پرسیده شد جایی نگه "
+               "داشته نمی‌شود. روز به وقت تهران.</p></div>")
+    return "".join(out)
+
+
 def user_usage(uid):
     """The same numbers the customer's page is drawn from, straight from the
     panel's tables - this runs beside it, on the same database."""
@@ -2369,6 +2406,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
             out.append("<div class='stat'><div class='n'>%s</div>"
                        "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
         out.append("</div></div>")
+
+        out.append(doh_card())
 
         rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
                        " FROM metrics GROUP BY host) l"

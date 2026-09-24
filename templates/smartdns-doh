@@ -20,7 +20,12 @@ connecting address says whose template to use; on DoH the connection comes
 from nginx on loopback and says nothing, so the personal address carries a
 token instead - it only says which customer's template to answer from.
 
-Nothing is logged about what anybody asked.
+Nothing is logged about what anybody asked. What is counted is how many
+queries each customer made, for the admin panel's figures and the customer
+page's "your DNS reaches us" line - never which names.
+
+Each customer is held to a rate - a broken device, or somebody who has the
+address and no business with it, cannot load the relay's resolvers.
 """
 import base64
 import hashlib
@@ -47,6 +52,15 @@ TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 # nginx on this machine: every DoH request arrives from here, after the gate
 # has let the customer in on 443.
 LOOPBACK = {"127.0.0.1", "::1", ""}
+# Where the counts go for smartdns-sync to collect: one finished file per
+# flush, so the two never need a lock between them. In /run, which is memory.
+STATS_DIR = "/run/smartdns-doh-stats"
+STATS_EVERY = 15
+# Queries a second each customer may make, and how many at once on top.
+# A phone opening an app asks for twenty names in a burst and then nothing;
+# this only ever stops something that keeps going.
+RATE = 50
+BURST = 200
 
 INFO, WARN, ERROR = 6, 4, 3
 
@@ -107,6 +121,83 @@ class State:
 
 
 STATE_NOW = State()
+
+
+# ---------------------------------------------------------------- limits
+class Limiter:
+    """A bucket of queries per customer, refilled at RATE a second."""
+
+    def __init__(self, rate=RATE, burst=BURST):
+        self.rate, self.burst = float(rate), float(burst)
+        self.buckets = {}
+        self.warned = {}
+        self.lock = threading.Lock()
+
+    def allow(self, key, label=None):
+        """label is what the log says; the key may be a token, which does
+        not belong in a log the admin panel shows."""
+        now = time.monotonic()
+        with self.lock:
+            tokens, at = self.buckets.get(key, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - at) * self.rate)
+            ok = tokens >= 1
+            self.buckets[key] = (tokens - 1 if ok else tokens, now)
+            if len(self.buckets) > 20000:
+                # Whoever has been quiet long enough to be full again is
+                # the same as somebody never seen.
+                full = self.burst / self.rate
+                self.buckets = {k: v for k, v in self.buckets.items()
+                                if now - v[1] < full}
+            if not ok and now - self.warned.get(key, -1e9) > 60:
+                self.warned[key] = now
+                log(WARN, "rate-limited: %s" % (label or key))
+        return ok
+
+
+LIMIT = Limiter()
+
+
+class Stats:
+    """How many queries each customer made since the last flush: DoH by
+    account, DoT by address. Counts only, never names."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.doh, self.dot = {}, {}
+
+    def count(self, kind, key):
+        with self.lock:
+            table = self.doh if kind == "doh" else self.dot
+            table[key] = table.get(key, 0) + 1
+
+    def take(self):
+        with self.lock:
+            out = {"doh": self.doh, "dot": self.dot}
+            self.doh, self.dot = {}, {}
+        return out
+
+
+STATS = Stats()
+
+
+def flush_stats(directory=STATS_DIR):
+    got = STATS.take()
+    if not got["doh"] and not got["dot"]:
+        return
+    os.makedirs(directory, exist_ok=True)
+    name = os.path.join(directory, "%d-%d" % (time.time() * 1000, os.getpid()))
+    with open(name + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(got, fh)
+    os.replace(name + ".tmp", name + ".json")
+
+
+def flush_loop():
+    while True:
+        time.sleep(STATS_EVERY)
+        try:
+            flush_stats()
+        except OSError as e:
+            log(WARN, "counts not written: %s" % e)
 
 
 # ---------------------------------------------------------------- resolving
@@ -226,6 +317,7 @@ class DoH(http.server.BaseHTTPRequestHandler):
             return self.fail(403, "not through the relay")
         state = STATE_NOW
         port = MAIN_PORT
+        uid = "0"
         if token:
             found = state.by_token(token)
             if not found:
@@ -233,6 +325,11 @@ class DoH(http.server.BaseHTTPRequestHandler):
                 # rather than answer with something that looks like DNS.
                 return self.fail(403, "this address is no longer valid")
             port = int(found[1].get("port") or MAIN_PORT)
+            uid = str(found[1].get("uid") or "0")
+        if not LIMIT.allow("doh:" + (token or "-"), "DoH, account %s" % uid):
+            self.fail(429, "too many queries")
+            return
+        STATS.count("doh", uid)
         try:
             reply = ask(query, port)
         except (OSError, ConnectionError) as e:
@@ -286,7 +383,11 @@ class DoT(socketserver.BaseRequestHandler):
                 query = read_exact(sock, size)
                 # The gate drops strangers on 853 before they get here; this
                 # is the second lock, for a relay whose gate is being changed.
-                reply = ask(query, port) if ok else refused(query)
+                if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
+                    STATS.count("dot", ip)
+                    reply = ask(query, port)
+                else:
+                    reply = refused(query)
                 sock.sendall(struct.pack("!H", len(reply)) + reply)
         except (OSError, ConnectionError):
             return
@@ -301,6 +402,7 @@ def main():
     doh = DoHServer(DOH_ADDR, DoH)
     dot = DoTServer(DOT_ADDR, DoT)
     threading.Thread(target=dot.serve_forever, daemon=True).start()
+    threading.Thread(target=flush_loop, daemon=True).start()
     log(INFO, "DoH on %s:%d, DoT on %s:%d" % (DOH_ADDR + DOT_ADDR))
     doh.serve_forever()
 

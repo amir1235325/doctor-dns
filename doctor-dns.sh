@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.7.0"
+VERSION="0.7.1"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -2854,6 +2854,14 @@ exit 0
 #        flags dynamic
 #        counter
 #    }
+#    # DNS queries alone, per client, so the customer's page can say whether
+#    # their queries reach this relay at all - or whether their operator
+#    # answers them before they get here. Not billed from: @up has them too.
+#    set dns {
+#        type ipv4_addr
+#        flags dynamic
+#        counter
+#    }
 #
 #    # Which shaping class each client belongs to, as a packet mark. Empty
 #    # until somebody is given a speed limit; managed by `smartdns-shape`.
@@ -2892,6 +2900,8 @@ exit 0
 #        type filter hook input priority 10 ; policy accept ;
 #        ip saddr @allowed udp dport 53 update @up { ip saddr counter }
 #        ip saddr @allowed tcp dport { 53, 80, 443, 853, 1119, 4070 } update @up { ip saddr counter }
+#        ip saddr @allowed udp dport 53 update @dns { ip saddr counter }
+#        ip saddr @allowed tcp dport 53 update @dns { ip saddr counter }
 #    }
 #
 #    # What we send back. nginx talks to the exit node as a local process, from
@@ -2903,11 +2913,15 @@ exit 0
 #        ip daddr @allowed tcp sport { 53, 80, 443, 853, 1119, 4070 } update @down { ip daddr counter }
 #    }
 #
-#    # Amplification defence, unchanged. An open resolver is worth roughly its
-#    # bandwidth to whoever finds it, and this box is easy to find.
+#    # Amplification defence. An open resolver is worth roughly its bandwidth
+#    # to whoever finds it, and this box is easy to find. Not on loopback:
+#    # smartdns-doh asks dnsmasq from 127.0.0.1 on behalf of every DoH and DoT
+#    # customer at once, and a limit per source address would have held all of
+#    # them together to 40 queries a second. They have a rate each in
+#    # smartdns-doh instead.
 #    chain input {
 #        type filter hook input priority 0 ; policy accept ;
-#        udp dport 53 meter dnsflood { ip saddr limit rate over 40/second burst 80 packets } drop
+#        iifname != "lo" udp dport 53 meter dnsflood { ip saddr limit rate over 40/second burst 80 packets } drop
 #    }
 #}
 #__END_NFTABLES__
@@ -3084,6 +3098,7 @@ exit 0
 #    nft delete element $TABLE allowed "{ $ip }" || die "nft refused the removal"
 #    nft delete element $TABLE up   "{ $ip }" 2>/dev/null
 #    nft delete element $TABLE down "{ $ip }" 2>/dev/null
+#    nft delete element $TABLE dns  "{ $ip }" 2>/dev/null
 #    save
 #    printf '%sremoved%s %s\n' "$G" "$N" "$ip"
 #    ;;
@@ -3837,6 +3852,20 @@ exit 0
 #-- turned into a catalogue service here and dropped. So what survives says
 #-- "PlayStation, 40 GB, on Tuesday" and never which site at what time - and
 #-- after thirty days not even that. Only the customer is shown it.
+#-- DoH and DoT, per day: how many queries of each, and who used them at all -
+#-- for the admin panel's figures. Counts only; nothing of what was asked.
+#CREATE TABLE IF NOT EXISTS doh_daily (
+#    day     TEXT NOT NULL,
+#    kind    TEXT NOT NULL,
+#    queries INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (day, kind)
+#);
+#CREATE TABLE IF NOT EXISTS doh_users (
+#    day     TEXT NOT NULL,
+#    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    PRIMARY KEY (day, user_id)
+#);
+#
 #CREATE TABLE IF NOT EXISTS usage_service (
 #    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 #    day     TEXT NOT NULL,
@@ -4075,6 +4104,12 @@ exit 0
 #    # charts can tell the two apart. The bill still comes from last_counter.
 #    ("ip_counters", "last_up", "INTEGER NOT NULL DEFAULT 0"),
 #    ("ip_counters", "last_down", "INTEGER NOT NULL DEFAULT 0"),
+#    # The relay's count of DNS bytes from this address, and when it last
+#    # grew: the customer's page says whether their DNS reaches us.
+#    ("ip_counters", "last_dns", "INTEGER NOT NULL DEFAULT 0"),
+#    ("ips", "dns_seen_at", "TEXT"),
+#    # When this account last used DoH or DoT.
+#    ("users", "doh_seen_at", "TEXT"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -5353,6 +5388,70 @@ exit 0
 #                      (owner["user_id"], day, key, n))
 #
 #
+#def record_dns(store, relay, seen):
+#    """A relay's DNS counters, {ip: bytes}: an address whose count moved has
+#    had its queries reach us, which is what the customer's page reports."""
+#    if not isinstance(seen, dict):
+#        return
+#    for ip, n in list(seen.items())[:5000]:
+#        try:
+#            n = int(n)
+#        except (TypeError, ValueError):
+#            continue
+#        row = store.one("SELECT last_dns FROM ip_counters WHERE ip = ? AND relay = ?",
+#                        (ip, relay))
+#        if row is None or n == row["last_dns"]:
+#            continue
+#        # Grown, or smaller because the set was rebuilt: either way queries
+#        # arrived since the last reading.
+#        if n > 0:
+#            store.run("UPDATE ips SET dns_seen_at = ? WHERE ip = ?", (now(), ip))
+#        store.run("UPDATE ip_counters SET last_dns = ? WHERE ip = ? AND relay = ?",
+#                  (n, ip, relay))
+#
+#
+#def record_doh(store, stats):
+#    """smartdns-doh's counts from a relay: DoH by account, DoT by address."""
+#    if not isinstance(stats, dict):
+#        return
+#    day = usage_buckets()["1d"]
+#    totals = {"doh": 0, "dot": 0}
+#    users = set()
+#    for uid, n in list((stats.get("doh") or {}).items())[:5000]:
+#        try:
+#            uid, n = int(uid), int(n)
+#        except (TypeError, ValueError):
+#            continue
+#        totals["doh"] += max(0, n)
+#        if uid > 0:
+#            users.add(uid)
+#    for ip, n in list((stats.get("dot") or {}).items())[:5000]:
+#        try:
+#            n = int(n)
+#        except (TypeError, ValueError):
+#            continue
+#        totals["dot"] += max(0, n)
+#        owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (str(ip),))
+#        if owner:
+#            users.add(owner["user_id"])
+#    for kind, n in totals.items():
+#        if n:
+#            store.run("INSERT INTO doh_daily (day, kind, queries) VALUES (?, ?, ?)"
+#                      " ON CONFLICT(day, kind) DO UPDATE SET queries = queries + excluded.queries",
+#                      (day, kind, n))
+#    for uid in users:
+#        if store.one("SELECT 1 FROM users WHERE id = ?", (uid,)):
+#            store.run("INSERT OR IGNORE INTO doh_users (day, user_id) VALUES (?, ?)", (day, uid))
+#            store.run("UPDATE users SET doh_seen_at = ? WHERE id = ?", (now(), uid))
+#
+#
+#def new_doh_token(store, user):
+#    """A fresh personal address; the old one stops at the relay's next sync."""
+#    token = secrets.token_urlsafe(16)
+#    store.run("UPDATE users SET doh_token = ? WHERE id = ?", (token, user["id"]))
+#    return token
+#
+#
 #def prune_usage(store):
 #    """Drop what is older than each grain is kept for."""
 #    now_t = datetime.now(timezone.utc)
@@ -5361,6 +5460,9 @@ exit 0
 #        store.run("DELETE FROM usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
 #    cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
 #    store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
+#    cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
+#    store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
+#    store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 #
 #
 #def usage_view(store, user, catalogue, with_services=True):
@@ -6557,6 +6659,11 @@ exit 0
 #                record_services(self.store, body.get("services"), CATALOGUE)
 #            except Exception as e:
 #                log_exception("per-service usage not recorded: %r" % e)
+#            try:
+#                record_dns(self.store, who, body.get("dns_seen"))
+#                record_doh(self.store, body.get("doh_stats"))
+#            except Exception as e:
+#                log_exception("DNS counts not recorded: %r" % e)
 #            # The relay's own recent logs, now and then, for the logs page.
 #            if isinstance(body.get("logs"), str):
 #                tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
@@ -6666,6 +6773,13 @@ exit 0
 #            view = usage_view(self.store, user, CATALOGUE)
 #            view["ok"] = True
 #            return self.reply(200, view)
+#        if self.path == "/user-doh-reset":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            new_doh_token(self.store, user)
+#            return self.reply(200, {"ok": True, "message": "آدرس تازه ساخته شد؛ تا یک دقیقه "
+#                                    "دیگر کار می‌کند و آدرس قبلی دیگر نه"})
 #        if self.path == "/user-trial":
 #            user = self._session_user(body.get("session"))
 #            if not user:
@@ -6975,6 +7089,11 @@ exit 0
 #            # The personal DoH address. The relay builds the full address from
 #            # its own name - it knows which relay the customer is looking at.
 #            "doh_token": doh_token(self.store, user),
+#            # Whether that address's DNS reaches us, and whether this account
+#            # uses the encrypted kind: the page's "your DNS arrives" line.
+#            "dns_seen_at": ips[0]["dns_seen_at"] if ips else None,
+#            "ip_added_at": ips[0]["added_at"] if ips else None,
+#            "doh_seen_at": user["doh_seen_at"],
 #        }
 #
 #
@@ -7280,6 +7399,7 @@ exit 0
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
@@ -7599,6 +7719,16 @@ exit 0
 #        for k in ("week", "last_week", "month", "last_month"):
 #            view[k] = {"up": view[k][0], "down": view[k][1]}
 #        return 200, view
+#
+#    def api_doh_reset(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        new_doh_token(self.store, user)
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, {"ok": True, "message": "آدرس تازه ساخته شد؛ تا یک دقیقه دیگر کار "
+#                     "می‌کند و آدرس قبلی دیگر نه",
+#                     "user": user_view(self.store, user, self.relays)}
 #
 #    def api_trial(self, body, tg):
 #        user, err = self.customer(tg)
@@ -8919,6 +9049,51 @@ exit 0
 #            "tested": UPSTREAM["tested"], "error": UPSTREAM["error"]}
 #
 #
+## ---------------------------------------------------------------- DNS seen
+#def dns_seen():
+#    """How many bytes of DNS each registered address has sent this relay
+#    since the set was made: {ip: bytes}. The panel only looks at whether it
+#    grew, which is what says a customer's queries are reaching us."""
+#    r = nft("-j", "list", "set", "inet", "smartdns", "dns")
+#    if r.returncode != 0:
+#        return {}
+#    out = {}
+#    for item in json.loads(r.stdout or "{}").get("nftables", []):
+#        for e in (item.get("set") or {}).get("elem") or []:
+#            e = e.get("elem") if isinstance(e, dict) else None
+#            if isinstance(e, dict) and isinstance(e.get("val"), str):
+#                out[e["val"]] = int((e.get("counter") or {}).get("bytes") or 0)
+#    return out
+#
+#
+## What smartdns-doh counted: how many queries each customer made, never
+## which names. Read, delivered, then gone, like the usage lines.
+#DOH_STATS_DIR = "/run/smartdns-doh-stats"
+#DOH_PENDING = {"doh": {}, "dot": {}}
+#
+#
+#def take_doh_stats():
+#    try:
+#        names = sorted(n for n in os.listdir(DOH_STATS_DIR) if n.endswith(".json"))
+#    except OSError:
+#        names = []
+#    for n in names:
+#        path = os.path.join(DOH_STATS_DIR, n)
+#        try:
+#            with open(path, encoding="utf-8") as fh:
+#                got = json.load(fh)
+#            for kind in ("doh", "dot"):
+#                for key, count in (got.get(kind) or {}).items():
+#                    DOH_PENDING[kind][key] = DOH_PENDING[kind].get(key, 0) + int(count)
+#        except (OSError, ValueError) as e:
+#            log(WARN, "DoH counts not read: %s" % e)
+#        try:
+#            os.remove(path)
+#        except OSError:
+#            pass
+#    return {k: dict(v) for k, v in DOH_PENDING.items()}
+#
+#
 ## ---------------------------------------------------------------- usage
 ## Where nginx writes it; see the note in relay-nginx.conf on why /run.
 #USAGE_LOG = "/run/smartdns-usage"
@@ -9002,6 +9177,13 @@ exit 0
 #        log(WARN, "usage not read: %s" % e)
 #    if services:
 #        payload["services"] = services
+#    try:
+#        payload["dns_seen"] = dns_seen()
+#    except Exception as e:
+#        log(WARN, "DNS counters not read: %s" % e)
+#    doh_stats = take_doh_stats()
+#    if doh_stats["doh"] or doh_stats["dot"]:
+#        payload["doh_stats"] = doh_stats
 #    if logs_due():
 #        payload["logs"] = recent_logs()
 #        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
@@ -9012,6 +9194,9 @@ exit 0
 #    answer = post("/sync", payload)
 #    if services:
 #        USAGE_PENDING.clear()
+#    if "doh_stats" in payload:
+#        DOH_PENDING["doh"].clear()
+#        DOH_PENDING["dot"].clear()
 #    # Delivered: the panel has it, so it is not sent again.
 #    if finished and WATCH_DONE["result"] is finished:
 #        WATCH_DONE["result"] = None
@@ -9781,6 +9966,63 @@ exit 0
 #
 #
 ## ---------------------------------------------------------------- DoH page
+## How recent a query has to be to count as "reaching us". Long enough that a
+## console left on is not flagged between two lookups, short enough that a
+## relay the customer has lost says so the same evening.
+#DNS_FRESH = 3600
+#
+#
+#def seconds_since(ts):
+#    try:
+#        t = datetime.fromisoformat(str(ts))
+#    except (TypeError, ValueError):
+#        return None
+#    if t.tzinfo is None:
+#        t = t.replace(tzinfo=timezone.utc)
+#    return max(0, (datetime.now(timezone.utc) - t).total_seconds())
+#
+#
+#def ago(seconds):
+#    if seconds < 90:
+#        return "همین الان"
+#    if seconds < 3600:
+#        return "%d دقیقه پیش" % (seconds // 60)
+#    if seconds < 86400:
+#        return "%d ساعت پیش" % (seconds // 3600)
+#    return "%d روز پیش" % (seconds // 86400)
+#
+#
+#def dns_check(info):
+#    """Whether the registered internet's DNS reaches this relay.
+#
+#    Not a test the page runs - a browser cannot put a DNS query to anybody,
+#    let alone see who answered - but what the relay itself has seen: the
+#    kernel counts each registered address's queries on port 53, and
+#    smartdns-doh counts the encrypted ones. Nothing arriving means the DNS
+#    was never set, or the operator answers it before it gets here.
+#    """
+#    if not info.get("ip"):
+#        return ""
+#    plain = seconds_since(info.get("dns_seen_at"))
+#    safe = seconds_since(info.get("doh_seen_at"))
+#    added = seconds_since(info.get("ip_added_at"))
+#    if plain is not None and plain < DNS_FRESH:
+#        return ("<p class='note'>✅ DNS اینترنت ثبت‌شده‌تان به ما می‌رسد — آخرین "
+#                "درخواست %s.</p>" % ago(plain))
+#    if safe is not None and safe < DNS_FRESH:
+#        return ("<p class='note'>✅ از DNS رمزگذاری‌شده استفاده می‌کنید — آخرین "
+#                "درخواست %s.</p>" % ago(safe))
+#    if plain is None and added is not None and added < 900:
+#        return ("<p class='note'>⏳ هنوز درخواست DNS از اینترنت ثبت‌شده‌تان نرسیده. "
+#                "DNS را روی مودم یا کنسول بگذارید؛ چند دقیقه بعد این‌جا تأیید "
+#                "می‌شود.</p>")
+#    return ("<div class='msg warnbox'>⚠️ در یک ساعت اخیر هیچ درخواست DNS از اینترنت "
+#            "ثبت‌شده‌تان به ما نرسیده%s. اگر دستگاهتان روشن است و سرویس کار نمی‌کند: "
+#            "یا DNS را روی مودم یا کنسول نگذاشته‌اید، یا اپراتور اینترنتتان DNS را "
+#            "می‌رباید. در این صورت از «DNS رمزگذاری‌شده» پایین همین صفحه استفاده "
+#            "کنید.</div>" % (" (آخرین: %s)" % ago(plain) if plain is not None else ""))
+#
+#
 #def doh_url(info):
 #    """The customer's personal DNS-over-HTTPS address, on this relay's name."""
 #    token = info.get("doh_token") or ""
@@ -9842,7 +10084,15 @@ exit 0
 #        "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله "
 #        "می‌گوید قالب شما کدام است.</p>"
 #        "<h3>DoH — DNS over HTTPS</h3>"
-#        + copy_field(url, "آدرس DoH شخصی") +
+#        + copy_field(url, "آدرس DoH شخصی")
+#        # Not on the setup page: that one is opened by the address itself,
+#        # and whoever holds the address should not be able to replace it.
+#        + ("" if setup else
+#           "<form method='post' action='/doh-reset' style='margin:0 16px 4px' onsubmit="
+#           "\"return confirm('آدرس فعلی از کار می‌افتد و باید آدرس تازه را روی "
+#           "دستگاه‌هایتان بگذارید. ادامه می‌دهید؟')\"><button class='ghost small'>"
+#           "ساختن آدرس تازه</button></form><p class='note'>اگر آدرس به دست کس "
+#           "دیگری افتاده. آدرس قبلی تا یک دقیقه بعد دیگر کار نمی‌کند.</p>") +
 #        # DoT has no path to carry a token: the relay answers it from the
 #        # template of the registered address it arrives from.
 #        "<h3>DoT — DNS over TLS</h3>"
@@ -10525,6 +10775,14 @@ exit 0
 #                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
 #            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 #
+#        if path == "/doh-reset":
+#            if not self.session():
+#                return self.redirect("/login")
+#            res = self.ask_panel("/user-doh-reset", {})
+#            if res is None:
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
 #        if path == "/telegram-unlink":
 #            if not self.session():
 #                return self.redirect("/login")
@@ -10881,6 +11139,7 @@ exit 0
 #        body.append(gauge)
 #        body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
 #        body.append(dns_box())
+#        body.append(dns_check(info))
 #
 #        if not info["ip"]:
 #            body.append(
@@ -11114,7 +11373,12 @@ exit 0
 #from nginx on loopback and says nothing, so the personal address carries a
 #token instead - it only says which customer's template to answer from.
 #
-#Nothing is logged about what anybody asked.
+#Nothing is logged about what anybody asked. What is counted is how many
+#queries each customer made, for the admin panel's figures and the customer
+#page's "your DNS reaches us" line - never which names.
+#
+#Each customer is held to a rate - a broken device, or somebody who has the
+#address and no business with it, cannot load the relay's resolvers.
 #"""
 #import base64
 #import hashlib
@@ -11141,6 +11405,15 @@ exit 0
 ## nginx on this machine: every DoH request arrives from here, after the gate
 ## has let the customer in on 443.
 #LOOPBACK = {"127.0.0.1", "::1", ""}
+## Where the counts go for smartdns-sync to collect: one finished file per
+## flush, so the two never need a lock between them. In /run, which is memory.
+#STATS_DIR = "/run/smartdns-doh-stats"
+#STATS_EVERY = 15
+## Queries a second each customer may make, and how many at once on top.
+## A phone opening an app asks for twenty names in a burst and then nothing;
+## this only ever stops something that keeps going.
+#RATE = 50
+#BURST = 200
 #
 #INFO, WARN, ERROR = 6, 4, 3
 #
@@ -11201,6 +11474,83 @@ exit 0
 #
 #
 #STATE_NOW = State()
+#
+#
+## ---------------------------------------------------------------- limits
+#class Limiter:
+#    """A bucket of queries per customer, refilled at RATE a second."""
+#
+#    def __init__(self, rate=RATE, burst=BURST):
+#        self.rate, self.burst = float(rate), float(burst)
+#        self.buckets = {}
+#        self.warned = {}
+#        self.lock = threading.Lock()
+#
+#    def allow(self, key, label=None):
+#        """label is what the log says; the key may be a token, which does
+#        not belong in a log the admin panel shows."""
+#        now = time.monotonic()
+#        with self.lock:
+#            tokens, at = self.buckets.get(key, (self.burst, now))
+#            tokens = min(self.burst, tokens + (now - at) * self.rate)
+#            ok = tokens >= 1
+#            self.buckets[key] = (tokens - 1 if ok else tokens, now)
+#            if len(self.buckets) > 20000:
+#                # Whoever has been quiet long enough to be full again is
+#                # the same as somebody never seen.
+#                full = self.burst / self.rate
+#                self.buckets = {k: v for k, v in self.buckets.items()
+#                                if now - v[1] < full}
+#            if not ok and now - self.warned.get(key, -1e9) > 60:
+#                self.warned[key] = now
+#                log(WARN, "rate-limited: %s" % (label or key))
+#        return ok
+#
+#
+#LIMIT = Limiter()
+#
+#
+#class Stats:
+#    """How many queries each customer made since the last flush: DoH by
+#    account, DoT by address. Counts only, never names."""
+#
+#    def __init__(self):
+#        self.lock = threading.Lock()
+#        self.doh, self.dot = {}, {}
+#
+#    def count(self, kind, key):
+#        with self.lock:
+#            table = self.doh if kind == "doh" else self.dot
+#            table[key] = table.get(key, 0) + 1
+#
+#    def take(self):
+#        with self.lock:
+#            out = {"doh": self.doh, "dot": self.dot}
+#            self.doh, self.dot = {}, {}
+#        return out
+#
+#
+#STATS = Stats()
+#
+#
+#def flush_stats(directory=STATS_DIR):
+#    got = STATS.take()
+#    if not got["doh"] and not got["dot"]:
+#        return
+#    os.makedirs(directory, exist_ok=True)
+#    name = os.path.join(directory, "%d-%d" % (time.time() * 1000, os.getpid()))
+#    with open(name + ".tmp", "w", encoding="utf-8") as fh:
+#        json.dump(got, fh)
+#    os.replace(name + ".tmp", name + ".json")
+#
+#
+#def flush_loop():
+#    while True:
+#        time.sleep(STATS_EVERY)
+#        try:
+#            flush_stats()
+#        except OSError as e:
+#            log(WARN, "counts not written: %s" % e)
 #
 #
 ## ---------------------------------------------------------------- resolving
@@ -11320,6 +11670,7 @@ exit 0
 #            return self.fail(403, "not through the relay")
 #        state = STATE_NOW
 #        port = MAIN_PORT
+#        uid = "0"
 #        if token:
 #            found = state.by_token(token)
 #            if not found:
@@ -11327,6 +11678,11 @@ exit 0
 #                # rather than answer with something that looks like DNS.
 #                return self.fail(403, "this address is no longer valid")
 #            port = int(found[1].get("port") or MAIN_PORT)
+#            uid = str(found[1].get("uid") or "0")
+#        if not LIMIT.allow("doh:" + (token or "-"), "DoH, account %s" % uid):
+#            self.fail(429, "too many queries")
+#            return
+#        STATS.count("doh", uid)
 #        try:
 #            reply = ask(query, port)
 #        except (OSError, ConnectionError) as e:
@@ -11380,7 +11736,11 @@ exit 0
 #                query = read_exact(sock, size)
 #                # The gate drops strangers on 853 before they get here; this
 #                # is the second lock, for a relay whose gate is being changed.
-#                reply = ask(query, port) if ok else refused(query)
+#                if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
+#                    STATS.count("dot", ip)
+#                    reply = ask(query, port)
+#                else:
+#                    reply = refused(query)
 #                sock.sendall(struct.pack("!H", len(reply)) + reply)
 #        except (OSError, ConnectionError):
 #            return
@@ -11395,6 +11755,7 @@ exit 0
 #    doh = DoHServer(DOH_ADDR, DoH)
 #    dot = DoTServer(DOT_ADDR, DoT)
 #    threading.Thread(target=dot.serve_forever, daemon=True).start()
+#    threading.Thread(target=flush_loop, daemon=True).start()
 #    log(INFO, "DoH on %s:%d, DoT on %s:%d" % (DOH_ADDR + DOT_ADDR))
 #    doh.serve_forever()
 #
@@ -12197,6 +12558,43 @@ exit 0
 #    return "".join(out)
 #
 #
+#
+#
+#def doh_card():
+#    """DoH and DoT over the last week: queries of each, and how many
+#    customers used them at all. Counts only - nothing of what was asked."""
+#    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
+#    try:
+#        rows = STORE.q("SELECT day, kind, queries FROM doh_daily WHERE day >= ?"
+#                       " ORDER BY day DESC", (since,))
+#        people = STORE.q("SELECT day, count(*) c FROM doh_users WHERE day >= ?"
+#                         " GROUP BY day", (since,))
+#        week = STORE.one("SELECT count(DISTINCT user_id) c FROM doh_users WHERE day >= ?",
+#                         (since,))["c"]
+#    except sqlite3.OperationalError:
+#        return ""          # a panel that has not made the tables yet
+#    if not rows:
+#        return ("<div class='card'><h2>DNS امن (DoH و DoT)</h2><p class='muted'>در ۷ روز "
+#                "اخیر کسی از DNS امن استفاده نکرده.</p></div>")
+#    by = {}
+#    for r in rows:
+#        by.setdefault(r["day"], {})[r["kind"]] = r["queries"]
+#    users = {r["day"]: r["c"] for r in people}
+#    doh = sum(v.get("doh", 0) for v in by.values())
+#    dot = sum(v.get("dot", 0) for v in by.values())
+#    out = ["<div class='card'><h2>DNS امن (DoH و DoT) — ۷ روز اخیر</h2><div class='grid'>"]
+#    for n, l in ((week, "مشتری"), (format(doh, ","), "کوئری DoH"),
+#                 (format(dot, ","), "کوئری DoT")):
+#        out.append("<div class='stat'><div class='n'>%s</div><div class='l'>%s</div></div>"
+#                   % (n, l))
+#    out.append("</div><table><tr><th>روز</th><th>DoH</th><th>DoT</th><th>مشتری</th></tr>")
+#    for day in sorted(by, reverse=True):
+#        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>"
+#                   % (day, format(by[day].get("doh", 0), ","),
+#                      format(by[day].get("dot", 0), ","), users.get(day, 0)))
+#    out.append("</table><p class='muted'>فقط تعداد؛ اینکه چه اسمی پرسیده شد جایی نگه "
+#               "داشته نمی‌شود. روز به وقت تهران.</p></div>")
+#    return "".join(out)
 #
 #
 #def user_usage(uid):
@@ -13978,6 +14376,8 @@ exit 0
 #            out.append("<div class='stat'><div class='n'>%s</div>"
 #                       "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
 #        out.append("</div></div>")
+#
+#        out.append(doh_card())
 #
 #        rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
 #                       " FROM metrics GROUP BY host) l"
@@ -18260,7 +18660,8 @@ exit 0
 #        if not u["ips"]:
 #            lines.append("\n⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ بدون آن کار نمی‌کند.")
 #        self.say(chat, "\n".join(lines),
-#                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]]})
+#                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"},
+#                                       {"text": "🔄 آدرس تازه", "callback_data": "dohnew"}]]})
 #
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
@@ -18453,6 +18854,11 @@ exit 0
 #            return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
 #                                   % (link["url"], link["minutes"])) if link
 #                            else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
+#        if kind == "dohnew":
+#            self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
+#            self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
+#                     "این را روی دستگاه‌هایتان بگذارید:")
+#            return self.show_doh(chat, sender)
 #        if kind == "newpw":
 #            res = self.panel.call("POST", "/users/%d/password" % sender["id"])
 #            return self.say(chat, "🔄 رمز تازهٔ پنل: %s\nنام کاربری: %s\n\nهر جا با رمز قبلی "

@@ -396,7 +396,8 @@ class Bot:
         if not u["ips"]:
             lines.append("\n⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ بدون آن کار نمی‌کند.")
         self.say(chat, "\n".join(lines),
-                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]]})
+                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"},
+                                       {"text": "🔄 آدرس تازه", "callback_data": "dohnew"}]]})
 
     def help_text(self):
         return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
@@ -589,6 +590,11 @@ class Bot:
             return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
                                    % (link["url"], link["minutes"])) if link
                             else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
+        if kind == "dohnew":
+            self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
+            self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
+                     "این را روی دستگاه‌هایتان بگذارید:")
+            return self.show_doh(chat, sender)
         if kind == "newpw":
             res = self.panel.call("POST", "/users/%d/password" % sender["id"])
             return self.say(chat, "🔄 رمز تازهٔ پنل: %s\nنام کاربری: %s\n\nهر جا با رمز قبلی "

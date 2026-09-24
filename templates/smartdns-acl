@@ -169,6 +169,7 @@ del|rm|remove)
     nft delete element $TABLE allowed "{ $ip }" || die "nft refused the removal"
     nft delete element $TABLE up   "{ $ip }" 2>/dev/null
     nft delete element $TABLE down "{ $ip }" 2>/dev/null
+    nft delete element $TABLE dns  "{ $ip }" 2>/dev/null
     save
     printf '%sremoved%s %s\n' "$G" "$N" "$ip"
     ;;

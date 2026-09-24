@@ -81,7 +81,7 @@ sent = []
 sync.post = lambda path, payload: sent.append(payload) or {
     "allowed": [], "profiles": {}, "extra_domains": [], "templates": {}}
 for name in ("save_template_names", "save_user_names", "apply_custom_domains",
-             "apply_speeds", "close_relay_when_ready"):
+             "apply_speeds", "close_relay_when_ready", "dns_seen"):
     setattr(sync, name, lambda *a, **k: False)
 sync.apply_profiles = lambda *a, **k: None
 sync.current_state = lambda: []
