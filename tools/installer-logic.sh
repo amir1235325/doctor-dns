@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.4"
+VERSION="0.8.5"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -1903,6 +1903,11 @@ ADMIN_KEY=$KEY_PATH
 EOF
             umask 022
             chmod 600 /etc/smart-dns/admin.env
+            # The panel was started above, before this file existed, so its
+            # bot API picked the relays' self-signed pair and would keep it
+            # until the next restart. Once more, now that it can find the
+            # real certificate.
+            systemctl try-restart smartdns-panel.service >/dev/null 2>&1 || true
             ADMIN_URL_OUT="https://$PANEL_DOMAIN:$ADMIN_PORT/$ADMIN_PATH_GEN/"
             ADMIN_PASS_OUT="$ADMIN_PASS"
         else
