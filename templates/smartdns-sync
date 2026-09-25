@@ -1841,7 +1841,34 @@ def brand():
     return (CFG or {}).get("PANEL_DOMAIN") or "سرویس"
 
 
+# On a single machine there is no server in Iran and none abroad, only this
+# one: the pages are written for two, and on one they say so in its words.
+# The longest phrases first, so "سرورهای ایران" is not half-replaced.
+ONE_SERVER_WORDS = (
+    ("آی‌پی ایرانی رله", "آی‌پی ایرانی مشتری"),
+    ("سرورهای ایران", "سرور"),
+    ("سرور ایران", "سرور"),
+    (" — سرور خارج", ""),
+    ("سرور خارج", "سرور"),
+    ("رله‌ها", "سرور"),
+    ("رله‌ای", "سروری"),
+    ("رله", "سرور"),
+)
+
+
+def one_server_words(text):
+    for a, b in ONE_SERVER_WORDS:
+        text = text.replace(a, b)
+    return text
+
+
+# Whether the exit's half - the panel - is on this machine too.
+PANEL_ENV_HERE = "/etc/smart-dns/panel.env"
+
+
 def user_page(inner):
+    if os.path.exists(PANEL_ENV_HERE):
+        inner = one_server_words(inner)
     return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>%s</title>%s<style>%s</style></head><body>%s

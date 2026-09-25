@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.1"
+VERSION="0.8.2"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -10559,7 +10559,34 @@ exit 0
 #    return (CFG or {}).get("PANEL_DOMAIN") or "سرویس"
 #
 #
+## On a single machine there is no server in Iran and none abroad, only this
+## one: the pages are written for two, and on one they say so in its words.
+## The longest phrases first, so "سرورهای ایران" is not half-replaced.
+#ONE_SERVER_WORDS = (
+#    ("آی‌پی ایرانی رله", "آی‌پی ایرانی مشتری"),
+#    ("سرورهای ایران", "سرور"),
+#    ("سرور ایران", "سرور"),
+#    (" — سرور خارج", ""),
+#    ("سرور خارج", "سرور"),
+#    ("رله‌ها", "سرور"),
+#    ("رله‌ای", "سروری"),
+#    ("رله", "سرور"),
+#)
+#
+#
+#def one_server_words(text):
+#    for a, b in ONE_SERVER_WORDS:
+#        text = text.replace(a, b)
+#    return text
+#
+#
+## Whether the exit's half - the panel - is on this machine too.
+#PANEL_ENV_HERE = "/etc/smart-dns/panel.env"
+#
+#
 #def user_page(inner):
+#    if os.path.exists(PANEL_ENV_HERE):
+#        inner = one_server_words(inner)
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
 #<title>%s</title>%s<style>%s</style></head><body>%s
@@ -14645,7 +14672,7 @@ exit 0
 #        except ValueError:
 #            continue
 #        cols.append(("رله " + r["key"].split(":", 1)[1], got.get("ms") or {}, got.get("at") or 0))
-#    if EXIT_BENCH["ms"]:
+#    if EXIT_BENCH["ms"] and not (one_server() and cols):
 #        cols.append(("این سرور", EXIT_BENCH["ms"], int(EXIT_BENCH["at"])))
 #    if not cols:
 #        return ("<p class='muted'>زمان جواب هنوز اندازه گرفته نشده؛ رله‌ها چند دقیقه بعد از "
@@ -15489,6 +15516,43 @@ exit 0
 #        return 0
 #
 #
+## On a single machine there is no server in Iran and none abroad, only this
+## one: the pages are written for two, and on one they say so in its words.
+## The longest phrases first, so "سرورهای ایران" is not half-replaced.
+#ONE_SERVER_WORDS = (
+#    # Whole sentences first, where swapping a word would leave them wrong.
+#    ("هر اسمی که رله‌ها مسیریابی نمی‌کنند", "هر اسمی که سرور مسیریابی نمی‌کند"),
+#    ("پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از اعمال، خودش از ایران "
+#     "امتحان می‌کند — اگر جواب ندهد همان قبلی را نگه می‌دارد.",
+#     "پیش از ذخیره از همین سرور آزموده می‌شوند — اگر جواب ندهند، همان قبلی می‌ماند."),
+#    (" آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود.", ""),
+#    ("<a href='#exit'>سرور خارج</a>", "<a href='#exit'>پنل‌ها</a>"),
+#    ("<a href='#relays'>سرورهای ایران</a>", "<a href='#relays'>DNS و همگام‌سازی</a>"),
+#    ("آی‌پی ایرانی رله", "آی‌پی ایرانی مشتری"),
+#    ("سرورهای ایران", "سرور"),
+#    ("سرور ایران", "سرور"),
+#    (" — سرور خارج", ""),
+#    ("سرور خارج", "سرور"),
+#    ("رله‌ها", "سرور"),
+#    ("رله‌ای", "سروری"),
+#    ("رله", "سرور"),
+#)
+#
+#
+#def one_server_words(text):
+#    for a, b in ONE_SERVER_WORDS:
+#        text = text.replace(a, b)
+#    return text
+#
+#
+## Whether this is a single machine: the relay's half lives here too.
+#SYNC_ENV_HERE = "/etc/smart-dns/sync.env"
+#
+#
+#def one_server():
+#    return os.path.exists(SYNC_ENV_HERE)
+#
+#
 #def page(title, body, cfg, active="", msg=None, msg_kind="good"):
 #    nav = ""
 #    waiting = tickets_waiting()
@@ -15502,6 +15566,8 @@ exit 0
 #    banner = ""
 #    if msg:
 #        banner = "<div class='msg %s'>%s</div>" % (msg_kind, html.escape(msg))
+#    if one_server():
+#        body, banner = one_server_words(body), one_server_words(banner)
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
 #<link rel="icon" href="data:,">

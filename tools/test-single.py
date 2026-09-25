@@ -179,6 +179,28 @@ for tool in ("smartdns-menu", "smartdns-logs", "smartdns-restart"):
 logs = open(os.path.join(ROOT, "templates", "smartdns-logs"), encoding="utf-8").read()
 check("and the logs show the DoH service too", "smartdns-doh" in logs)
 
+print("the pages' words")
+admin = load("templates/smartdns-admin", "admin")
+admin.tickets_waiting = lambda: 0
+cfg = {"ADMIN_PATH": "p"}
+body = ("<h2>سرورهای ایران</h2><p>سرور ایران 1.2.3.4 — پنل و API — سرور خارج، "
+        "هیچ رله‌ای هنوز، به آی‌پی رله، رله‌ها اعمال می‌کنند</p>")
+admin.SYNC_ENV_HERE = os.path.join(tmp, "no-such-file")
+two = admin.page("t", body, cfg, msg="روی رله‌ها اعمال می‌شود")
+check("with two servers, the pages keep naming them", "سرورهای ایران" in two and "رله‌ها" in two)
+admin.SYNC_ENV_HERE = os.path.join(tmp, "sync.env")
+open(admin.SYNC_ENV_HERE, "w").close()
+one = admin.page("t", body, cfg, msg="روی رله‌ها اعمال می‌شود")
+check("on one, no server in Iran, none abroad, and no relay - on the page or in its message",
+      all(w not in one for w in ("ایران", "خارج", "رله")) and "هیچ سروری هنوز" in one
+      and "به آی‌پی سرور" in one, one[one.index("<h2>"):][:300])
+sync.PANEL_ENV_HERE = os.path.join(tmp, "no-such-file")
+check("the customer's page the same way: as it was with two servers",
+      "از رله" in sync.user_page("<p>✅ از رله</p>"))
+sync.PANEL_ENV_HERE = admin.SYNC_ENV_HERE
+check("and in its own words on one", "از سرور" in sync.user_page("<p>✅ از رله</p>")
+      and "رله" not in sync.user_page("<p>✅ از رله</p>"))
+
 shutil.rmtree(tmp, ignore_errors=True)
 print()
 print("%d FAILED: %s" % (len(fails), "; ".join(fails)) if fails else "all checks passed")
