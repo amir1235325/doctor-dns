@@ -190,7 +190,6 @@ discord.gg
 discord.gift
 discord.new
 discordapp.com
-discordapp.io
 discordapp.net
 discordcdn.com
 discordstatus.com

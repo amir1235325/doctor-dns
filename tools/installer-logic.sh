@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.2"
+VERSION="0.8.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -95,6 +95,44 @@ is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }
 # Where a single machine's sync API listens: loopback only, because 8443 is
 # its customer panel, and the only relay it has is itself.
 SINGLE_API_PORT=8449
+
+# Whose name the exit's address is registered in. An address block registered
+# to an Iranian company is still Iranian to Google, even on a server in
+# Germany: EA FC's Ultimate Team runs on Google Cloud and does not answer such
+# an exit at all (a user's report, 2026-09: Leaseweb Germany, netname IR-...),
+# nor do other services on Google. Only a warning - the registry may be wrong,
+# or it may not matter for what this exit is for - and silence when the
+# registry cannot be asked.
+exit_owner_check() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    local found
+    found="$(curl -fsSL -m 10 "https://rdap.org/ip/$1" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+why = []
+if str(d.get("name") or "").upper().startswith("IR-"):
+    why.append("the network is named %s" % d["name"])
+def walk(entities):
+    for e in entities or []:
+        card = (e.get("vcardArray") or [None, []])[1]
+        if "registrant" in (e.get("roles") or []):
+            for f in card:
+                if f[0] == "adr" and "iran" in json.dumps(f, ensure_ascii=False).lower():
+                    names = [x[3] for x in card if x[0] == "fn"]
+                    why.append("it is registered to %s, in Iran" % (names[0] if names else "a company"))
+        walk(e.get("entities"))
+walk(d.get("entities"))
+print("; ".join(dict.fromkeys(why)))
+' 2>/dev/null || true)"
+    [ -n "$found" ] || return 0
+    warn "this address is registered as Iranian: $found."
+    warn "Google treats it as Iran, wherever the server is - EA FC Ultimate Team (on"
+    warn "Google Cloud) and other Google-hosted services will not answer this exit."
+    warn "an exit whose address is registered outside Iran avoids that."
+}
 
 # Where the relay's certificate is, and so whether it can serve DoH. The
 # name is the customer panel's: one certificate, one name, for the panel on
@@ -623,6 +661,45 @@ case "${1:-}" in
         exit 0 ;;
 esac
 
+# ---------------------------------------------------------------- the name
+# The first thing anybody running this sees: the name, large. On one line
+# where the terminal is wide enough (90 columns), on two where it is not; in
+# colour on a terminal, plain in a log.
+banner() {
+    local cols="${COLUMNS:-}" c="" n=""
+    case "$cols" in ""|*[!0-9]*) cols="$(tput cols 2>/dev/null || echo 80)" ;; esac
+    if [ -t 1 ]; then c=$'\033[1;36m'; n=$'\033[0m'; fi
+    printf '\n%s' "$c"
+    if [ "$cols" -ge 90 ] 2>/dev/null; then
+        printf '%s\n' \
+        '  ██████╗   ██████╗   ██████╗ ████████╗  ██████╗  ██████╗     ██████╗  ███╗   ██╗ ███████╗' \
+        '  ██╔══██╗ ██╔═══██╗ ██╔════╝ ╚══██╔══╝ ██╔═══██╗ ██╔══██╗    ██╔══██╗ ████╗  ██║ ██╔════╝' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██████╔╝    ██║  ██║ ██╔██╗ ██║ ███████╗' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██╔══██╗    ██║  ██║ ██║╚██╗██║ ╚════██║' \
+        '  ██████╔╝ ╚██████╔╝ ╚██████╗    ██║    ╚██████╔╝ ██║  ██║    ██████╔╝ ██║ ╚████║ ███████║' \
+        '  ╚═════╝   ╚═════╝   ╚═════╝    ╚═╝     ╚═════╝  ╚═╝  ╚═╝    ╚═════╝  ╚═╝  ╚═══╝ ╚══════╝'
+    else
+        printf '%s\n' \
+        '  ██████╗   ██████╗   ██████╗ ████████╗  ██████╗  ██████╗ ' \
+        '  ██╔══██╗ ██╔═══██╗ ██╔════╝ ╚══██╔══╝ ██╔═══██╗ ██╔══██╗' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██████╔╝' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██╔══██╗' \
+        '  ██████╔╝ ╚██████╔╝ ╚██████╗    ██║    ╚██████╔╝ ██║  ██║' \
+        '  ╚═════╝   ╚═════╝   ╚═════╝    ╚═╝     ╚═════╝  ╚═╝  ╚═╝'
+        printf '\n'
+        printf '%s\n' \
+        '                ██████╗  ███╗   ██╗ ███████╗' \
+        '                ██╔══██╗ ████╗  ██║ ██╔════╝' \
+        '                ██║  ██║ ██╔██╗ ██║ ███████╗' \
+        '                ██║  ██║ ██║╚██╗██║ ╚════██║' \
+        '                ██████╔╝ ██║ ╚████║ ███████║' \
+        '                ╚═════╝  ╚═╝  ╚═══╝ ╚══════╝'
+    fi
+    printf '%s\n  %ssmart DNS for Iran, version %s%s\n' "$n" "${B:-}" "$VERSION" "$n"
+}
+# Not for -V and -h, answered above: a script asking wants only the answer.
+case "${1:-}" in -V|--version|-h|--help) ;; *) banner ;; esac
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || die "run as root:  sudo bash $0"
 [ -r "$SELF" ] && [ -n "$(payload SYSCTL)" ] || die "cannot read my own payloads.
@@ -972,6 +1049,7 @@ if [ -z "$SELF_IP" ]; then
 fi
 valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
 [ "$ROLE" = single ] || [ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
+if is_exit; then exit_owner_check "$SELF_IP"; fi
 
 if [ "$ROLE" = single ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$SELF_IP"; PEER_IP="$SELF_IP"

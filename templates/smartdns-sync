@@ -1022,6 +1022,162 @@ def run_watch(job):
     WATCH_DONE["result"] = {"id": job["id"], "text": text or "(nothing seen)"}
 
 
+def tls_probe(host, address=None, timeout=6.0):
+    """Whether `host` answers HTTPS from here: ["ok", "HTTP 200", ms], or
+    ["fail", how, ms]. At `address` when given - a relay's own 443, which is
+    the customer's way through - and otherwise wherever the name resolves.
+    The certificate is checked, so an answer from anything but the real
+    service - a filtering page, a proxy - is a failure, not a pass."""
+    t0 = time.monotonic()
+
+    def done(state, detail):
+        return [state, detail, int((time.monotonic() - t0) * 1000)]
+    try:
+        where = address or socket.getaddrinfo(host, 443, socket.AF_INET,
+                                              socket.SOCK_STREAM)[0][4][0]
+    except (OSError, UnicodeError):
+        return done("fail", "no address")
+    if not address and not ipaddress.ip_address(where).is_global:
+        # Loopback, a private range, 0.0.0.1: nothing a customer could use,
+        # and connecting there would only reach this machine or its network.
+        return done("fail", "local address")
+    try:
+        raw = socket.create_connection((where, 443), timeout=timeout)
+    except socket.timeout:
+        return done("fail", "timeout")
+    except ConnectionRefusedError:
+        return done("fail", "refused")
+    except OSError:
+        return done("fail", "unreachable")
+    try:
+        with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as s:
+            s.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: doctor-dns-check\r\n"
+                       "Connection: close\r\n\r\n" % host).encode())
+            line = s.recv(128).split(b"\r\n", 1)[0].decode("latin-1")
+    except ssl.SSLCertVerificationError as e:
+        # A certificate for other names is the real service, reached - a bare
+        # domain whose certificate covers only its www. A certificate nobody
+        # vouches for is not: that is something else answering in its place.
+        code = getattr(e, "verify_code", 0)
+        # 10: the service's own certificate ran out. 2, 20, 21: it does not
+        # send the certificates between its own and a known authority - a
+        # browser goes and fetches them, Python does not. Either is the
+        # service's own doing, not the way here; a site with both is told as
+        # whichever OpenSSL meets first, so the two are told the same.
+        return done("fail", {62: "name", 10: "expired", 2: "expired", 20: "expired",
+                             21: "expired"}.get(code, "certificate"))
+    except socket.timeout:
+        return done("fail", "timeout")
+    except ConnectionResetError:
+        return done("fail", "reset")
+    except (ssl.SSLError, OSError):
+        return done("fail", "tls")
+    finally:
+        raw.close()
+    m = re.match(r"HTTP/\S+ (\d{3})", line)
+    return done("ok", "HTTP " + m.group(1) if m else "no HTTP answer")
+
+
+def http_probe(host, address=None, timeout=6.0):
+    """The same on port 80, plain HTTP: where consoles download from, and
+    hosts that serve nothing on 443 at all."""
+    t0 = time.monotonic()
+    try:
+        where = address or socket.getaddrinfo(host, 80, socket.AF_INET,
+                                              socket.SOCK_STREAM)[0][4][0]
+        if not address and not ipaddress.ip_address(where).is_global:
+            return None
+        with socket.create_connection((where, 80), timeout=timeout) as s:
+            s.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: doctor-dns-check\r\n"
+                       "Connection: close\r\n\r\n" % host).encode())
+            head = s.recv(2048).decode("latin-1")
+    except (OSError, UnicodeError):
+        return None
+    m = re.match(r"HTTP/\S+ (\d{3})", head)
+    if not m:
+        return None
+    # Sent over to its own https is no proof: that is what the exit answers on
+    # 80 for any name it does not carry - through a relay, every name would
+    # pass - and a real site that says it has already passed on 443.
+    moved = re.search(r"(?im)^location:\s*(\S+)", head)
+    if m.group(1) in ("301", "302", "307", "308") and moved and \
+            moved.group(1).rstrip("/") == "https://" + host:
+        return None
+    return ["ok", "HTTP %s on 80" % m.group(1), int((time.monotonic() - t0) * 1000)]
+
+
+# The names the exit forwards on port 80: its server_name there, the same.
+CONSOLE_HTTP = re.compile(r"^.*\.(playstation\.(net|com)|xboxlive\.com|gamepass\.com)$")
+
+
+def check_host(host, address=None):
+    """Whether a service answers at this name at all: HTTPS with its own
+    certificate; or one for other names; or its www.; or, for a console's
+    download host, plain HTTP on 80.
+    A catalogue domain is a suffix to route, not always a site of its own, so
+    only when all of those fail is it reported - as the first way it failed."""
+    first = tls_probe(host, address)
+    if first[0] == "ok":
+        return first
+    if first[1] == "name":
+        return ["ok", "certificate for other names", first[2]]
+    if first[1] == "expired":
+        return ["ok", "expired certificate", first[2]]
+    if first[1] == "local address":
+        return first
+    if not host.startswith("www."):
+        www = tls_probe("www." + host, address)
+        if www[0] == "ok" or www[1] == "name":
+            return ["ok", "www." + host, www[2]]
+        if www[1] == "expired":
+            return ["ok", "expired certificate", www[2]]
+        first = [first[0], "%s|www:%s" % (first[1], www[1]), first[2]]
+    # Plain HTTP only for the consoles' download hosts - the only names the
+    # exit carries on 80 - so the exit's column and a relay's ask the same.
+    plain = http_probe(host, address) if CONSOLE_HTTP.match(host) else None
+    return plain or first
+
+
+def probe_all(hosts, address=None, workers=24):
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        out = dict(zip(hosts, pool.map(lambda h: check_host(h, address), hosts)))
+    # Once more, a few at a time, for what failed: hundreds at once through a
+    # relay drop the odd name that answers perfectly well on its own. Only a
+    # name that fails twice is reported.
+    again = [h for h, v in out.items() if v[0] == "fail" and v[1] != "local address"]
+    if again:
+        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+            for h, v in zip(again, pool.map(lambda h: check_host(h, address), again)):
+                if v[0] == "ok":
+                    out[h] = v
+    return out
+
+
+# The admin panel's service check, from here: each host through this relay's
+# own 443 - the customer's way, the tunnel or the direct line to the exit
+# included - once per request, in a thread of its own.
+PROBE_DONE = {"id": None, "result": None}
+
+
+def start_probe(job):
+    if not isinstance(job, dict) or not job.get("id") or job["id"] == PROBE_DONE["id"]:
+        return False
+    hosts = [h for h in job.get("hosts") or []
+             if isinstance(h, str) and re.fullmatch(r"[a-z0-9.-]{1,253}", h)][:2000]
+    PROBE_DONE["id"] = job["id"]
+
+    def run():
+        try:
+            results = probe_all(hosts, address="127.0.0.1")
+        except Exception as e:
+            log(WARN, "services not checked: %s" % e)
+            results = {}
+        PROBE_DONE["result"] = {"id": job["id"], "results": results}
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 def start_watch(job):
     """A request from the panel, once per request."""
     if not isinstance(job, dict) or not job.get("id") or job["id"] == WATCH_DONE["id"]:
@@ -1488,6 +1644,9 @@ def sync_once():
     finished = WATCH_DONE["result"]
     if finished:
         payload["watch_result"] = finished
+    checked = PROBE_DONE["result"]
+    if checked:
+        payload["probe_result"] = checked
     answer = post("/sync", payload)
     if services:
         USAGE_PENDING.clear()
@@ -1507,10 +1666,16 @@ def sync_once():
     # Delivered: the panel has it, so it is not sent again.
     if finished and WATCH_DONE["result"] is finished:
         WATCH_DONE["result"] = None
+    if checked and PROBE_DONE["result"] is checked:
+        PROBE_DONE["result"] = None
     try:
         start_watch(answer.get("watch"))
     except Exception as e:
         log(WARN, "watch not started: %s" % e)
+    try:
+        start_probe(answer.get("probe"))
+    except Exception as e:
+        log(WARN, "service check not started: %s" % e)
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:

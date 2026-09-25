@@ -73,7 +73,7 @@ def run(data, *args, **env):
     e.update(env)
     return subprocess.run([BASH, posix(script)] + list(args), env=e,
                           capture_output=True, text=True, timeout=180,
-                          stdin=subprocess.DEVNULL)
+                          encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
 
 
 print("the whole file gets past the preflight")

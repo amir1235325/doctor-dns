@@ -440,6 +440,16 @@ CREATE TABLE IF NOT EXISTS watch_results (
     text   TEXT NOT NULL
 );
 
+-- The admin panel's service check: for the latest request, what each place it
+-- ran from - the exit itself, and each relay the customer's way - found for
+-- every host, as JSON {host: [state, detail, ms]}.
+CREATE TABLE IF NOT EXISTS probe_results (
+    source TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    at     TEXT NOT NULL,
+    data   TEXT NOT NULL
+);
+
 -- The answer already given to a request that carried an Idempotency-Key. A
 -- bot that sends the same request twice - a retry after a timeout, a user
 -- tapping twice - gets the first answer back instead of a second action.
@@ -3168,6 +3178,24 @@ def daily_report_due(store, stamp=None):
 WATCH_FRESH = 600
 
 
+# How long a service check is handed to the relays after it is asked for.
+PROBE_FRESH = 1200
+
+
+def probe_job(store):
+    """The admin panel's current service check, for the relays: which hosts."""
+    try:
+        job = json.loads(store.setting("probe_job") or "null")
+    except ValueError:
+        return None
+    if not isinstance(job, dict) or not job.get("hosts"):
+        return None
+    asked = parse_ts(job.get("asked_at"))
+    if not asked or (datetime.now(timezone.utc) - asked).total_seconds() > PROBE_FRESH:
+        return None
+    return {"id": job.get("id"), "hosts": job.get("hosts")}
+
+
 def watch_job(store):
     """The admin panel's current request to run smartdns-watch, while fresh."""
     try:
@@ -3474,6 +3502,16 @@ class API(http.server.BaseHTTPRequestHandler):
                                (who, now(), body["logs"][-40000:],
                                 tunnel[-20000:] if isinstance(tunnel, str) else None,
                                 errors[-20000:] if isinstance(errors, str) else None))
+            # What the service check found from here, the customer's way.
+            probed = body.get("probe_result")
+            if isinstance(probed, dict) and isinstance(probed.get("results"), dict):
+                clean = {str(h)[:253]: [str(v[0])[:8], str(v[1])[:40], int(v[2])]
+                         for h, v in list(probed["results"].items())[:2000]
+                         if isinstance(v, list) and len(v) == 3
+                         and isinstance(v[2], (int, float))}
+                self.store.run("INSERT OR REPLACE INTO probe_results (source, job_id, at, data)"
+                               " VALUES (?, ?, ?, ?)", (who, str(probed.get("id"))[:40], now(),
+                                                        json.dumps(clean)))
             # What smartdns-watch saw, when the admin panel asked for it.
             done = body.get("watch_result")
             if isinstance(done, dict) and isinstance(done.get("text"), str):
@@ -3585,6 +3623,8 @@ class API(http.server.BaseHTTPRequestHandler):
                                     "bench": bench_wanted(self.store),
                                     "templates": self.store.template_names(),
                                     "watch": watch_job(self.store),
+                                    # The admin panel's service check, if asked.
+                                    "probe": probe_job(self.store),
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----

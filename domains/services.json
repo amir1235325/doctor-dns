@@ -1582,7 +1582,6 @@
             "discord.gift",
             "discord.new",
             "discordapp.com",
-            "discordapp.io",
             "discordapp.net",
             "discordcdn.com",
             "discordstatus.com"
@@ -1969,6 +1968,7 @@
           "note": "روشن کردنش بازی‌های EA را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند",
           "domains": [
             "gosredirector.ea.com",
+            "blazeredirector.ea.com",
             "blaze.ea.com",
             "gameservices.ea.com",
             "tnt-ea.com"

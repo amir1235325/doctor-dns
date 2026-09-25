@@ -67,7 +67,18 @@ check("and anybody else is dropped, IPv6 included",
       r.stdout.index("accept") < r.stdout.index("tcp dport 8443 drop"), r.stdout)
 check("it replaces itself rather than piling up",
       r.stdout.startswith("table inet smartdns_api\ndelete table inet smartdns_api\n"), r.stdout[:80])
-check("it touches no other port", set(re.findall(r"dport (\d+)", r.stdout)) == {"8443"})
+inbound = r.stdout[r.stdout.index("chain input"):r.stdout.index("chain nginx_out")]
+check("inbound, it touches no other port", set(re.findall(r"dport (\d+)", inbound)) == {"8443"})
+out = r.stdout[r.stdout.index("chain nginx_out"):]
+check("nginx may not proxy to this machine - a name resolving to it made nginx connect "
+      "to itself until it ran out of memory",
+      "type filter hook output" in out and "fib daddr type local reject with tcp reset" in out
+      and "meta skuid { 33, 65534 }" in out, out)
+check("  nor to a private address, the cloud's metadata service among them",
+      "169.254.0.0/16" in out and "10.0.0.0/8" in out and "192.168.0.0/16" in out
+      and "0.0.0.0/8" in out)
+check("  on the ports it proxies only - its own upstreams, DoH and the rest, are elsewhere",
+      "tcp dport { 80, 443, 1119, 4070 }" in out and "8453" not in out and "18119" not in out)
 r = run("198.51.100.1, 1.2.3,abc,300.1.1.1", "--print")
 check("a mistake in RELAY_IP is left out, and said",
       "{ 127.0.0.1, 198.51.100.1 }" in r.stdout and "ignoring '1.2.3'" in r.stderr

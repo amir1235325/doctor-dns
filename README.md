@@ -210,6 +210,13 @@ A few notes:
 - A provider's test file downloading fast from inside Iran does not mean the
   server you buy from that provider will be fast; we saw exactly this with OVH
   and Vultr.
+- **Check whose name the exit's address is registered in, not only where the
+  server is.** An address block registered to an Iranian company is Iran to
+  Google, even on a server in Germany: EA FC's Ultimate Team (on Google Cloud)
+  and other Google-hosted services will not answer that exit. Before you buy,
+  look the address up (`curl -s https://rdap.org/ip/ADDRESS`): a network name
+  starting with `IR-`, or a registrant in Iran, means this. The installer
+  checks it too, and warns.
 - An exit may work well with one Iran server and not with another.
 - The service did not behave the same on every internet connection: with the
   same setup it worked well on mobile internet but was very slow on home

@@ -1,5 +1,6 @@
 #!/bin/bash
-# smartdns-api-guard - let only the relays reach this exit's sync API (8443).
+# smartdns-api-guard - let only the relays reach this exit's sync API (8443),
+# and keep nginx from proxying to this machine or to private addresses.
 #
 # usage: smartdns-api-guard           load the rule
 #        smartdns-api-guard --print   show the rule, and load nothing
@@ -9,10 +10,27 @@
 # holding connections open can wear the API down. Dropped here, they never get
 # a connection at all.
 #
+# nginx here proxies each connection to wherever the name it carries resolves.
+# Some names resolve to loopback in public DNS - discordapp.io, in the Discord
+# service, is 127.0.0.1 - and then nginx connects to itself, is handed the
+# same name, connects again: one connection became 15000 and the exit was
+# killed for memory (found on the test exit, 2026-09-25). A name resolving to
+# a private address is worse in another way: 169.254.169.254 is the cloud's
+# metadata service, which holds this machine's credentials. So nginx's own
+# connections to this machine, or to a private range, on the ports it proxies
+# are refused. Its real local upstreams - DoH, DoT, the Battle.net helper -
+# are on other ports, and the tunnel reaches nginx rather than the other way.
+#
 # smartdns-panel.service runs this before every start, so the list is always
 # the RELAY_IP the panel itself reads: a relay added there by hand is let in
 # the next time the panel restarts, as it would be by the panel.
 set -u
+
+# nginx's workers: nobody, as this installer's nginx.conf leaves them, or
+# www-data, as Debian's own would.
+NGINX_UIDS="33, 65534"
+PROXIED="80, 443, 1119, 4070"
+PRIVATE="0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16"
 
 # Variables only so a test can point them somewhere else; nothing else sets them.
 ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
@@ -44,6 +62,11 @@ table inet smartdns_api {
         tcp dport $port ip saddr { $list } accept
         tcp dport $port drop
     }
+    chain nginx_out {
+        type filter hook output priority 0 ; policy accept ;
+        meta skuid { $NGINX_UIDS } tcp dport { $PROXIED } fib daddr type local reject with tcp reset
+        meta skuid { $NGINX_UIDS } tcp dport { $PROXIED } ip daddr { $PRIVATE } reject with tcp reset
+    }
 }"
 
 case "${1:-}" in
@@ -59,7 +82,7 @@ if [ -z "$NFT" ]; then
     exit 0
 fi
 if printf '%s\n' "$rules" | "$NFT" -f -; then
-    echo "port $port answers: $list"
+    echo "port $port answers: $list; nginx may not proxy to this machine or a private address"
 else
     echo "nft refused the rule - the sync API stays open, and the panel refuses strangers itself" >&2
 fi

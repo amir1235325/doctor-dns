@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.2"
+VERSION="0.8.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -95,6 +95,44 @@ is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }
 # Where a single machine's sync API listens: loopback only, because 8443 is
 # its customer panel, and the only relay it has is itself.
 SINGLE_API_PORT=8449
+
+# Whose name the exit's address is registered in. An address block registered
+# to an Iranian company is still Iranian to Google, even on a server in
+# Germany: EA FC's Ultimate Team runs on Google Cloud and does not answer such
+# an exit at all (a user's report, 2026-09: Leaseweb Germany, netname IR-...),
+# nor do other services on Google. Only a warning - the registry may be wrong,
+# or it may not matter for what this exit is for - and silence when the
+# registry cannot be asked.
+exit_owner_check() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    local found
+    found="$(curl -fsSL -m 10 "https://rdap.org/ip/$1" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+why = []
+if str(d.get("name") or "").upper().startswith("IR-"):
+    why.append("the network is named %s" % d["name"])
+def walk(entities):
+    for e in entities or []:
+        card = (e.get("vcardArray") or [None, []])[1]
+        if "registrant" in (e.get("roles") or []):
+            for f in card:
+                if f[0] == "adr" and "iran" in json.dumps(f, ensure_ascii=False).lower():
+                    names = [x[3] for x in card if x[0] == "fn"]
+                    why.append("it is registered to %s, in Iran" % (names[0] if names else "a company"))
+        walk(e.get("entities"))
+walk(d.get("entities"))
+print("; ".join(dict.fromkeys(why)))
+' 2>/dev/null || true)"
+    [ -n "$found" ] || return 0
+    warn "this address is registered as Iranian: $found."
+    warn "Google treats it as Iran, wherever the server is - EA FC Ultimate Team (on"
+    warn "Google Cloud) and other Google-hosted services will not answer this exit."
+    warn "an exit whose address is registered outside Iran avoids that."
+}
 
 # Where the relay's certificate is, and so whether it can serve DoH. The
 # name is the customer panel's: one certificate, one name, for the panel on
@@ -623,6 +661,45 @@ case "${1:-}" in
         exit 0 ;;
 esac
 
+# ---------------------------------------------------------------- the name
+# The first thing anybody running this sees: the name, large. On one line
+# where the terminal is wide enough (90 columns), on two where it is not; in
+# colour on a terminal, plain in a log.
+banner() {
+    local cols="${COLUMNS:-}" c="" n=""
+    case "$cols" in ""|*[!0-9]*) cols="$(tput cols 2>/dev/null || echo 80)" ;; esac
+    if [ -t 1 ]; then c=$'\033[1;36m'; n=$'\033[0m'; fi
+    printf '\n%s' "$c"
+    if [ "$cols" -ge 90 ] 2>/dev/null; then
+        printf '%s\n' \
+        '  ██████╗   ██████╗   ██████╗ ████████╗  ██████╗  ██████╗     ██████╗  ███╗   ██╗ ███████╗' \
+        '  ██╔══██╗ ██╔═══██╗ ██╔════╝ ╚══██╔══╝ ██╔═══██╗ ██╔══██╗    ██╔══██╗ ████╗  ██║ ██╔════╝' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██████╔╝    ██║  ██║ ██╔██╗ ██║ ███████╗' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██╔══██╗    ██║  ██║ ██║╚██╗██║ ╚════██║' \
+        '  ██████╔╝ ╚██████╔╝ ╚██████╗    ██║    ╚██████╔╝ ██║  ██║    ██████╔╝ ██║ ╚████║ ███████║' \
+        '  ╚═════╝   ╚═════╝   ╚═════╝    ╚═╝     ╚═════╝  ╚═╝  ╚═╝    ╚═════╝  ╚═╝  ╚═══╝ ╚══════╝'
+    else
+        printf '%s\n' \
+        '  ██████╗   ██████╗   ██████╗ ████████╗  ██████╗  ██████╗ ' \
+        '  ██╔══██╗ ██╔═══██╗ ██╔════╝ ╚══██╔══╝ ██╔═══██╗ ██╔══██╗' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██████╔╝' \
+        '  ██║  ██║ ██║   ██║ ██║         ██║    ██║   ██║ ██╔══██╗' \
+        '  ██████╔╝ ╚██████╔╝ ╚██████╗    ██║    ╚██████╔╝ ██║  ██║' \
+        '  ╚═════╝   ╚═════╝   ╚═════╝    ╚═╝     ╚═════╝  ╚═╝  ╚═╝'
+        printf '\n'
+        printf '%s\n' \
+        '                ██████╗  ███╗   ██╗ ███████╗' \
+        '                ██╔══██╗ ████╗  ██║ ██╔════╝' \
+        '                ██║  ██║ ██╔██╗ ██║ ███████╗' \
+        '                ██║  ██║ ██║╚██╗██║ ╚════██║' \
+        '                ██████╔╝ ██║ ╚████║ ███████║' \
+        '                ╚═════╝  ╚═╝  ╚═══╝ ╚══════╝'
+    fi
+    printf '%s\n  %ssmart DNS for Iran, version %s%s\n' "$n" "${B:-}" "$VERSION" "$n"
+}
+# Not for -V and -h, answered above: a script asking wants only the answer.
+case "${1:-}" in -V|--version|-h|--help) ;; *) banner ;; esac
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || die "run as root:  sudo bash $0"
 [ -r "$SELF" ] && [ -n "$(payload SYSCTL)" ] || die "cannot read my own payloads.
@@ -972,6 +1049,7 @@ if [ -z "$SELF_IP" ]; then
 fi
 valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
 [ "$ROLE" = single ] || [ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
+if is_exit; then exit_owner_check "$SELF_IP"; fi
 
 if [ "$ROLE" = single ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$SELF_IP"; PEER_IP="$SELF_IP"
@@ -2283,7 +2361,12 @@ exit 0
 ##    pointing such a name at it makes the client fire SYNs into a void and retry
 ##    forever. EA's game stack is full of these:
 ##
-##      gosredirector.ea.com   TCP 42130 / 42230   game-server redirector
+##      gosredirector.ea.com   TCP 42130 / 42230   game-server redirector (FC 25)
+##      blazeredirector.ea.com the same, for FC 26 (spring25.client.blazeredirector...)
+##                             - and if it is routed, the redirector sees the exit's
+##                             address while the Blaze servers it hands out see
+##                             Iran's, and EA refuses the sign-in (reported with a
+##                             German exit: "you must be signed in to PSN and EA")
 ##      blaze.ea.com           TCP 15000-15100     the actual game servers
 ##      gameservices.ea.com    TCP 10010, 11000    QoS coordinator, match stats
 ##      tnt-ea.com             TCP 8095            realtime messaging
@@ -2332,6 +2415,7 @@ exit 0
 ## Add more with:  smartdns bypass <domain>
 #
 #server=/gosredirector.ea.com/#
+#server=/blazeredirector.ea.com/#
 #server=/blaze.ea.com/#
 #server=/gameservices.ea.com/#
 #server=/tnt-ea.com/#
@@ -4263,6 +4347,16 @@ exit 0
 #    job_id TEXT NOT NULL,
 #    at     TEXT NOT NULL,
 #    text   TEXT NOT NULL
+#);
+#
+#-- The admin panel's service check: for the latest request, what each place it
+#-- ran from - the exit itself, and each relay the customer's way - found for
+#-- every host, as JSON {host: [state, detail, ms]}.
+#CREATE TABLE IF NOT EXISTS probe_results (
+#    source TEXT PRIMARY KEY,
+#    job_id TEXT NOT NULL,
+#    at     TEXT NOT NULL,
+#    data   TEXT NOT NULL
 #);
 #
 #-- The answer already given to a request that carried an Idempotency-Key. A
@@ -6993,6 +7087,24 @@ exit 0
 #WATCH_FRESH = 600
 #
 #
+## How long a service check is handed to the relays after it is asked for.
+#PROBE_FRESH = 1200
+#
+#
+#def probe_job(store):
+#    """The admin panel's current service check, for the relays: which hosts."""
+#    try:
+#        job = json.loads(store.setting("probe_job") or "null")
+#    except ValueError:
+#        return None
+#    if not isinstance(job, dict) or not job.get("hosts"):
+#        return None
+#    asked = parse_ts(job.get("asked_at"))
+#    if not asked or (datetime.now(timezone.utc) - asked).total_seconds() > PROBE_FRESH:
+#        return None
+#    return {"id": job.get("id"), "hosts": job.get("hosts")}
+#
+#
 #def watch_job(store):
 #    """The admin panel's current request to run smartdns-watch, while fresh."""
 #    try:
@@ -7299,6 +7411,16 @@ exit 0
 #                               (who, now(), body["logs"][-40000:],
 #                                tunnel[-20000:] if isinstance(tunnel, str) else None,
 #                                errors[-20000:] if isinstance(errors, str) else None))
+#            # What the service check found from here, the customer's way.
+#            probed = body.get("probe_result")
+#            if isinstance(probed, dict) and isinstance(probed.get("results"), dict):
+#                clean = {str(h)[:253]: [str(v[0])[:8], str(v[1])[:40], int(v[2])]
+#                         for h, v in list(probed["results"].items())[:2000]
+#                         if isinstance(v, list) and len(v) == 3
+#                         and isinstance(v[2], (int, float))}
+#                self.store.run("INSERT OR REPLACE INTO probe_results (source, job_id, at, data)"
+#                               " VALUES (?, ?, ?, ?)", (who, str(probed.get("id"))[:40], now(),
+#                                                        json.dumps(clean)))
 #            # What smartdns-watch saw, when the admin panel asked for it.
 #            done = body.get("watch_result")
 #            if isinstance(done, dict) and isinstance(done.get("text"), str):
@@ -7410,6 +7532,8 @@ exit 0
 #                                    "bench": bench_wanted(self.store),
 #                                    "templates": self.store.template_names(),
 #                                    "watch": watch_job(self.store),
+#                                    # The admin panel's service check, if asked.
+#                                    "probe": probe_job(self.store),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -9740,6 +9864,162 @@ exit 0
 #    WATCH_DONE["result"] = {"id": job["id"], "text": text or "(nothing seen)"}
 #
 #
+#def tls_probe(host, address=None, timeout=6.0):
+#    """Whether `host` answers HTTPS from here: ["ok", "HTTP 200", ms], or
+#    ["fail", how, ms]. At `address` when given - a relay's own 443, which is
+#    the customer's way through - and otherwise wherever the name resolves.
+#    The certificate is checked, so an answer from anything but the real
+#    service - a filtering page, a proxy - is a failure, not a pass."""
+#    t0 = time.monotonic()
+#
+#    def done(state, detail):
+#        return [state, detail, int((time.monotonic() - t0) * 1000)]
+#    try:
+#        where = address or socket.getaddrinfo(host, 443, socket.AF_INET,
+#                                              socket.SOCK_STREAM)[0][4][0]
+#    except (OSError, UnicodeError):
+#        return done("fail", "no address")
+#    if not address and not ipaddress.ip_address(where).is_global:
+#        # Loopback, a private range, 0.0.0.1: nothing a customer could use,
+#        # and connecting there would only reach this machine or its network.
+#        return done("fail", "local address")
+#    try:
+#        raw = socket.create_connection((where, 443), timeout=timeout)
+#    except socket.timeout:
+#        return done("fail", "timeout")
+#    except ConnectionRefusedError:
+#        return done("fail", "refused")
+#    except OSError:
+#        return done("fail", "unreachable")
+#    try:
+#        with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as s:
+#            s.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: doctor-dns-check\r\n"
+#                       "Connection: close\r\n\r\n" % host).encode())
+#            line = s.recv(128).split(b"\r\n", 1)[0].decode("latin-1")
+#    except ssl.SSLCertVerificationError as e:
+#        # A certificate for other names is the real service, reached - a bare
+#        # domain whose certificate covers only its www. A certificate nobody
+#        # vouches for is not: that is something else answering in its place.
+#        code = getattr(e, "verify_code", 0)
+#        # 10: the service's own certificate ran out. 2, 20, 21: it does not
+#        # send the certificates between its own and a known authority - a
+#        # browser goes and fetches them, Python does not. Either is the
+#        # service's own doing, not the way here; a site with both is told as
+#        # whichever OpenSSL meets first, so the two are told the same.
+#        return done("fail", {62: "name", 10: "expired", 2: "expired", 20: "expired",
+#                             21: "expired"}.get(code, "certificate"))
+#    except socket.timeout:
+#        return done("fail", "timeout")
+#    except ConnectionResetError:
+#        return done("fail", "reset")
+#    except (ssl.SSLError, OSError):
+#        return done("fail", "tls")
+#    finally:
+#        raw.close()
+#    m = re.match(r"HTTP/\S+ (\d{3})", line)
+#    return done("ok", "HTTP " + m.group(1) if m else "no HTTP answer")
+#
+#
+#def http_probe(host, address=None, timeout=6.0):
+#    """The same on port 80, plain HTTP: where consoles download from, and
+#    hosts that serve nothing on 443 at all."""
+#    t0 = time.monotonic()
+#    try:
+#        where = address or socket.getaddrinfo(host, 80, socket.AF_INET,
+#                                              socket.SOCK_STREAM)[0][4][0]
+#        if not address and not ipaddress.ip_address(where).is_global:
+#            return None
+#        with socket.create_connection((where, 80), timeout=timeout) as s:
+#            s.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: doctor-dns-check\r\n"
+#                       "Connection: close\r\n\r\n" % host).encode())
+#            head = s.recv(2048).decode("latin-1")
+#    except (OSError, UnicodeError):
+#        return None
+#    m = re.match(r"HTTP/\S+ (\d{3})", head)
+#    if not m:
+#        return None
+#    # Sent over to its own https is no proof: that is what the exit answers on
+#    # 80 for any name it does not carry - through a relay, every name would
+#    # pass - and a real site that says it has already passed on 443.
+#    moved = re.search(r"(?im)^location:\s*(\S+)", head)
+#    if m.group(1) in ("301", "302", "307", "308") and moved and \
+#            moved.group(1).rstrip("/") == "https://" + host:
+#        return None
+#    return ["ok", "HTTP %s on 80" % m.group(1), int((time.monotonic() - t0) * 1000)]
+#
+#
+## The names the exit forwards on port 80: its server_name there, the same.
+#CONSOLE_HTTP = re.compile(r"^.*\.(playstation\.(net|com)|xboxlive\.com|gamepass\.com)$")
+#
+#
+#def check_host(host, address=None):
+#    """Whether a service answers at this name at all: HTTPS with its own
+#    certificate; or one for other names; or its www.; or, for a console's
+#    download host, plain HTTP on 80.
+#    A catalogue domain is a suffix to route, not always a site of its own, so
+#    only when all of those fail is it reported - as the first way it failed."""
+#    first = tls_probe(host, address)
+#    if first[0] == "ok":
+#        return first
+#    if first[1] == "name":
+#        return ["ok", "certificate for other names", first[2]]
+#    if first[1] == "expired":
+#        return ["ok", "expired certificate", first[2]]
+#    if first[1] == "local address":
+#        return first
+#    if not host.startswith("www."):
+#        www = tls_probe("www." + host, address)
+#        if www[0] == "ok" or www[1] == "name":
+#            return ["ok", "www." + host, www[2]]
+#        if www[1] == "expired":
+#            return ["ok", "expired certificate", www[2]]
+#        first = [first[0], "%s|www:%s" % (first[1], www[1]), first[2]]
+#    # Plain HTTP only for the consoles' download hosts - the only names the
+#    # exit carries on 80 - so the exit's column and a relay's ask the same.
+#    plain = http_probe(host, address) if CONSOLE_HTTP.match(host) else None
+#    return plain or first
+#
+#
+#def probe_all(hosts, address=None, workers=24):
+#    import concurrent.futures
+#    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+#        out = dict(zip(hosts, pool.map(lambda h: check_host(h, address), hosts)))
+#    # Once more, a few at a time, for what failed: hundreds at once through a
+#    # relay drop the odd name that answers perfectly well on its own. Only a
+#    # name that fails twice is reported.
+#    again = [h for h, v in out.items() if v[0] == "fail" and v[1] != "local address"]
+#    if again:
+#        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+#            for h, v in zip(again, pool.map(lambda h: check_host(h, address), again)):
+#                if v[0] == "ok":
+#                    out[h] = v
+#    return out
+#
+#
+## The admin panel's service check, from here: each host through this relay's
+## own 443 - the customer's way, the tunnel or the direct line to the exit
+## included - once per request, in a thread of its own.
+#PROBE_DONE = {"id": None, "result": None}
+#
+#
+#def start_probe(job):
+#    if not isinstance(job, dict) or not job.get("id") or job["id"] == PROBE_DONE["id"]:
+#        return False
+#    hosts = [h for h in job.get("hosts") or []
+#             if isinstance(h, str) and re.fullmatch(r"[a-z0-9.-]{1,253}", h)][:2000]
+#    PROBE_DONE["id"] = job["id"]
+#
+#    def run():
+#        try:
+#            results = probe_all(hosts, address="127.0.0.1")
+#        except Exception as e:
+#            log(WARN, "services not checked: %s" % e)
+#            results = {}
+#        PROBE_DONE["result"] = {"id": job["id"], "results": results}
+#    threading.Thread(target=run, daemon=True).start()
+#    return True
+#
+#
 #def start_watch(job):
 #    """A request from the panel, once per request."""
 #    if not isinstance(job, dict) or not job.get("id") or job["id"] == WATCH_DONE["id"]:
@@ -10206,6 +10486,9 @@ exit 0
 #    finished = WATCH_DONE["result"]
 #    if finished:
 #        payload["watch_result"] = finished
+#    checked = PROBE_DONE["result"]
+#    if checked:
+#        payload["probe_result"] = checked
 #    answer = post("/sync", payload)
 #    if services:
 #        USAGE_PENDING.clear()
@@ -10225,10 +10508,16 @@ exit 0
 #    # Delivered: the panel has it, so it is not sent again.
 #    if finished and WATCH_DONE["result"] is finished:
 #        WATCH_DONE["result"] = None
+#    if checked and PROBE_DONE["result"] is checked:
+#        PROBE_DONE["result"] = None
 #    try:
 #        start_watch(answer.get("watch"))
 #    except Exception as e:
 #        log(WARN, "watch not started: %s" % e)
+#    try:
+#        start_probe(answer.get("probe"))
+#    except Exception as e:
+#        log(WARN, "service check not started: %s" % e)
 #    try:
 #        save_template_names(answer.get("templates"))
 #    except Exception as e:
@@ -15303,6 +15592,343 @@ exit 0
 #    return "%d روز پیش" % (secs // 86400)
 #
 #
+#def tls_probe(host, address=None, timeout=6.0):
+#    """Whether `host` answers HTTPS from here: ["ok", "HTTP 200", ms], or
+#    ["fail", how, ms]. At `address` when given - a relay's own 443, which is
+#    the customer's way through - and otherwise wherever the name resolves.
+#    The certificate is checked, so an answer from anything but the real
+#    service - a filtering page, a proxy - is a failure, not a pass."""
+#    t0 = time.monotonic()
+#
+#    def done(state, detail):
+#        return [state, detail, int((time.monotonic() - t0) * 1000)]
+#    try:
+#        where = address or socket.getaddrinfo(host, 443, socket.AF_INET,
+#                                              socket.SOCK_STREAM)[0][4][0]
+#    except (OSError, UnicodeError):
+#        return done("fail", "no address")
+#    if not address and not ipaddress.ip_address(where).is_global:
+#        # Loopback, a private range, 0.0.0.1: nothing a customer could use,
+#        # and connecting there would only reach this machine or its network.
+#        return done("fail", "local address")
+#    try:
+#        raw = socket.create_connection((where, 443), timeout=timeout)
+#    except socket.timeout:
+#        return done("fail", "timeout")
+#    except ConnectionRefusedError:
+#        return done("fail", "refused")
+#    except OSError:
+#        return done("fail", "unreachable")
+#    try:
+#        with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as s:
+#            s.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: doctor-dns-check\r\n"
+#                       "Connection: close\r\n\r\n" % host).encode())
+#            line = s.recv(128).split(b"\r\n", 1)[0].decode("latin-1")
+#    except ssl.SSLCertVerificationError as e:
+#        # A certificate for other names is the real service, reached - a bare
+#        # domain whose certificate covers only its www. A certificate nobody
+#        # vouches for is not: that is something else answering in its place.
+#        code = getattr(e, "verify_code", 0)
+#        # 10: the service's own certificate ran out. 2, 20, 21: it does not
+#        # send the certificates between its own and a known authority - a
+#        # browser goes and fetches them, Python does not. Either is the
+#        # service's own doing, not the way here; a site with both is told as
+#        # whichever OpenSSL meets first, so the two are told the same.
+#        return done("fail", {62: "name", 10: "expired", 2: "expired", 20: "expired",
+#                             21: "expired"}.get(code, "certificate"))
+#    except socket.timeout:
+#        return done("fail", "timeout")
+#    except ConnectionResetError:
+#        return done("fail", "reset")
+#    except (ssl.SSLError, OSError):
+#        return done("fail", "tls")
+#    finally:
+#        raw.close()
+#    m = re.match(r"HTTP/\S+ (\d{3})", line)
+#    return done("ok", "HTTP " + m.group(1) if m else "no HTTP answer")
+#
+#
+#def http_probe(host, address=None, timeout=6.0):
+#    """The same on port 80, plain HTTP: where consoles download from, and
+#    hosts that serve nothing on 443 at all."""
+#    t0 = time.monotonic()
+#    try:
+#        where = address or socket.getaddrinfo(host, 80, socket.AF_INET,
+#                                              socket.SOCK_STREAM)[0][4][0]
+#        if not address and not ipaddress.ip_address(where).is_global:
+#            return None
+#        with socket.create_connection((where, 80), timeout=timeout) as s:
+#            s.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: doctor-dns-check\r\n"
+#                       "Connection: close\r\n\r\n" % host).encode())
+#            head = s.recv(2048).decode("latin-1")
+#    except (OSError, UnicodeError):
+#        return None
+#    m = re.match(r"HTTP/\S+ (\d{3})", head)
+#    if not m:
+#        return None
+#    # Sent over to its own https is no proof: that is what the exit answers on
+#    # 80 for any name it does not carry - through a relay, every name would
+#    # pass - and a real site that says it has already passed on 443.
+#    moved = re.search(r"(?im)^location:\s*(\S+)", head)
+#    if m.group(1) in ("301", "302", "307", "308") and moved and \
+#            moved.group(1).rstrip("/") == "https://" + host:
+#        return None
+#    return ["ok", "HTTP %s on 80" % m.group(1), int((time.monotonic() - t0) * 1000)]
+#
+#
+## The names the exit forwards on port 80: its server_name there, the same.
+#CONSOLE_HTTP = re.compile(r"^.*\.(playstation\.(net|com)|xboxlive\.com|gamepass\.com)$")
+#
+#
+#def check_host(host, address=None):
+#    """Whether a service answers at this name at all: HTTPS with its own
+#    certificate; or one for other names; or its www.; or, for a console's
+#    download host, plain HTTP on 80.
+#    A catalogue domain is a suffix to route, not always a site of its own, so
+#    only when all of those fail is it reported - as the first way it failed."""
+#    first = tls_probe(host, address)
+#    if first[0] == "ok":
+#        return first
+#    if first[1] == "name":
+#        return ["ok", "certificate for other names", first[2]]
+#    if first[1] == "expired":
+#        return ["ok", "expired certificate", first[2]]
+#    if first[1] == "local address":
+#        return first
+#    if not host.startswith("www."):
+#        www = tls_probe("www." + host, address)
+#        if www[0] == "ok" or www[1] == "name":
+#            return ["ok", "www." + host, www[2]]
+#        if www[1] == "expired":
+#            return ["ok", "expired certificate", www[2]]
+#        first = [first[0], "%s|www:%s" % (first[1], www[1]), first[2]]
+#    # Plain HTTP only for the consoles' download hosts - the only names the
+#    # exit carries on 80 - so the exit's column and a relay's ask the same.
+#    plain = http_probe(host, address) if CONSOLE_HTTP.match(host) else None
+#    return plain or first
+#
+#
+#def probe_all(hosts, address=None, workers=24):
+#    import concurrent.futures
+#    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+#        out = dict(zip(hosts, pool.map(lambda h: check_host(h, address), hosts)))
+#    # Once more, a few at a time, for what failed: hundreds at once through a
+#    # relay drop the odd name that answers perfectly well on its own. Only a
+#    # name that fails twice is reported.
+#    again = [h for h, v in out.items() if v[0] == "fail" and v[1] != "local address"]
+#    if again:
+#        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+#            for h, v in zip(again, pool.map(lambda h: check_host(h, address), again)):
+#                if v[0] == "ok":
+#                    out[h] = v
+#    return out
+#
+#
+## ---------------------------------------------------------------- diagnosis
+## Which of the catalogue's services answer at all: from this exit, and from
+## each relay the customer's way. Some services refuse some servers outright -
+## a block registered to an Iranian company, a provider a service does not
+## like - and nothing on our side can change that; this says which, before a
+## customer does.
+#DIAG = {"running": False}
+#DIAG_PER_GROUP = 10
+## What to try for a catalogue domain that is only a suffix: a real host under
+## it that is always there, checked to answer; or None where there is none to
+## name - the hosts behind it change by the minute (Netflix's video, a CDN's
+## customers) or the bare name is a placeholder. A suffix with no address at
+## all, bare or www., is told the same way without being listed here.
+#PROBE_HOSTS = {
+#    "jtvnw.net": "static-cdn.jtvnw.net", "ttvnw.net": "usher.ttvnw.net",
+#    "gvt1.com": "redirector.gvt1.com", "gvt2.com": "beacons.gvt2.com",
+#    "discordapp.net": "media.discordapp.net", "minecraftservices.com": "api.minecraftservices.com",
+#    "slack-edge.com": "a.slack-edge.com", "nflxext.com": "assets.nflxext.com",
+#    "rbxcdn.com": "tr.rbxcdn.com", "rgpub.io": "static.rgpub.io",
+#    "playstation.net": "apollo2.dl.playstation.net",
+#    "nflxvideo.net": None, "gcloudcs.com": None, "en25.com": None, "supercell.net": None,
+#    "battlenet.com": None,
+#}
+#PROBE_WORDS = {"no address": "آدرسی ندارد", "timeout": "جواب نداد", "refused": "اتصال رد شد",
+#               "unreachable": "مسیری نیست", "reset": "اتصال قطع شد",
+#               "tls": "اتصال امن برقرار نشد", "certificate": "گواهی نامعتبر — جواب از جای دیگری آمد",
+#               "no HTTP answer": "وصل شد، بی جواب HTTP",
+#               "certificate for other names": "وصل شد؛ گواهی برای زیردامنه‌ها",
+#               "expired": "گواهی خود سایت منقضی یا ناقص است",
+#               "expired certificate": "گواهی خود سایت منقضی یا ناقص است — مشکل از خود سرویس "
+#                                      "است، نه از ما",
+#               "local address": "به آدرسی داخلی اشاره می‌کند (مثل 127.0.0.1) — اسم خراب است"}
+#
+#
+#def diag_items(ticked=None):
+#    """What to check: every routed group's domains, a few per group. The
+#    groups that are never routed are left out - they go direct - and so are
+#    the ones off by default that no template has switched on: those go
+#    direct too, most of them because they are not on 443 at all."""
+#    if ticked is None:
+#        try:
+#            ticked = {(r["service_key"], r["group_key"]) for r in STORE.q(
+#                "SELECT DISTINCT service_key, group_key FROM template_services")}
+#        except sqlite3.OperationalError:
+#            ticked = set()
+#    out = []
+#    for svc in catalogue_now():
+#        if svc["key"] == "bypass":
+#            continue
+#        for g in svc["groups"]:
+#            if g.get("locked"):
+#                continue
+#            if g.get("opt_in") and (svc["key"], g["key"]) not in ticked:
+#                continue
+#            for d in g["domains"][:DIAG_PER_GROUP]:
+#                out.append((svc["key"], svc.get("label") or svc["key"], d))
+#    return out
+#
+#
+#def resolvable(name):
+#    try:
+#        socket.getaddrinfo(name, 443, socket.AF_INET, socket.SOCK_STREAM)
+#        return True
+#    except (OSError, UnicodeError):
+#        return False
+#
+#
+#def pick_host(domain):
+#    """The name to try for a domain: itself, or www. when the bare domain has
+#    no address - many of the catalogue's are parents of what is really used."""
+#    for name in (domain, "www." + domain):
+#        if resolvable(name):
+#            return name
+#    return None
+#
+#
+#def run_diagnosis():
+#    import concurrent.futures
+#    try:
+#        items = diag_items()
+#        with concurrent.futures.ThreadPoolExecutor(32) as pool:
+#            hosts = list(pool.map(
+#                lambda d: PROBE_HOSTS[d] if d in PROBE_HOSTS else pick_host(d),
+#                [d for _, _, d in items]))
+#        job = {"id": secrets.token_hex(6), "asked_at": now(),
+#               "items": [[k, label, d, h] for (k, label, d), h in zip(items, hosts)],
+#               "hosts": sorted({h for h in hosts if h})}
+#        STORE.run("INSERT INTO settings (key, value) VALUES ('probe_job', ?)"
+#                  " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(job),))
+#        STORE.run("DELETE FROM probe_results")
+#        results = probe_all(job["hosts"])
+#        STORE.run("INSERT OR REPLACE INTO probe_results (source, job_id, at, data)"
+#                  " VALUES ('exit', ?, ?, ?)", (job["id"], now(), json.dumps(results)))
+#    except Exception as e:
+#        log(WARN, "services not checked: %r" % e)
+#    finally:
+#        DIAG["running"] = False
+#
+#
+#def diagnose_page():
+#    p = CFG["ADMIN_PATH"]
+#    try:
+#        job = json.loads(STORE.one("SELECT value FROM settings WHERE key = 'probe_job'")
+#                         ["value"] or "null")
+#    except (TypeError, ValueError):
+#        job = None
+#    out = ["<div class='card'><h2>عیب‌یابی سرویس‌ها</h2>"
+#           "<p class='muted'>برای هر سرویسی که از سرور می‌رود، چند دامنه‌اش امتحان می‌شود: یک "
+#           "اتصال امن روی ۴۴۳ با گواهی خود سرویس. دو جا: <b>از سرور خارج</b> — خود سرور به آن "
+#           "سرویس می‌رسد یا نه — و <b>از مسیر مشتری</b>، از هر رله و از همان راهی که ترافیک "
+#           "مشتری می‌رود. اگر از سرور خارج نشود، آن سرویس آن سرور را قبول نمی‌کند و از دست ما "
+#           "کاری برنمی‌آید؛ اگر از سرور خارج بشود و از مسیر مشتری نه، مشکل از راه ایران تا "
+#           "خارج است. فقط ۴۴۳ آزموده می‌شود؛ بازی‌هایی که روی پورت‌های دیگر یا UDP بازی می‌کنند "
+#           "این‌جا نیستند.</p>"
+#           "<form method='post' action='/%s/diagnose-start'><button>%s</button></form>"
+#           % (p, "در حال تست…" if DIAG["running"] else "شروع تست")]
+#    if not job:
+#        out.append("</div>")
+#        return "".join(out)
+#    rows = {r["source"]: json.loads(r["data"]) for r in STORE.q(
+#        "SELECT source, data FROM probe_results WHERE job_id = ?", (job.get("id"),))}
+#    sources = (["exit"] if "exit" in rows else []) + sorted(s for s in rows if s != "exit")
+#    asked = parse_ts(job.get("asked_at"))
+#    age = (datetime.now(timezone.utc) - asked).total_seconds() if asked else 1e9
+#    waiting = DIAG["running"] or (age < 600 and len(sources) < 2)
+#    out.append("<p class='muted'>آخرین تست: %s%s</p>" % (
+#        html.escape(ago(job.get("asked_at"))),
+#        " · <span class='warn'>منتظر نتیجه%s؛ این صفحه خودش تازه می‌شود</span>"
+#        % ("ٔ سرور خارج" if DIAG["running"] else "ٔ رله‌ها") if waiting else ""))
+#    if waiting:
+#        out.append("<script>setTimeout(function(){location.reload()},10000)</script>")
+#    out.append("</div>")
+#    if not sources:
+#        return "".join(out)
+#    label = {"exit": "از سرور خارج"}
+#    label.update({s: "از مسیر مشتری — رله %s" % s for s in sources if s != "exit"})
+#    services = {}
+#    for key, name, domain, host in job.get("items") or []:
+#        services.setdefault((key, name), []).append((domain, host))
+#
+#    def words(detail):
+#        first, _, www = detail.partition("|www:")
+#        said = PROBE_WORDS.get(first, first)
+#        return said + ("؛ www. هم: " + PROBE_WORDS.get(www, www) if www else "")
+#
+#    def cell(res, exit_res=None):
+#        if not res:
+#            return "<td class='muted'>-</td>"
+#        state, detail, ms = res
+#        if detail == "expired certificate":
+#            return "<td class='warn'>⚠ %s</td>" % html.escape(PROBE_WORDS[detail])
+#        if state == "ok":
+#            return "<td class='ok'>✓ %s · %d ms</td>" % (html.escape(detail), ms)
+#        # A relay cannot see where a name points - the exit resolves it - so
+#        # where the exit found it pointing here, that is the reason for both.
+#        if exit_res and exit_res[1] == "local address":
+#            detail = "local address"
+#        return "<td class='warn'>✗ %s</td>" % html.escape(words(detail))
+#
+#    summary = []
+#    for (key, name), doms in services.items():
+#        tested = [(d, h) for d, h in doms if h]
+#        chips, bad = [], 0
+#        for src in sources:
+#            ok = sum(1 for _, h in tested if (rows[src].get(h) or ["fail"])[0] == "ok")
+#            n = len(tested)
+#            if not n:
+#                chips.append("<td class='muted'>فقط پسوند</td>")
+#            elif ok == n:
+#                chips.append("<td><span class='ok'>✓ همه (%d)</span></td>" % n)
+#            elif ok == 0:
+#                chips.append("<td><b class='warn'>✗ هیچ‌کدام (%d)</b></td>" % n)
+#                bad += 2
+#            else:
+#                chips.append("<td><span class='warn'>%d از %d</span></td>" % (ok, n))
+#                bad += 1
+#        detail = ["<details><summary class='muted'>%d دامنه</summary><table><tr><th>دامنه</th>%s"
+#                  "</tr>" % (len(doms), "".join("<th>%s</th>" % html.escape(label[s])
+#                                              for s in sources))]
+#        for d, h in doms:
+#            if not h:
+#                detail.append("<tr><td><code>%s</code></td><td class='muted' colspan='%d'>فقط "
+#                              "پسوند است؛ سرورهای واقعی‌اش زیردامنه‌ها هستند و از این‌جا آزموده "
+#                              "نمی‌شود</td></tr>" % (html.escape(d), len(sources)))
+#                continue
+#            shown = h if h == d else "%s ← %s" % (d, h)
+#            detail.append("<tr><td><code>%s</code></td>%s</tr>" % (
+#                html.escape(shown), "".join(cell(rows[s].get(h), rows.get("exit", {}).get(h))
+#                                            for s in sources)))
+#        detail.append("</table></details>")
+#        summary.append((-bad, name, "<tr><td><b>%s</b>%s</td>%s</tr>"
+#                        % (html.escape(name), "".join(detail), "".join(chips))))
+#    summary.sort(key=lambda x: (x[0], x[1]))
+#    out.append("<div class='card'><h2>نتیجه</h2><div style='overflow-x:auto'><table><tr>"
+#               "<th>سرویس</th>%s</tr>%s</table></div><p class='muted'>سرویس‌هایی که مشکل دارند "
+#               "بالاترند. «گواهی نامعتبر» یعنی جواب از جایی جز خود سرویس آمد — مثلاً صفحهٔ "
+#               "فیلتر. هر اسمی که خراب شد یک بار دیگر آرام‌تر آزموده می‌شود، و فقط اگر بار دوم "
+#               "هم خراب بود این‌جا می‌آید. گروه‌های «پیش‌فرض خاموش» فقط وقتی آزموده می‌شوند که "
+#               "در قالبی روشن باشند. یک دامنهٔ خراب در سرویسی بزرگ همیشه یعنی خرابی نیست؛ جزئیات هر سرویس را "
+#               "باز کنید.</p></div>"
+#               % ("".join("<th>%s</th>" % html.escape(label[s]) for s in sources),
+#                  "".join(r for _, _, r in summary)))
+#    return "".join(out)
+#
+#
 #def watch_card(pre):
 #    """Asking the relays to run smartdns-watch, and what they saw."""
 #    p = CFG["ADMIN_PATH"]
@@ -15560,7 +16186,7 @@ exit 0
 #                        ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
 #                        ("plans", "پلن‌ها"), ("pay", "پرداخت"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
 #                        ("bot", "ربات"), ("api", "API"), ("settings", "تنظیمات"),
-#                        ("logs", "لاگ")):
+#                        ("logs", "لاگ"), ("diagnose", "عیب‌یابی")):
 #        cls = " class='on'" if active == path else ""
 #        nav += "<a href='/%s/%s'%s>%s</a>" % (cfg["ADMIN_PATH"], path, cls, label)
 #    banner = ""
@@ -16443,6 +17069,7 @@ exit 0
 #                 "settings": ("تنظیمات", self.settings),
 #                 "restore": ("بازگردانی", self.restore_page),
 #                 "logs": ("لاگ", self.logs),
+#                 "diagnose": ("عیب‌یابی", diagnose_page),
 #                 "usage": ("مصرف کاربر", self.user_usage_page)}
 #        if rest not in pages:
 #            return self.lost()
@@ -17736,6 +18363,14 @@ exit 0
 #                return self.redirect("tickets?m=!این تیکت پیدا نشد")
 #            return self.redirect("tickets?t=%d&m=%s" % (
 #                tid, "تیکت بسته شد" if to == "closed" else "تیکت دوباره باز شد"))
+#
+#        if rest == "diagnose-start":
+#            if DIAG["running"]:
+#                return self.redirect("diagnose?m=!تست قبلی هنوز تمام نشده")
+#            DIAG["running"] = True
+#            threading.Thread(target=run_diagnosis, daemon=True).start()
+#            return self.redirect("diagnose?m=تست شروع شد؛ از سرور خارج چند دقیقه، و از رله‌ها "
+#                                 "بعد از همگام‌سازی بعدی")
 #
 #        if rest == "watch-start":
 #            target = one("target").strip()
@@ -20436,7 +21071,8 @@ exit 0
 
 #__BEGIN_SMARTDNS_API_GUARD__
 ##!/bin/bash
-## smartdns-api-guard - let only the relays reach this exit's sync API (8443).
+## smartdns-api-guard - let only the relays reach this exit's sync API (8443),
+## and keep nginx from proxying to this machine or to private addresses.
 ##
 ## usage: smartdns-api-guard           load the rule
 ##        smartdns-api-guard --print   show the rule, and load nothing
@@ -20446,10 +21082,27 @@ exit 0
 ## holding connections open can wear the API down. Dropped here, they never get
 ## a connection at all.
 ##
+## nginx here proxies each connection to wherever the name it carries resolves.
+## Some names resolve to loopback in public DNS - discordapp.io, in the Discord
+## service, is 127.0.0.1 - and then nginx connects to itself, is handed the
+## same name, connects again: one connection became 15000 and the exit was
+## killed for memory (found on the test exit, 2026-09-25). A name resolving to
+## a private address is worse in another way: 169.254.169.254 is the cloud's
+## metadata service, which holds this machine's credentials. So nginx's own
+## connections to this machine, or to a private range, on the ports it proxies
+## are refused. Its real local upstreams - DoH, DoT, the Battle.net helper -
+## are on other ports, and the tunnel reaches nginx rather than the other way.
+##
 ## smartdns-panel.service runs this before every start, so the list is always
 ## the RELAY_IP the panel itself reads: a relay added there by hand is let in
 ## the next time the panel restarts, as it would be by the panel.
 #set -u
+#
+## nginx's workers: nobody, as this installer's nginx.conf leaves them, or
+## www-data, as Debian's own would.
+#NGINX_UIDS="33, 65534"
+#PROXIED="80, 443, 1119, 4070"
+#PRIVATE="0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16"
 #
 ## Variables only so a test can point them somewhere else; nothing else sets them.
 #ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
@@ -20481,6 +21134,11 @@ exit 0
 #        tcp dport $port ip saddr { $list } accept
 #        tcp dport $port drop
 #    }
+#    chain nginx_out {
+#        type filter hook output priority 0 ; policy accept ;
+#        meta skuid { $NGINX_UIDS } tcp dport { $PROXIED } fib daddr type local reject with tcp reset
+#        meta skuid { $NGINX_UIDS } tcp dport { $PROXIED } ip daddr { $PRIVATE } reject with tcp reset
+#    }
 #}"
 #
 #case "${1:-}" in
@@ -20496,7 +21154,7 @@ exit 0
 #    exit 0
 #fi
 #if printf '%s\n' "$rules" | "$NFT" -f -; then
-#    echo "port $port answers: $list"
+#    echo "port $port answers: $list; nginx may not proxy to this machine or a private address"
 #else
 #    echo "nft refused the rule - the sync API stays open, and the panel refuses strangers itself" >&2
 #fi
@@ -22034,7 +22692,6 @@ exit 0
 #discord.gift
 #discord.new
 #discordapp.com
-#discordapp.io
 #discordapp.net
 #discordcdn.com
 #discordstatus.com
@@ -24201,7 +24858,6 @@ exit 0
 #            "discord.gift",
 #            "discord.new",
 #            "discordapp.com",
-#            "discordapp.io",
 #            "discordapp.net",
 #            "discordcdn.com",
 #            "discordstatus.com"
@@ -24588,6 +25244,7 @@ exit 0
 #          "note": "روشن کردنش بازی‌های EA را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند",
 #          "domains": [
 #            "gosredirector.ea.com",
+#            "blazeredirector.ea.com",
 #            "blaze.ea.com",
 #            "gameservices.ea.com",
 #            "tnt-ea.com"
