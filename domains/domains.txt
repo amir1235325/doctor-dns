@@ -231,7 +231,6 @@ easyanticheat.net
 edge.blizzard.com
 edgesuite.net
 edx.org
-efootball.com
 elastic.co
 elderscrollsonline.com
 electronicarts.com
@@ -401,7 +400,6 @@ kaggle.net
 kaggleusercontent.com
 khanacademy.org
 kick.com
-kickstream.com
 kineticgames.co.uk
 konami.com
 konami.net

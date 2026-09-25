@@ -334,7 +334,7 @@ check("an expired certificate is a warning, and said to be the service's own",
 check("a name the exit found pointing at itself is said so on the relay's side too",
       page.count("به آدرسی داخلی اشاره می‌کند") == 2, page.count("به آدرسی داخلی اشاره می‌کند"))
 check("and what went wrong, in words", "گواهی نامعتبر" in page
-      and "فقط پسوند است" in page)
+      and "این اسم خودش سایتی ندارد" in page)
 asrc = read("templates/smartdns-admin")
 check("on its own page in the menu, run in a thread of its own",
       '("diagnose", "عیب‌یابی")' in asrc and "threading.Thread(target=run_diagnosis, daemon=True)" in asrc)

@@ -1020,7 +1020,6 @@
           "key": "konami",
           "label": "Konami — eFootball",
           "domains": [
-            "efootball.com",
             "konami.com",
             "konami.net"
           ]
@@ -1179,8 +1178,7 @@
           "key": "main",
           "label": "همه",
           "domains": [
-            "kick.com",
-            "kickstream.com"
+            "kick.com"
           ]
         }
       ]

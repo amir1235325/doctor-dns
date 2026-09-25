@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.3"
+VERSION="0.8.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -15732,11 +15732,12 @@ exit 0
 ## customer does.
 #DIAG = {"running": False}
 #DIAG_PER_GROUP = 10
-## What to try for a catalogue domain that is only a suffix: a real host under
-## it that is always there, checked to answer; or None where there is none to
-## name - the hosts behind it change by the minute (Netflix's video, a CDN's
-## customers) or the bare name is a placeholder. A suffix with no address at
-## all, bare or www., is told the same way without being listed here.
+## What to try for a catalogue domain that is not itself a site: a real host
+## under it that is always there, checked to answer; or None where there is
+## none to name - the hosts behind it change by the minute (Netflix's video, a
+## CDN's customers), or the name only sends browsers to another site. A domain
+## with no address at all, bare or www., is told the same way without being
+## listed here.
 #PROBE_HOSTS = {
 #    "jtvnw.net": "static-cdn.jtvnw.net", "ttvnw.net": "usher.ttvnw.net",
 #    "gvt1.com": "redirector.gvt1.com", "gvt2.com": "beacons.gvt2.com",
@@ -15746,6 +15747,8 @@ exit 0
 #    "playstation.net": "apollo2.dl.playstation.net",
 #    "nflxvideo.net": None, "gcloudcs.com": None, "en25.com": None, "supercell.net": None,
 #    "battlenet.com": None,
+#    # Only a redirect, on 80, to the game's real site elsewhere.
+#    "haydaygame.com": None, "helldivers2.com": None, "squadbusters.game": None,
 #}
 #PROBE_WORDS = {"no address": "آدرسی ندارد", "timeout": "جواب نداد", "refused": "اتصال رد شد",
 #               "unreachable": "مسیری نیست", "reset": "اتصال قطع شد",
@@ -15891,7 +15894,7 @@ exit 0
 #            ok = sum(1 for _, h in tested if (rows[src].get(h) or ["fail"])[0] == "ok")
 #            n = len(tested)
 #            if not n:
-#                chips.append("<td class='muted'>فقط پسوند</td>")
+#                chips.append("<td class='muted'>سایتی ندارد</td>")
 #            elif ok == n:
 #                chips.append("<td><span class='ok'>✓ همه (%d)</span></td>" % n)
 #            elif ok == 0:
@@ -15905,9 +15908,10 @@ exit 0
 #                                              for s in sources))]
 #        for d, h in doms:
 #            if not h:
-#                detail.append("<tr><td><code>%s</code></td><td class='muted' colspan='%d'>فقط "
-#                              "پسوند است؛ سرورهای واقعی‌اش زیردامنه‌ها هستند و از این‌جا آزموده "
-#                              "نمی‌شود</td></tr>" % (html.escape(d), len(sources)))
+#                detail.append("<tr><td><code>%s</code></td><td class='muted' colspan='%d'>این "
+#                              "اسم خودش سایتی ندارد — فقط پسوند زیردامنه‌هاست، یا فقط به سایت "
+#                              "دیگری هدایت می‌کند — و آزموده نشد؛ خود سرویس از دامنه‌های دیگرش "
+#                              "کار می‌کند</td></tr>" % (html.escape(d), len(sources)))
 #                continue
 #            shown = h if h == d else "%s ← %s" % (d, h)
 #            detail.append("<tr><td><code>%s</code></td>%s</tr>" % (
@@ -22733,7 +22737,6 @@ exit 0
 #edge.blizzard.com
 #edgesuite.net
 #edx.org
-#efootball.com
 #elastic.co
 #elderscrollsonline.com
 #electronicarts.com
@@ -22903,7 +22906,6 @@ exit 0
 #kaggleusercontent.com
 #khanacademy.org
 #kick.com
-#kickstream.com
 #kineticgames.co.uk
 #konami.com
 #konami.net
@@ -24296,7 +24298,6 @@ exit 0
 #          "key": "konami",
 #          "label": "Konami — eFootball",
 #          "domains": [
-#            "efootball.com",
 #            "konami.com",
 #            "konami.net"
 #          ]
@@ -24455,8 +24456,7 @@ exit 0
 #          "key": "main",
 #          "label": "همه",
 #          "domains": [
-#            "kick.com",
-#            "kickstream.com"
+#            "kick.com"
 #          ]
 #        }
 #      ]
