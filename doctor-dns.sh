@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.5"
+VERSION="0.8.6"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -2376,6 +2376,13 @@ exit 0
 ##      gameservices.ea.com    TCP 10010, 11000    QoS coordinator, match stats
 ##      tnt-ea.com             TCP 8095            realtime messaging
 ##
+##    Call of Duty's network layer is the same kind of thing: Demonware, whose
+##    lobby (lsg.*) and STUN (genesis.stun.*) are not on 443. Routed, MW III
+##    and Warzone stop at "Networking failed to start" (HUENEME - NEGEV);
+##    resolved directly they come up (reported from a PS5 in Tehran, 0.8.5).
+##
+##      demonware.net          lsg, genesis.stun, loginservice, user-consent
+##
 ## 2. The service is reachable from Iran anyway, and routing it costs something.
 ##    ps5.np.playstation.net is the console's STUN server as well as a PSN API
 ##    host, and it answers fine from an Iranian address - routing it sent NAT
@@ -2424,6 +2431,7 @@ exit 0
 #server=/blaze.ea.com/#
 #server=/gameservices.ea.com/#
 #server=/tnt-ea.com/#
+#server=/demonware.net/#
 #server=/np.playstation.net/#
 #server=/np.dl.playstation.net/#
 #server=/ol.epicgames.com/#
@@ -3039,16 +3047,27 @@ exit 0
 #    # (e.g. EA's gosredirector uses TCP 42130/42230, hijacking it kills FC 25)
 #    need_root; shift
 #    [ $# -gt 0 ] || { echo "usage: smartdns bypass <domain> [domain ...]"; exit 1; }
+#    changed=""
 #    for d in "$@"; do
 #      d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
 #      if grep -q "^server=/$d/" "$BYPASS"; then
 #        echo "already bypassed: $d"
+#      elif grep -qxF "address=/$d/$IP" "$CONF"; then
+#        # dnsmasq lets an address= win over a server= for the same name, so a
+#        # bypass only ever works on a name *under* a routed one.
+#        echo "not bypassed: $d is routed itself, and its own rule wins over a bypass."
+#        echo "  take it out of the routed list instead - the admin panel's templates,"
+#        echo "  or for a moment:  smartdns del $d   (the panel puts it back on its next sync)"
 #      else
 #        # "#": the usual resolvers, whichever the admin panel picked.
 #        printf 'server=/%s/#\n' "$d" >> "$BYPASS"
 #        echo "bypassed (resolves to its real IP now): $d"
+#        changed=1
 #      fi
 #    done
+#    # Restarting dnsmasq is a moment without DNS for every customer: only
+#    # when there is something new for it to read.
+#    [ -n "$changed" ] || exit 0
 #    dnsmasq --test -C /etc/dnsmasq.conf && systemctl restart dnsmasq && echo "dnsmasq reloaded"
 #    ;;
 #  unbypass)
@@ -22680,7 +22699,6 @@ exit 0
 #deepseek.com
 #dell.com
 #demandbase.com
-#demonware.net
 #deno.land
 #design.google.com
 #developer.chrome.com
@@ -23216,7 +23234,6 @@ exit 0
 #underlords.com
 #unity.com
 #unity3d.com
-#uno.demonware.net
 #unrealengine.com
 #unrealengine.dev
 #unsplash.com
@@ -23509,7 +23526,6 @@ exit 0
 #            "callofduty.com",
 #            "callofdutywarzone.com",
 #            "codwarzone.com",
-#            "demonware.net",
 #            "diablo.com",
 #            "diablo4.com",
 #            "hearthstone.com",
@@ -23519,7 +23535,6 @@ exit 0
 #            "ravensoftware.com",
 #            "sledgehammergames.com",
 #            "treyarch.com",
-#            "uno.demonware.net",
 #            "worldofwarcraft.com"
 #          ]
 #        },
@@ -25253,6 +25268,16 @@ exit 0
 #            "blaze.ea.com",
 #            "gameservices.ea.com",
 #            "tnt-ea.com"
+#          ]
+#        },
+#        {
+#          "key": "demonware",
+#          "label": "Call of Duty — Demonware",
+#          "opt_in": true,
+#          "locked": true,
+#          "note": "روشن کردنش کالاف و وارزون را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند",
+#          "domains": [
+#            "demonware.net"
 #          ]
 #        },
 #        {

@@ -169,7 +169,6 @@ deepmind.google
 deepseek.com
 dell.com
 demandbase.com
-demonware.net
 deno.land
 design.google.com
 developer.chrome.com
@@ -705,7 +704,6 @@ umamusume.jp
 underlords.com
 unity.com
 unity3d.com
-uno.demonware.net
 unrealengine.com
 unrealengine.dev
 unsplash.com

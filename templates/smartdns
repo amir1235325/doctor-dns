@@ -43,16 +43,27 @@ case "${1:-}" in
     # (e.g. EA's gosredirector uses TCP 42130/42230, hijacking it kills FC 25)
     need_root; shift
     [ $# -gt 0 ] || { echo "usage: smartdns bypass <domain> [domain ...]"; exit 1; }
+    changed=""
     for d in "$@"; do
       d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
       if grep -q "^server=/$d/" "$BYPASS"; then
         echo "already bypassed: $d"
+      elif grep -qxF "address=/$d/$IP" "$CONF"; then
+        # dnsmasq lets an address= win over a server= for the same name, so a
+        # bypass only ever works on a name *under* a routed one.
+        echo "not bypassed: $d is routed itself, and its own rule wins over a bypass."
+        echo "  take it out of the routed list instead - the admin panel's templates,"
+        echo "  or for a moment:  smartdns del $d   (the panel puts it back on its next sync)"
       else
         # "#": the usual resolvers, whichever the admin panel picked.
         printf 'server=/%s/#\n' "$d" >> "$BYPASS"
         echo "bypassed (resolves to its real IP now): $d"
+        changed=1
       fi
     done
+    # Restarting dnsmasq is a moment without DNS for every customer: only
+    # when there is something new for it to read.
+    [ -n "$changed" ] || exit 0
     dnsmasq --test -C /etc/dnsmasq.conf && systemctl restart dnsmasq && echo "dnsmasq reloaded"
     ;;
   unbypass)

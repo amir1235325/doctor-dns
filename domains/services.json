@@ -226,7 +226,6 @@
             "callofduty.com",
             "callofdutywarzone.com",
             "codwarzone.com",
-            "demonware.net",
             "diablo.com",
             "diablo4.com",
             "hearthstone.com",
@@ -236,7 +235,6 @@
             "ravensoftware.com",
             "sledgehammergames.com",
             "treyarch.com",
-            "uno.demonware.net",
             "worldofwarcraft.com"
           ]
         },
@@ -1970,6 +1968,16 @@
             "blaze.ea.com",
             "gameservices.ea.com",
             "tnt-ea.com"
+          ]
+        },
+        {
+          "key": "demonware",
+          "label": "Call of Duty — Demonware",
+          "opt_in": true,
+          "locked": true,
+          "note": "روشن کردنش کالاف و وارزون را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند",
+          "domains": [
+            "demonware.net"
           ]
         },
         {
