@@ -8608,9 +8608,9 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    " enctype='multipart/form-data'>"
                    "<input type='hidden' name='id' value='%d'>"
                    "<div class='f'><label>جواب</label>"
-                   "<textarea name='body' rows='4' required maxlength='2000'"
+                   "<textarea name='body' rows='4' maxlength='2000'"
                    " style='width:100%%'></textarea></div>"
-                   "<div class='f'><label>عکس (اختیاری)</label>"
+                   "<div class='f'><label>عکس (اختیاری؛ با عکس، نوشتن لازم نیست)</label>"
                    "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
                    "</div><button>فرستادن جواب</button></form>" % (p, t["id"]))
         to = "open" if t["status"] == "closed" else "closed"
@@ -9787,8 +9787,6 @@ class Admin(http.server.BaseHTTPRequestHandler):
             if not owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
                         " WHERE t.id = ?", tid):
                 return self.redirect("tickets?m=!این تیکت پیدا نشد")
-            if not text:
-                return self.redirect("tickets?t=%d&m=!متن جواب را بنویسید" % tid)
             blob = kind = None
             if raw is not None:
                 try:
@@ -9801,17 +9799,22 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 kind = image_kind(blob)
                 if not kind:
                     return self.redirect("tickets?t=%d&m=!فقط عکس JPG، PNG یا WEBP" % tid)
+            # A picture alone is an answer too.
+            if not text and not blob:
+                return self.redirect("tickets?t=%d&m=!متن جواب را بنویسید یا عکس بفرستید" % tid)
             stamp = now()
-            STORE.run("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
-                      " image_blob, image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-                      (tid, text, seal(blob) if blob else blob, kind, stamp))
+            mid = STORE.run("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+                            " image_blob, image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+                            (tid, text, seal(blob) if blob else blob, kind, stamp)).lastrowid
             STORE.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
                       (stamp, tid))
             ticket = STORE.one("SELECT user_id, subject FROM tickets WHERE id = ?", (tid,))
             emit("ticket.answered", ticket["user_id"], {
                 "ticket_id": tid, "subject": ticket["subject"], "body": text,
-                "has_image": bool(blob),
-                "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+                "has_image": bool(blob), "message_id": mid,
+                "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (
+                    ticket["subject"],
+                    (text + ("\n🖼 با عکس" if blob else "")) if text else "🖼 عکس")})
             return self.redirect("tickets?t=%d&m=جواب فرستاده شد" % tid)
 
         if rest == "ticket-status":

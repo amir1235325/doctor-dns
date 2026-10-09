@@ -467,7 +467,8 @@ you can no longer reach.
 - **Free trial**: a plan ticked as one, taken with one tap and no slip - with
   a linked Telegram account, once per Telegram account and once per account.
 - **Tickets**: from the customer's page, the bot, and the admin panel's
-  Tickets page, with pictures.
+  Tickets page, with pictures - a screenshot of the error alone will do, and
+  the bot shows the picture itself to the operator and to the customer.
 - **Telegram bot** (admin panel → Bot): get a token from @BotFather, press
   Start in the new bot, give the token and your numeric Telegram id, and press
   set up. The bot runs on this exit. Its customers get a web sign-in too and

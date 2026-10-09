@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.5"
+VERSION="0.10.6"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -8694,6 +8694,15 @@ exit 0
 #    return blob, kind
 #
 #
+## A message may be a picture alone - a screenshot of the error says it all.
+#TICKET_EMPTY = "متن پیام را بنویسید یا عکس بفرستید"
+#
+#
+#def ticket_said(text, blob):
+#    """A message in words, for a notice: its text, and a word for its picture."""
+#    return (text + ("\n🖼 با عکس" if blob else "")) if text else "🖼 عکس"
+#
+#
 #def ticket_text(body, field, limit):
 #    text = unicodedata.normalize("NFC", str(body.get(field) or ""))
 #    # Keep line breaks, drop other control characters a client might send.
@@ -8714,11 +8723,11 @@ exit 0
 #    text = ticket_text(body, "body", TICKET_BODY_MAX)
 #    if not subject:
 #        return refused("subject_required", "موضوع تیکت را بنویسید")
-#    if not text:
-#        return refused("body_required", "متن پیام را بنویسید")
 #    blob, kind = ticket_image(body)
 #    if isinstance(blob, dict):
 #        return blob
+#    if not text and not blob:
+#        return refused("body_required", TICKET_EMPTY)
 #    waiting = store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
 #                        " AND status != 'closed'", (user["id"],))["c"]
 #    if waiting >= TICKET_OPEN_MAX:
@@ -8733,14 +8742,16 @@ exit 0
 #                               " created_at, updated_at) VALUES (?, ?, 'open', ?, ?)",
 #                               (user["id"], subject, stamp, stamp))
 #        tid = cur.lastrowid
-#        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
-#                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-#                         (tid, text, seal(blob), kind, stamp))
+#        mid = store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+#                               " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+#                               (tid, text, seal(blob), kind, stamp)).lastrowid
 #        store.db.commit()
 #    print("ticket #%d opened by user %d" % (tid, user["id"]), flush=True)
 #    emit_admin(store, "ticket.opened", {
 #        "ticket_id": tid, "user_id": user["id"], "subject": subject, "body": text,
-#        "text": "تیکت تازه از %s: «%s»\n\n%s" % (who_label(user), subject, text)})
+#        "message_id": mid, "has_image": bool(blob),
+#        "text": "تیکت تازه از %s: «%s»\n\n%s" % (who_label(user), subject,
+#                                                 ticket_said(text, blob))})
 #    return {"ok": True, "ticket_id": tid,
 #            "message": "تیکت ثبت شد؛ جواب همین‌جا می‌آید"}
 #
@@ -8761,18 +8772,18 @@ exit 0
 #    if not ticket:
 #        return refused("ticket_not_found", "این تیکت پیدا نشد")
 #    text = ticket_text(body, "body", TICKET_BODY_MAX)
-#    if not text:
-#        return refused("body_required", "متن پیام را بنویسید")
 #    blob, kind = ticket_image(body)
 #    if isinstance(blob, dict):
 #        return blob
+#    if not text and not blob:
+#        return refused("body_required", TICKET_EMPTY)
 #    if not ticket_rate_ok(user):
 #        return refused("slow_down", "پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید")
 #    stamp = now()
 #    with store.lock:
-#        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
-#                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-#                         (ticket["id"], text, seal(blob), kind, stamp))
+#        mid = store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+#                               " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+#                               (ticket["id"], text, seal(blob), kind, stamp)).lastrowid
 #        # Whatever it was, it is the operator's turn now - a closed ticket
 #        # written into is open again.
 #        store.db.execute("UPDATE tickets SET status = 'open', updated_at = ?"
@@ -8780,9 +8791,9 @@ exit 0
 #        store.db.commit()
 #    emit_admin(store, "ticket.message", {
 #        "ticket_id": ticket["id"], "user_id": user["id"], "subject": ticket["subject"],
-#        "body": text,
+#        "body": text, "message_id": mid, "has_image": bool(blob),
 #        "text": "پیام تازه از %s در تیکت «%s»:\n\n%s"
-#                % (who_label(user), ticket["subject"], text)})
+#                % (who_label(user), ticket["subject"], ticket_said(text, blob))})
 #    return {"ok": True, "ticket_id": ticket["id"], "message": "پیام فرستاده شد"}
 #
 #
@@ -9395,22 +9406,23 @@ exit 0
 #    if not ticket:
 #        return refused("ticket_not_found", "این تیکت پیدا نشد")
 #    text = ticket_text(body, "body", TICKET_BODY_MAX)
-#    if not text:
-#        return refused("body_required", "متن جواب را بنویسید")
 #    blob, kind = ticket_image(body)
 #    if isinstance(blob, dict):
 #        return blob
+#    if not text and not blob:
+#        return refused("body_required", "متن جواب را بنویسید یا عکس بفرستید")
 #    stamp = now()
-#    store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
-#              " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-#              (tid, text, seal(blob), kind, stamp))
+#    mid = store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
+#                    " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+#                    (tid, text, seal(blob), kind, stamp)).lastrowid
 #    store.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
 #              (stamp, tid))
 #    user = store.one("SELECT * FROM users WHERE id = ?", (ticket["user_id"],))
 #    emit(store, user, "ticket.answered", {
 #        "ticket_id": tid, "subject": ticket["subject"], "body": text,
-#        "has_image": bool(blob),
-#        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+#        "has_image": bool(blob), "message_id": mid,
+#        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s"
+#                % (ticket["subject"], ticket_said(text, blob))})
 #    return {"ok": True, "message": "جواب فرستاده شد"}
 #
 #
@@ -11770,6 +11782,23 @@ exit 0
 #                                 "telegram_id": owner["telegram_id"]}
 #        return 200, res
 #
+#    def api_admin_ticket_image(self, body, tid, mid):
+#        """A ticket message's picture, for the operator - or a seller, of
+#        their own customers' tickets only - as the receipt's is."""
+#        extra, more = self.mine()
+#        row = self.store.one("SELECT m.image_blob, m.image_type FROM ticket_messages m"
+#                             " JOIN tickets t ON t.id = m.ticket_id"
+#                             " JOIN users u ON u.id = t.user_id"
+#                             " WHERE m.id = ? AND t.id = ?" + extra,
+#                             (int(mid), int(tid)) + more)
+#        if not row or row["image_blob"] is None:
+#            return 404, refused("image_not_found", "این عکس پیدا نشد")
+#        image = unseal(row["image_blob"])
+#        if image is None:
+#            return 409, refused("image_sealed", "این عکس روی این سرور باز نمی‌شود")
+#        return 200, {"ok": True, "content_type": row["image_type"],
+#                     "data": base64.b64encode(image).decode("ascii")}
+#
 #    def api_admin_reply(self, body, tid):
 #        if not self.owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
 #                         " WHERE t.id = ?", int(tid)):
@@ -11853,6 +11882,8 @@ exit 0
 #        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/wallet$"), "admin_wallet"),
 #        ("GET", re.compile(r"/api/v1/admin/tickets$"), "admin_tickets"),
 #        ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})$"), "admin_ticket"),
+#        ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/messages/(\d{1,12})/image$"),
+#         "admin_ticket_image"),
 #        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/reply$"), "admin_reply"),
 #        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/close$"), "admin_close"),
 #    ]
@@ -18901,9 +18932,9 @@ exit 0
 #            "<div class='dns'><div class='k'>تیکت تازه</div>"
 #            "<form method='post' action='/ticket-new' enctype='multipart/form-data'>"
 #            "<label>موضوع</label><input name='subject' required maxlength='80'>"
-#            "<label>پیام</label><textarea name='body' rows='5' required maxlength='2000'>"
+#            "<label>پیام</label><textarea name='body' rows='5' maxlength='2000'>"
 #            "</textarea>"
-#            "<label>عکس (اختیاری، مثلاً اسکرین‌شات خطا)</label>"
+#            "<label>عکس (مثلاً اسکرین‌شات خطا) — با عکس، نوشتن پیام لازم نیست</label>"
 #            "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
 #            "<button>فرستادن تیکت</button></form></div>")
 #        body.append("<p class='alt'><a href='/'>برگشت به حساب</a></p>")
@@ -18934,8 +18965,8 @@ exit 0
 #        body.append(
 #            "<form method='post' action='/ticket-reply' enctype='multipart/form-data'>"
 #            "<input type='hidden' name='id' value='%d'>"
-#            "<label>%s</label><textarea name='body' rows='4' required maxlength='2000'>"
-#            "</textarea><label>عکس (اختیاری)</label>"
+#            "<label>%s</label><textarea name='body' rows='4' maxlength='2000'>"
+#            "</textarea><label>عکس (اختیاری؛ با عکس، نوشتن لازم نیست)</label>"
 #            "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
 #            "<button>فرستادن</button></form>"
 #            % (t["id"], "پیام تازه — تیکت دوباره باز می‌شود"
@@ -28952,9 +28983,9 @@ exit 0
 #                   " enctype='multipart/form-data'>"
 #                   "<input type='hidden' name='id' value='%d'>"
 #                   "<div class='f'><label>جواب</label>"
-#                   "<textarea name='body' rows='4' required maxlength='2000'"
+#                   "<textarea name='body' rows='4' maxlength='2000'"
 #                   " style='width:100%%'></textarea></div>"
-#                   "<div class='f'><label>عکس (اختیاری)</label>"
+#                   "<div class='f'><label>عکس (اختیاری؛ با عکس، نوشتن لازم نیست)</label>"
 #                   "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
 #                   "</div><button>فرستادن جواب</button></form>" % (p, t["id"]))
 #        to = "open" if t["status"] == "closed" else "closed"
@@ -30131,8 +30162,6 @@ exit 0
 #            if not owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
 #                        " WHERE t.id = ?", tid):
 #                return self.redirect("tickets?m=!این تیکت پیدا نشد")
-#            if not text:
-#                return self.redirect("tickets?t=%d&m=!متن جواب را بنویسید" % tid)
 #            blob = kind = None
 #            if raw is not None:
 #                try:
@@ -30145,17 +30174,22 @@ exit 0
 #                kind = image_kind(blob)
 #                if not kind:
 #                    return self.redirect("tickets?t=%d&m=!فقط عکس JPG، PNG یا WEBP" % tid)
+#            # A picture alone is an answer too.
+#            if not text and not blob:
+#                return self.redirect("tickets?t=%d&m=!متن جواب را بنویسید یا عکس بفرستید" % tid)
 #            stamp = now()
-#            STORE.run("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
-#                      " image_blob, image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-#                      (tid, text, seal(blob) if blob else blob, kind, stamp))
+#            mid = STORE.run("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+#                            " image_blob, image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+#                            (tid, text, seal(blob) if blob else blob, kind, stamp)).lastrowid
 #            STORE.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
 #                      (stamp, tid))
 #            ticket = STORE.one("SELECT user_id, subject FROM tickets WHERE id = ?", (tid,))
 #            emit("ticket.answered", ticket["user_id"], {
 #                "ticket_id": tid, "subject": ticket["subject"], "body": text,
-#                "has_image": bool(blob),
-#                "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+#                "has_image": bool(blob), "message_id": mid,
+#                "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (
+#                    ticket["subject"],
+#                    (text + ("\n🖼 با عکس" if blob else "")) if text else "🖼 عکس")})
 #            return self.redirect("tickets?t=%d&m=جواب فرستاده شد" % tid)
 #
 #        if rest == "ticket-status":
@@ -34689,6 +34723,8 @@ exit 0
 #          "over_quota": "حجم تمام شده ⛔", "expired": "دوره تمام شده ⛔",
 #          "suspended": "مسدود ⛔"}
 #MAX_FILE = 4 * 1024 * 1024
+## What a ticket's picture may be - the panel's TICKET_IMAGE_TYPES.
+#TICKET_IMAGES = ("image/jpeg", "image/png", "image/webp")
 ## Telegram's longest caption under a photo or video.
 #CAPTION_MAX = 1024
 ## How long "is in the channel" is believed before Telegram is asked again.
@@ -35281,8 +35317,8 @@ exit 0
 #            return self.got_receipt(chat, sender, msg, None, device=True)
 #        if waiting == "ticket_subject" and text:
 #            self.state[chat] = ("ticket_body", text[:80])
-#            return self.say(chat, "متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):",
-#                            CANCEL)
+#            return self.say(chat, "متن پیامتان را بنویسید، یا عکس خطا را بفرستید "
+#                                  "(عکس می‌تواند توضیح هم داشته باشد):", CANCEL)
 #        if waiting == "ticket_body":
 #            return self.got_ticket(chat, sender, msg, subject=extra)
 #        if waiting == "ticket_reply":
@@ -35870,16 +35906,35 @@ exit 0
 #            buttons.append({"text": "✔️ بستن", "callback_data": "tkc:%d" % tid})
 #        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
 #
+#    def ticket_picture(self, msg):
+#        """A ticket message's picture: as a photo, or as a file when it is an
+#        image - a screenshot sent uncompressed. ({image_type, image_data} or
+#        {}, and why not, when there was one that cannot be taken)."""
+#        doc = msg.get("document") or {}
+#        if msg.get("photo"):
+#            file_id = msg["photo"][-1]["file_id"]
+#        elif (doc.get("mime_type") or "").startswith("image/"):
+#            file_id = doc["file_id"]
+#        else:
+#            return {}, ""
+#        try:
+#            blob = self.tg.download(file_id)
+#        except ValueError as e:
+#            return {}, str(e)
+#        kind = image_type(blob)
+#        if kind not in TICKET_IMAGES:
+#            return {}, "فقط عکس JPG، PNG یا WEBP"
+#        return {"image_type": kind, "image_data": base64.b64encode(blob).decode()}, ""
+#
 #    def got_ticket(self, chat, sender, msg, subject=None, ticket=None):
 #        body = (msg.get("text") or msg.get("caption") or "").strip()
-#        if not body:
-#            return self.say(chat, "متن پیام را بنویسید (یا «انصراف»).", CANCEL)
-#        payload = {"body": body}
-#        if msg.get("photo"):
-#            blob = self.tg.download(msg["photo"][-1]["file_id"])
-#            if image_type(blob) in ("image/jpeg", "image/png", "image/webp"):
-#                payload.update(image_type=image_type(blob),
-#                               image_data=base64.b64encode(blob).decode())
+#        picture, why = self.ticket_picture(msg)
+#        if why:
+#            return self.say(chat, "⚠️ %s — دوباره بفرستید (یا «انصراف»)." % why, CANCEL)
+#        # A screenshot of the error alone is a message too.
+#        if not body and not picture:
+#            return self.say(chat, "متن پیام را بنویسید یا عکس بفرستید (یا «انصراف»).", CANCEL)
+#        payload = dict(picture, body=body)
 #        idem = "ticket-%d-%d" % (sender["id"], msg["message_id"])
 #        if subject is not None:
 #            payload["subject"] = subject
@@ -35999,7 +36054,7 @@ exit 0
 #            return self.say(chat, "موضوع تیکت را در یک خط بنویسید:", CANCEL)
 #        if kind == "tkr":
 #            self.state[chat] = ("ticket_reply", int(arg))
-#            return self.say(chat, "پیامتان را بنویسید:", CANCEL)
+#            return self.say(chat, "پیامتان را بنویسید یا عکس بفرستید:", CANCEL)
 #        if kind == "tkc":
 #            res = self.panel.call("POST", "/users/%d/tickets/%d/close" % (sender["id"], int(arg)))
 #            return self.say(chat, "✔️ " + res["message"], MENU)
@@ -36029,6 +36084,34 @@ exit 0
 #        except ApiError:
 #            self.say(chat, caption, buttons)
 #
+#    def ticket_notice(self, chat, text, markup, data, image_path):
+#        """A ticket's message to the operator or the customer, with its
+#        picture when it has one: the picture with the words under it, or
+#        after it when they are too long for a caption. Words alone if the
+#        picture cannot be had."""
+#        mid = data.get("message_id")
+#        if not data.get("has_image") or not mid:
+#            return self.say(chat, text, markup)
+#        try:
+#            pic = self.panel.call("GET", image_path % int(mid))
+#            blob = base64.b64decode(pic.get("data") or pic.get("image_data") or "")
+#        except Exception as e:
+#            log("ticket #%s: its picture could not be had (%s)" % (data.get("ticket_id"), e))
+#            return self.say(chat, text, markup)
+#        words = self.t(text)
+#        # photo() cuts a caption at 1000, a little under Telegram's own.
+#        if len(words) <= 1000:
+#            try:
+#                return self.tg.photo(chat, blob, words, self.t_markup(markup))
+#            except Exception as e:
+#                log("could not send to %s: %s" % (chat, e))
+#                return self.say(chat, text, markup)
+#        try:
+#            self.tg.photo(chat, blob, "")
+#        except Exception as e:
+#            log("could not send to %s: %s" % (chat, e))
+#        self.say(chat, text, markup)
+#
 #    def admin_button(self, chat, q, kind, num):
 #        if kind in ("ok", "no"):
 #            try:
@@ -36047,21 +36130,19 @@ exit 0
 #            return self.say(chat, "رسید #%d: %s" % (num, done))
 #        if kind == "areply":
 #            self.state[chat] = ("admin_reply", num)
-#            return self.say(chat, "جواب تیکت #%d را بنویسید:" % num, CANCEL)
+#            return self.say(chat, "جواب تیکت #%d را بنویسید یا عکس بفرستید:" % num, CANCEL)
 #        if kind == "aclose":
 #            res = self.panel.call("POST", "/admin/tickets/%d/close" % num)
 #            return self.say(chat, "تیکت #%d: %s" % (num, res["message"]))
 #
 #    def admin_reply(self, chat, msg, tid):
 #        body = (msg.get("text") or msg.get("caption") or "").strip()
-#        if not body:
-#            return self.say(chat, "متن جواب را بنویسید (یا «انصراف»).", CANCEL)
-#        payload = {"body": body}
-#        if msg.get("photo"):
-#            blob = self.tg.download(msg["photo"][-1]["file_id"])
-#            if image_type(blob) in ("image/jpeg", "image/png", "image/webp"):
-#                payload.update(image_type=image_type(blob),
-#                               image_data=base64.b64encode(blob).decode())
+#        picture, why = self.ticket_picture(msg)
+#        if why:
+#            return self.say(chat, "⚠️ %s — دوباره بفرستید (یا «انصراف»)." % why, CANCEL)
+#        if not body and not picture:
+#            return self.say(chat, "متن جواب را بنویسید یا عکس بفرستید (یا «انصراف»).", CANCEL)
+#        payload = dict(picture, body=body)
 #        self.panel.call("POST", "/admin/tickets/%d/reply" % tid, payload,
 #                        idem="areply-%d-%d" % (chat, msg["message_id"]))
 #        self.state.pop(chat, None)
@@ -36082,9 +36163,11 @@ exit 0
 #                                      text if text.startswith("🧾") else "🧾 " + text)
 #                elif kind in ("ticket.opened", "ticket.message"):
 #                    tid = data["ticket_id"]
-#                    self.say(admin, "🎫 #%d %s" % (tid, text), {"inline_keyboard": [[
+#                    buttons = {"inline_keyboard": [[
 #                        {"text": "✍️ جواب", "callback_data": "areply:%d" % tid},
-#                        {"text": "✔️ بستن", "callback_data": "aclose:%d" % tid}]]})
+#                        {"text": "✔️ بستن", "callback_data": "aclose:%d" % tid}]]}
+#                    self.ticket_notice(admin, "🎫 #%d %s" % (tid, text), buttons, data,
+#                                       "/admin/tickets/%d/messages/%%d/image" % tid)
 #                elif text:
 #                    self.say(admin, text)
 #            return
@@ -36101,6 +36184,9 @@ exit 0
 #        if kind == "ticket.answered":
 #            markup = {"inline_keyboard": [[{"text": "✍️ جواب",
 #                                            "callback_data": "tkr:%d" % data["ticket_id"]}]]}
+#            return self.ticket_notice(chat, text, markup, data,
+#                                      "/users/%d/tickets/%d/messages/%%d/image"
+#                                      % (int(chat), data["ticket_id"]))
 #        elif kind in ("quota.warning", "quota.exhausted", "plan.expiring", "plan.expired"):
 #            markup = {"inline_keyboard": [[{"text": "🛒 تمدید", "callback_data": "plans"}]]}
 #        self.say(chat, text, markup)
@@ -42259,7 +42345,7 @@ exit 0
 #"را از App Store یا Google Play نصب کنید.": "app from the App Store or Google Play.",
 #"را با عدد بنویسید؛ خالی یعنی خاموش": "must be a number; empty means off",
 #"را بزنید؛ وگرنه ربات نمی‌تواند به شما پیام بدهد.": "; otherwise the bot cannot message you.",
-#"را بنویسید:": ":",
+#"را بنویسید یا عکس بفرستید:": "- write it or send a picture:",
 #"را به آی‌پی": "to the IP",
 #"را تونل رلهٔ": "as the tunnel of relay",
 #"را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود سرویس گاهی کار کند و گاهی نه.": "again — another address there makes the service work sometimes and sometimes not.",
@@ -42575,9 +42661,9 @@ exit 0
 #"عضویت اجباری در کانال (اختیاری)": "Channel to join first (optional)",
 #"عوض می‌شود": "changes",
 #"عکس": "Picture",
-#"عکس (اختیاری)": "Picture (optional)",
-#"عکس (اختیاری، مثلاً اسکرین‌شات خطا)": "Picture (optional, e.g. a screenshot of the error)",
+#"عکس (اختیاری؛ با عکس، نوشتن لازم نیست)": "Picture (optional; with a picture, no words are needed)",
 #"عکس (رسید و تیکت) در این فایل با کلید سرور دیگری رمزگذاری شده و این‌جا باز نمی‌شود. اگر از سرور دیگری آورده‌اید، فایل": "Pictures (receipts and tickets) in this file are encrypted with another server’s key and cannot be opened here. If you brought it from another server, the file",
+#"عکس (مثلاً اسکرین‌شات خطا) — با عکس، نوشتن پیام لازم نیست": "Picture (a screenshot of the error, say) - with a picture, no message is needed",
 #"عکس JPG، PNG یا WEBP تا ۱۰ مگابایت، فیلم MP4 تا ۲۰ مگابایت؛ با انتخاب هر فایل، جای فایل بعدی باز می‌شود. تا": "A JPG, PNG or WEBP photo up to 10 MB, an MP4 video up to 20 MB; choosing a file opens a box for the next one. Up to",
 #"عکس این رسید نیست (یا بعد از تصمیم پاک شده)": "This receipt has no picture (or it was deleted after the decision)",
 #"عکس با آن رمزگذاری شده و الان باز نمی‌شود. فایل را از نسخهٔ پشتیبانش برگردانید. تا آن موقع عکس‌های تازه بدون رمز نگه داشته می‌شوند.": "pictures are encrypted with it and cannot be opened now. Put the file back from its backup. Until then new pictures are kept unencrypted.",
@@ -42744,14 +42830,14 @@ exit 0
 #"متا (فیسبوک) Audience Network": "Meta (Facebook) Audience Network",
 #"متفرقه": "Other game tools",
 #"متن": "Text",
-#"متن جواب را بنویسید": "Write the reply text",
-#"متن جواب را بنویسید (یا «انصراف»).": "Write your reply (or “Cancel”).",
+#"متن جواب را بنویسید یا عکس بفرستید": "Write the answer or send a picture",
+#"متن جواب را بنویسید یا عکس بفرستید (یا «انصراف»).": "Write the answer or send a picture (or \"Cancel\").",
 #"متن راهنما (اختیاری، زیر «راهنما» در ربات)": "Help text (optional, under “Help” in the bot)",
 #"متن پیام": "Message text",
-#"متن پیام را بنویسید": "Write the message text",
-#"متن پیام را بنویسید (یا «انصراف»).": "Write your message (or “Cancel”).",
+#"متن پیام را بنویسید یا عکس بفرستید": "Write the message or send a picture",
+#"متن پیام را بنویسید یا عکس بفرستید (یا «انصراف»).": "Write the message or send a picture (or \"Cancel\").",
 #"متن پیام را بنویسید یا عکس یا فیلم بگذارید": "Write a message, or add a photo or video",
-#"متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):": "Write your message (you can also send a photo with a caption):",
+#"متن پیامتان را بنویسید، یا عکس خطا را بفرستید (عکس می‌تواند توضیح هم داشته باشد):": "Write your message, or send a picture of the error (it may have a caption too):",
 #"متن کانفیگ": "The config's text",
 #"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it.",
 #"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند. تبلیغ و ردیاب را هم می‌بندد، و بعضی بازی‌ها و فروشگاه‌ها به همان دامنه‌ها نیاز دارند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it. It also blocks ads and trackers, and some games and stores need those same domains.",
@@ -43196,7 +43282,7 @@ exit 0
 #"پیام تازه — تیکت دوباره باز می‌شود": "New message — the ticket reopens",
 #"پیام فرستاده شد": "Message sent",
 #"پیام فقط به مشتری‌هایی می‌رسد که تلگرامشان به ربات وصل است. ربات پیام‌ها را یکی‌یکی و با فاصله می‌فرستد تا تلگرام محدودش نکند؛ برای همین اگر مشتری زیاد باشد، چند دقیقه طول می‌کشد. عدد کنار هر گزینه، تعداد همین لحظه است.": "The message reaches only customers whose Telegram is linked to the bot. The bot sends them one by one, spaced out, so Telegram does not limit it; with many customers it takes a few minutes. The number beside each choice is the count right now.",
-#"پیامتان را بنویسید:": "Write your message:",
+#"پیامتان را بنویسید یا عکس بفرستید:": "Write your message or send a picture:",
 #"پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید": "You have sent many messages; write again a little later",
 #"پیش از ذخیره از همین سرور آزموده می‌شوند — اگر جواب ندهند، همان قبلی می‌ماند.": "They are tested from this server before saving — if they do not answer, the previous ones stay.",
 #"پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از اعمال، خودش از ایران امتحان می‌کند — اگر جواب ندهد همان قبلی را نگه می‌دارد.": "They are tested from this server before saving, and each relay also tries them from Iran before applying — if they do not answer, it keeps the previous ones.",
@@ -43405,6 +43491,7 @@ exit 0
 #"— خود سرور به آن سرویس می‌رسد یا نه — و": "— whether the server itself reaches that service — and",
 #"— دانلود": "— download",
 #"— دانلود تا": "— download up to",
+#"— دوباره بفرستید (یا «انصراف»).": "- send it again (or \"Cancel\").",
 #"— روز و ساعت به وقت تهران. تفکیک سرویس را فقط خود کاربر می‌بیند.": "— day and hour in Tehran time. Only the user sees the per-service breakdown.",
 #"— سرور خارج": "— exit server",
 #"— سرویس را از شما می‌خرد و به مشتری‌های خودش می‌فروشد. فقط مشتری‌هایی را می‌بیند که خودش آورده؛ پلن و قیمت و شماره کارت هم مال خودش. بدون این تیک، مثل کارمند شماست و همهٔ مشتری‌ها را می‌بیند.": "— buys the service from you and sells it to their own customers. Sees only the customers they brought; the plans, prices and card number are theirs too. Without this tick, they are like your staff and see every customer.",
@@ -43557,6 +43644,8 @@ exit 0
 #"🔗 ورود به پنل وب": "🔗 Sign in to the web panel",
 #"🔞 پورن": "🔞 Porn",
 #"🕒 زمان:": "🕒 Sent:",
+#"🖼 با عکس": "🖼 with a picture",
+#"🖼 عکس": "🖼 picture",
 #"🗂 قالب:": "🗂 Template:",
 #"🗄 بکاپ پنل —": "🗄 Panel backup —",
 #"🗑 حذف": "🗑 Delete",

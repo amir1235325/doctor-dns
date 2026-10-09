@@ -303,7 +303,7 @@ curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
 | `POST /users/{telegram_id}/tickets/{id}/close` | بستن |
 | `GET /users/{telegram_id}/tickets/{id}/messages/{message_id}/image` | عکس یک پیام: `{"image_type", "image_data"}` (base64) |
 
-هر پیام می‌تواند یک عکس داشته باشد: `"image_type": "image/jpeg"` (یا png، webp) و `"image_data"` به base64، حداکثر ۴ مگابایت.
+هر پیام می‌تواند یک عکس داشته باشد: `"image_type": "image/jpeg"` (یا png، webp) و `"image_data"` به base64، حداکثر ۴ مگابایت. پیامی که عکس دارد متن نمی‌خواهد — اسکرین‌شات خطا به‌تنهایی کافی است.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
@@ -343,7 +343,7 @@ curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
 | `receipt.approved` | ادمین رسید را تأیید کرد | `receipt_id`، `plan`، `expires_at`، `quota_bytes` |
 | `receipt.rejected` | ادمین رسید را رد کرد | `receipt_id` |
 | `plan.activated` | ادمین دستی پلن داد (مثلاً پرداخت نقدی) | `plan`، `expires_at`، `quota_bytes` |
-| `ticket.answered` | ادمین به تیکت جواب داد | `ticket_id`، `subject`، `body`، `has_image` |
+| `ticket.answered` | ادمین به تیکت جواب داد | `ticket_id`، `subject`، `body`، `has_image`، `message_id` (عکسش از `GET /users/{telegram_id}/tickets/{id}/messages/{message_id}/image`) |
 | `quota.warning` | ۸۰٪ یا ۹۵٪ حجم مصرف شد | `percent`، `quota_bytes`، `used_bytes`، `remaining_bytes` |
 | `quota.exhausted` | حجم تمام شد و سرویس قطع است | `quota_bytes`، `used_bytes` |
 | `plan.expiring` | ۳ روز یا کمتر به پایان دوره مانده | `expires_at`، `days_left` |
@@ -394,6 +394,7 @@ def from_panel(secret, header, body):      # body: bytes، همان‌طور ک�
 | `POST /admin/users/{id}/wallet` | `{"amount": "50000", "note": "هدیه"}` — اضافه کردن به کیف پول؛ `"-50000"` کم می‌کند. کمتر از صفر نمی‌شود (`409` با `wallet_short`). به مشتری خبر `wallet.changed` می‌رود |
 | `GET /admin/tickets?status=open` | تیکت‌ها؛ `open` (پیش‌فرض)، `answered`، `closed`، `all` |
 | `GET /admin/tickets/{id}` | یک تیکت با پیام‌ها و صاحبش |
+| `GET /admin/tickets/{id}/messages/{message_id}/image` | عکس یک پیام تیکت: `{"content_type", "data"}` (base64) |
 | `POST /admin/tickets/{id}/reply` | جواب: `{"body": "...", "image_type"?, "image_data"?}` |
 | `POST /admin/tickets/{id}/close` | بستن |
 
@@ -413,8 +414,8 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" $API/admin/receipts/31/app
 |---|---|---|
 | `receipt.submitted` | رسید تازه رسید | `receipt_id`، `user_id`، `amount`، `kind` (`card`، `topup` یا `device`)، `plan`؛ `text` همان جزئیات کامل `GET /admin/receipts` است |
 | `wallet.bought` | مشتری پلن را از کیف پول خرید | `user_id`، `amount`، `plan` |
-| `ticket.opened` | تیکت تازه | `ticket_id`، `user_id`، `subject`، `body` |
-| `ticket.message` | مشتری در تیکتی نوشت | `ticket_id`، `user_id`، `subject`، `body` |
+| `ticket.opened` | تیکت تازه | `ticket_id`، `user_id`، `subject`، `body`، `message_id`، `has_image` |
+| `ticket.message` | مشتری در تیکتی نوشت | `ticket_id`، `user_id`، `subject`، `body`، `message_id`، `has_image` — عکسش از `GET /admin/tickets/{id}/messages/{message_id}/image` |
 | `user.created` | مشتری تازه ثبت‌نام کرد | `user_id`، `via` (`web` یا `bot`) |
 | `trial.started` | مشتری تست رایگان گرفت | `user_id`، `plan` |
 | `report.daily` | هر روز ساعت ۹ صبح به وقت ایران | همان عددهای `/admin/stats` |

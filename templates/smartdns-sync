@@ -6102,9 +6102,9 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             "<div class='dns'><div class='k'>تیکت تازه</div>"
             "<form method='post' action='/ticket-new' enctype='multipart/form-data'>"
             "<label>موضوع</label><input name='subject' required maxlength='80'>"
-            "<label>پیام</label><textarea name='body' rows='5' required maxlength='2000'>"
+            "<label>پیام</label><textarea name='body' rows='5' maxlength='2000'>"
             "</textarea>"
-            "<label>عکس (اختیاری، مثلاً اسکرین‌شات خطا)</label>"
+            "<label>عکس (مثلاً اسکرین‌شات خطا) — با عکس، نوشتن پیام لازم نیست</label>"
             "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
             "<button>فرستادن تیکت</button></form></div>")
         body.append("<p class='alt'><a href='/'>برگشت به حساب</a></p>")
@@ -6135,8 +6135,8 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         body.append(
             "<form method='post' action='/ticket-reply' enctype='multipart/form-data'>"
             "<input type='hidden' name='id' value='%d'>"
-            "<label>%s</label><textarea name='body' rows='4' required maxlength='2000'>"
-            "</textarea><label>عکس (اختیاری)</label>"
+            "<label>%s</label><textarea name='body' rows='4' maxlength='2000'>"
+            "</textarea><label>عکس (اختیاری؛ با عکس، نوشتن لازم نیست)</label>"
             "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
             "<button>فرستادن</button></form>"
             % (t["id"], "پیام تازه — تیکت دوباره باز می‌شود"

@@ -323,6 +323,58 @@ check("and closes it", code == 200
       and store.one("SELECT status FROM tickets WHERE id = ?", (bt,))["status"] == "closed")
 code, res = call("GET", "/users/111")
 check("the account says how many replies wait", "tickets_answered" in res["user"])
+
+print("a picture alone is a message")
+store.run("INSERT INTO api_tokens (name, token_hash, scope, webhook_url, created_at)"
+          " VALUES ('a', ?, 'admin', 'https://bot.example/hook', ?)",
+          (panel.token_hash("dd_adminkey"), panel.now()))
+store.run("UPDATE api_tokens SET webhook_url = 'https://bot.example/hook' WHERE name = 'b'")
+panel.THROTTLE.clear("ticket:1")
+code, res = call("POST", "/users/111/tickets", {"subject": "خطا", "body": ""})
+check("neither words nor a picture: refused", code == 400 and res["error"] == "body_required"
+      and "عکس" in res["message"])
+code, res = call("POST", "/users/111/tickets", {"subject": "خطا", "image_type": "image/png",
+                                                 "image_data": PNG64})
+check("a screenshot with no words opens a ticket", code == 201, str(res))
+pt = res["ticket"]["id"]
+pm = res["ticket"]["messages"][0]["id"]
+code, res = call("POST", "/users/111/tickets/%d/messages" % pt,
+                 {"image_type": "image/png", "image_data": PNG64})
+check("and is written into one", code == 201 and len(res["ticket"]["messages"]) == 2)
+sent = [json.loads(r["payload"]) for r in store.q(
+    "SELECT payload FROM webhook_outbox WHERE event IN ('ticket.opened', 'ticket.message')"
+    " ORDER BY id DESC LIMIT 2")]
+check("the operator's bot is told which message has the picture",
+      len(sent) == 2 and all(e["data"]["has_image"] and e["data"]["message_id"] for e in sent)
+      and sent[-1]["data"]["message_id"] == pm and "🖼" in sent[-1]["data"]["text"], str(sent))
+
+
+def admin_call(path):
+    req = urllib.request.Request(BASE + path)
+    req.add_header("Authorization", "Bearer dd_adminkey")
+    try:
+        r = urllib.request.urlopen(req, timeout=10)
+        return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+code, res = admin_call("/admin/tickets/%d/messages/%d/image" % (pt, pm))
+check("and fetches it", code == 200 and base64.b64decode(res["data"]) == PNG
+      and res["content_type"] == "image/png")
+code, res = admin_call("/admin/tickets/%d/messages/%d/image" % (tid, pm))
+check("  only under its own ticket", code == 404)
+code, res = call("GET", "/admin/tickets/%d/messages/%d/image" % (pt, pm))
+check("  and with admin rights only", code == 403)
+res = panel.admin_ticket_reply(store, pt, {"image_type": "image/png", "image_data": PNG64})
+told = json.loads(store.one("SELECT payload FROM webhook_outbox WHERE event = 'ticket.answered'"
+                            " ORDER BY id DESC LIMIT 1")["payload"])["data"]
+check("the operator may answer with a picture alone, and the customer's bot is told which",
+      res["ok"] and told["has_image"] and told["message_id"]
+      and call("GET", "/users/111/tickets/%d/messages/%d/image"
+               % (pt, told["message_id"]))[0] == 200)
+check("  but not with nothing", panel.admin_ticket_reply(store, pt, {})["error"]
+      == "body_required")
 server.shutdown()
 
 shutil.rmtree(tmp, ignore_errors=True)

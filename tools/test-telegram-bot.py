@@ -399,6 +399,52 @@ tap(CUSTOMER, "tk:%d" % tk["id"])
 check("and sees the whole conversation", "درست شد ممنون" in tg.last(CUSTOMER)["text"]
       and "پشتیبانی" in tg.last(CUSTOMER)["text"])
 
+print("a screenshot of the error")
+panel.THROTTLE.clear("ticket:%d" % store.one("SELECT user_id FROM tickets")["user_id"])
+tap(CUSTOMER, "tknew")
+message(CUSTOMER, "خطای بازی")
+check("the bot says a picture will do", "عکس خطا" in tg.last(CUSTOMER)["text"])
+message(CUSTOMER, photo="PHOTO1")
+shot = store.one("SELECT * FROM tickets ORDER BY id DESC LIMIT 1")
+first = store.one("SELECT * FROM ticket_messages WHERE ticket_id = ?", (shot["id"],))
+check("a photo with no words opens the ticket", shot["subject"] == "خطای بازی"
+      and first["body"] == "" and first["image_blob"] is not None)
+panel_speaks()
+pic = tg.last(ADMIN_TG, "sendPhoto")
+check("the operator gets the photo itself, the ticket under it, with the reply button",
+      pic.get("bytes") == PNG and "خطای بازی" in pic.get("caption", "")
+      and pic["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "areply:%d"
+      % shot["id"])
+tap(CUSTOMER, "tkr:%d" % shot["id"])
+updates[0] += 1
+bot.handle({"update_id": updates[0], "message": {
+    "message_id": updates[0], "chat": {"id": CUSTOMER, "type": "private"},
+    "from": {"id": CUSTOMER, "first_name": "علی"}, "caption": "این یکی هم",
+    "document": {"file_id": "PHOTO1", "mime_type": "image/png", "file_name": "s.png"}}})
+last = store.one("SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY id DESC LIMIT 1",
+                 (shot["id"],))
+check("a screenshot sent as a file is taken too", last["body"] == "این یکی هم"
+      and last["image_blob"] is not None)
+tap(CUSTOMER, "tkr:%d" % shot["id"])
+updates[0] += 1
+bot.handle({"update_id": updates[0], "message": {
+    "message_id": updates[0], "chat": {"id": CUSTOMER, "type": "private"},
+    "from": {"id": CUSTOMER, "first_name": "علی"},
+    "document": {"file_id": "TEXTFILE", "mime_type": "image/png", "file_name": "x.png"}}})
+check("  a file that is no picture is refused, and the bot waits for another",
+      "JPG" in tg.last(CUSTOMER)["text"]
+      and bot.state.get(CUSTOMER, (None,))[0] == "ticket_reply")
+message(CUSTOMER, botmod.B_CANCEL)
+panel_speaks()
+tap(ADMIN_TG, "areply:%d" % shot["id"])
+message(ADMIN_TG, photo="PHOTO1")
+panel_speaks()
+pic = tg.last(CUSTOMER, "sendPhoto")
+check("the operator answers with a photo alone, and the customer gets the photo",
+      pic.get("bytes") == PNG and "خطای بازی" in pic.get("caption", "")
+      and pic["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "tkr:%d"
+      % shot["id"])
+
 print("linking a web account")
 web = store.create_web_user("sara", "سارا", "sara-password")
 SARA = 222

@@ -106,6 +106,8 @@ STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال �
           "over_quota": "حجم تمام شده ⛔", "expired": "دوره تمام شده ⛔",
           "suspended": "مسدود ⛔"}
 MAX_FILE = 4 * 1024 * 1024
+# What a ticket's picture may be - the panel's TICKET_IMAGE_TYPES.
+TICKET_IMAGES = ("image/jpeg", "image/png", "image/webp")
 # Telegram's longest caption under a photo or video.
 CAPTION_MAX = 1024
 # How long "is in the channel" is believed before Telegram is asked again.
@@ -698,8 +700,8 @@ class Bot:
             return self.got_receipt(chat, sender, msg, None, device=True)
         if waiting == "ticket_subject" and text:
             self.state[chat] = ("ticket_body", text[:80])
-            return self.say(chat, "متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):",
-                            CANCEL)
+            return self.say(chat, "متن پیامتان را بنویسید، یا عکس خطا را بفرستید "
+                                  "(عکس می‌تواند توضیح هم داشته باشد):", CANCEL)
         if waiting == "ticket_body":
             return self.got_ticket(chat, sender, msg, subject=extra)
         if waiting == "ticket_reply":
@@ -1287,16 +1289,35 @@ class Bot:
             buttons.append({"text": "✔️ بستن", "callback_data": "tkc:%d" % tid})
         self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
 
+    def ticket_picture(self, msg):
+        """A ticket message's picture: as a photo, or as a file when it is an
+        image - a screenshot sent uncompressed. ({image_type, image_data} or
+        {}, and why not, when there was one that cannot be taken)."""
+        doc = msg.get("document") or {}
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]
+        elif (doc.get("mime_type") or "").startswith("image/"):
+            file_id = doc["file_id"]
+        else:
+            return {}, ""
+        try:
+            blob = self.tg.download(file_id)
+        except ValueError as e:
+            return {}, str(e)
+        kind = image_type(blob)
+        if kind not in TICKET_IMAGES:
+            return {}, "فقط عکس JPG، PNG یا WEBP"
+        return {"image_type": kind, "image_data": base64.b64encode(blob).decode()}, ""
+
     def got_ticket(self, chat, sender, msg, subject=None, ticket=None):
         body = (msg.get("text") or msg.get("caption") or "").strip()
-        if not body:
-            return self.say(chat, "متن پیام را بنویسید (یا «انصراف»).", CANCEL)
-        payload = {"body": body}
-        if msg.get("photo"):
-            blob = self.tg.download(msg["photo"][-1]["file_id"])
-            if image_type(blob) in ("image/jpeg", "image/png", "image/webp"):
-                payload.update(image_type=image_type(blob),
-                               image_data=base64.b64encode(blob).decode())
+        picture, why = self.ticket_picture(msg)
+        if why:
+            return self.say(chat, "⚠️ %s — دوباره بفرستید (یا «انصراف»)." % why, CANCEL)
+        # A screenshot of the error alone is a message too.
+        if not body and not picture:
+            return self.say(chat, "متن پیام را بنویسید یا عکس بفرستید (یا «انصراف»).", CANCEL)
+        payload = dict(picture, body=body)
         idem = "ticket-%d-%d" % (sender["id"], msg["message_id"])
         if subject is not None:
             payload["subject"] = subject
@@ -1416,7 +1437,7 @@ class Bot:
             return self.say(chat, "موضوع تیکت را در یک خط بنویسید:", CANCEL)
         if kind == "tkr":
             self.state[chat] = ("ticket_reply", int(arg))
-            return self.say(chat, "پیامتان را بنویسید:", CANCEL)
+            return self.say(chat, "پیامتان را بنویسید یا عکس بفرستید:", CANCEL)
         if kind == "tkc":
             res = self.panel.call("POST", "/users/%d/tickets/%d/close" % (sender["id"], int(arg)))
             return self.say(chat, "✔️ " + res["message"], MENU)
@@ -1446,6 +1467,34 @@ class Bot:
         except ApiError:
             self.say(chat, caption, buttons)
 
+    def ticket_notice(self, chat, text, markup, data, image_path):
+        """A ticket's message to the operator or the customer, with its
+        picture when it has one: the picture with the words under it, or
+        after it when they are too long for a caption. Words alone if the
+        picture cannot be had."""
+        mid = data.get("message_id")
+        if not data.get("has_image") or not mid:
+            return self.say(chat, text, markup)
+        try:
+            pic = self.panel.call("GET", image_path % int(mid))
+            blob = base64.b64decode(pic.get("data") or pic.get("image_data") or "")
+        except Exception as e:
+            log("ticket #%s: its picture could not be had (%s)" % (data.get("ticket_id"), e))
+            return self.say(chat, text, markup)
+        words = self.t(text)
+        # photo() cuts a caption at 1000, a little under Telegram's own.
+        if len(words) <= 1000:
+            try:
+                return self.tg.photo(chat, blob, words, self.t_markup(markup))
+            except Exception as e:
+                log("could not send to %s: %s" % (chat, e))
+                return self.say(chat, text, markup)
+        try:
+            self.tg.photo(chat, blob, "")
+        except Exception as e:
+            log("could not send to %s: %s" % (chat, e))
+        self.say(chat, text, markup)
+
     def admin_button(self, chat, q, kind, num):
         if kind in ("ok", "no"):
             try:
@@ -1464,21 +1513,19 @@ class Bot:
             return self.say(chat, "رسید #%d: %s" % (num, done))
         if kind == "areply":
             self.state[chat] = ("admin_reply", num)
-            return self.say(chat, "جواب تیکت #%d را بنویسید:" % num, CANCEL)
+            return self.say(chat, "جواب تیکت #%d را بنویسید یا عکس بفرستید:" % num, CANCEL)
         if kind == "aclose":
             res = self.panel.call("POST", "/admin/tickets/%d/close" % num)
             return self.say(chat, "تیکت #%d: %s" % (num, res["message"]))
 
     def admin_reply(self, chat, msg, tid):
         body = (msg.get("text") or msg.get("caption") or "").strip()
-        if not body:
-            return self.say(chat, "متن جواب را بنویسید (یا «انصراف»).", CANCEL)
-        payload = {"body": body}
-        if msg.get("photo"):
-            blob = self.tg.download(msg["photo"][-1]["file_id"])
-            if image_type(blob) in ("image/jpeg", "image/png", "image/webp"):
-                payload.update(image_type=image_type(blob),
-                               image_data=base64.b64encode(blob).decode())
+        picture, why = self.ticket_picture(msg)
+        if why:
+            return self.say(chat, "⚠️ %s — دوباره بفرستید (یا «انصراف»)." % why, CANCEL)
+        if not body and not picture:
+            return self.say(chat, "متن جواب را بنویسید یا عکس بفرستید (یا «انصراف»).", CANCEL)
+        payload = dict(picture, body=body)
         self.panel.call("POST", "/admin/tickets/%d/reply" % tid, payload,
                         idem="areply-%d-%d" % (chat, msg["message_id"]))
         self.state.pop(chat, None)
@@ -1499,9 +1546,11 @@ class Bot:
                                       text if text.startswith("🧾") else "🧾 " + text)
                 elif kind in ("ticket.opened", "ticket.message"):
                     tid = data["ticket_id"]
-                    self.say(admin, "🎫 #%d %s" % (tid, text), {"inline_keyboard": [[
+                    buttons = {"inline_keyboard": [[
                         {"text": "✍️ جواب", "callback_data": "areply:%d" % tid},
-                        {"text": "✔️ بستن", "callback_data": "aclose:%d" % tid}]]})
+                        {"text": "✔️ بستن", "callback_data": "aclose:%d" % tid}]]}
+                    self.ticket_notice(admin, "🎫 #%d %s" % (tid, text), buttons, data,
+                                       "/admin/tickets/%d/messages/%%d/image" % tid)
                 elif text:
                     self.say(admin, text)
             return
@@ -1518,6 +1567,9 @@ class Bot:
         if kind == "ticket.answered":
             markup = {"inline_keyboard": [[{"text": "✍️ جواب",
                                             "callback_data": "tkr:%d" % data["ticket_id"]}]]}
+            return self.ticket_notice(chat, text, markup, data,
+                                      "/users/%d/tickets/%d/messages/%%d/image"
+                                      % (int(chat), data["ticket_id"]))
         elif kind in ("quota.warning", "quota.exhausted", "plan.expiring", "plan.expired"):
             markup = {"inline_keyboard": [[{"text": "🛒 تمدید", "callback_data": "plans"}]]}
         self.say(chat, text, markup)

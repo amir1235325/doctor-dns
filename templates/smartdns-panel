@@ -4022,6 +4022,15 @@ def ticket_image(body):
     return blob, kind
 
 
+# A message may be a picture alone - a screenshot of the error says it all.
+TICKET_EMPTY = "متن پیام را بنویسید یا عکس بفرستید"
+
+
+def ticket_said(text, blob):
+    """A message in words, for a notice: its text, and a word for its picture."""
+    return (text + ("\n🖼 با عکس" if blob else "")) if text else "🖼 عکس"
+
+
 def ticket_text(body, field, limit):
     text = unicodedata.normalize("NFC", str(body.get(field) or ""))
     # Keep line breaks, drop other control characters a client might send.
@@ -4042,11 +4051,11 @@ def ticket_open(store, user, body):
     text = ticket_text(body, "body", TICKET_BODY_MAX)
     if not subject:
         return refused("subject_required", "موضوع تیکت را بنویسید")
-    if not text:
-        return refused("body_required", "متن پیام را بنویسید")
     blob, kind = ticket_image(body)
     if isinstance(blob, dict):
         return blob
+    if not text and not blob:
+        return refused("body_required", TICKET_EMPTY)
     waiting = store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
                         " AND status != 'closed'", (user["id"],))["c"]
     if waiting >= TICKET_OPEN_MAX:
@@ -4061,14 +4070,16 @@ def ticket_open(store, user, body):
                                " created_at, updated_at) VALUES (?, ?, 'open', ?, ?)",
                                (user["id"], subject, stamp, stamp))
         tid = cur.lastrowid
-        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
-                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-                         (tid, text, seal(blob), kind, stamp))
+        mid = store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+                               " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+                               (tid, text, seal(blob), kind, stamp)).lastrowid
         store.db.commit()
     print("ticket #%d opened by user %d" % (tid, user["id"]), flush=True)
     emit_admin(store, "ticket.opened", {
         "ticket_id": tid, "user_id": user["id"], "subject": subject, "body": text,
-        "text": "تیکت تازه از %s: «%s»\n\n%s" % (who_label(user), subject, text)})
+        "message_id": mid, "has_image": bool(blob),
+        "text": "تیکت تازه از %s: «%s»\n\n%s" % (who_label(user), subject,
+                                                 ticket_said(text, blob))})
     return {"ok": True, "ticket_id": tid,
             "message": "تیکت ثبت شد؛ جواب همین‌جا می‌آید"}
 
@@ -4089,18 +4100,18 @@ def ticket_reply(store, user, tid, body):
     if not ticket:
         return refused("ticket_not_found", "این تیکت پیدا نشد")
     text = ticket_text(body, "body", TICKET_BODY_MAX)
-    if not text:
-        return refused("body_required", "متن پیام را بنویسید")
     blob, kind = ticket_image(body)
     if isinstance(blob, dict):
         return blob
+    if not text and not blob:
+        return refused("body_required", TICKET_EMPTY)
     if not ticket_rate_ok(user):
         return refused("slow_down", "پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید")
     stamp = now()
     with store.lock:
-        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
-                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
-                         (ticket["id"], text, seal(blob), kind, stamp))
+        mid = store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+                               " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+                               (ticket["id"], text, seal(blob), kind, stamp)).lastrowid
         # Whatever it was, it is the operator's turn now - a closed ticket
         # written into is open again.
         store.db.execute("UPDATE tickets SET status = 'open', updated_at = ?"
@@ -4108,9 +4119,9 @@ def ticket_reply(store, user, tid, body):
         store.db.commit()
     emit_admin(store, "ticket.message", {
         "ticket_id": ticket["id"], "user_id": user["id"], "subject": ticket["subject"],
-        "body": text,
+        "body": text, "message_id": mid, "has_image": bool(blob),
         "text": "پیام تازه از %s در تیکت «%s»:\n\n%s"
-                % (who_label(user), ticket["subject"], text)})
+                % (who_label(user), ticket["subject"], ticket_said(text, blob))})
     return {"ok": True, "ticket_id": ticket["id"], "message": "پیام فرستاده شد"}
 
 
@@ -4723,22 +4734,23 @@ def admin_ticket_reply(store, tid, body):
     if not ticket:
         return refused("ticket_not_found", "این تیکت پیدا نشد")
     text = ticket_text(body, "body", TICKET_BODY_MAX)
-    if not text:
-        return refused("body_required", "متن جواب را بنویسید")
     blob, kind = ticket_image(body)
     if isinstance(blob, dict):
         return blob
+    if not text and not blob:
+        return refused("body_required", "متن جواب را بنویسید یا عکس بفرستید")
     stamp = now()
-    store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
-              " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-              (tid, text, seal(blob), kind, stamp))
+    mid = store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
+                    " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+                    (tid, text, seal(blob), kind, stamp)).lastrowid
     store.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
               (stamp, tid))
     user = store.one("SELECT * FROM users WHERE id = ?", (ticket["user_id"],))
     emit(store, user, "ticket.answered", {
         "ticket_id": tid, "subject": ticket["subject"], "body": text,
-        "has_image": bool(blob),
-        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+        "has_image": bool(blob), "message_id": mid,
+        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s"
+                % (ticket["subject"], ticket_said(text, blob))})
     return {"ok": True, "message": "جواب فرستاده شد"}
 
 
@@ -7098,6 +7110,23 @@ class AdminAPI:
                                  "telegram_id": owner["telegram_id"]}
         return 200, res
 
+    def api_admin_ticket_image(self, body, tid, mid):
+        """A ticket message's picture, for the operator - or a seller, of
+        their own customers' tickets only - as the receipt's is."""
+        extra, more = self.mine()
+        row = self.store.one("SELECT m.image_blob, m.image_type FROM ticket_messages m"
+                             " JOIN tickets t ON t.id = m.ticket_id"
+                             " JOIN users u ON u.id = t.user_id"
+                             " WHERE m.id = ? AND t.id = ?" + extra,
+                             (int(mid), int(tid)) + more)
+        if not row or row["image_blob"] is None:
+            return 404, refused("image_not_found", "این عکس پیدا نشد")
+        image = unseal(row["image_blob"])
+        if image is None:
+            return 409, refused("image_sealed", "این عکس روی این سرور باز نمی‌شود")
+        return 200, {"ok": True, "content_type": row["image_type"],
+                     "data": base64.b64encode(image).decode("ascii")}
+
     def api_admin_reply(self, body, tid):
         if not self.owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
                          " WHERE t.id = ?", int(tid)):
@@ -7181,6 +7210,8 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/wallet$"), "admin_wallet"),
         ("GET", re.compile(r"/api/v1/admin/tickets$"), "admin_tickets"),
         ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})$"), "admin_ticket"),
+        ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/messages/(\d{1,12})/image$"),
+         "admin_ticket_image"),
         ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/reply$"), "admin_reply"),
         ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/close$"), "admin_close"),
     ]
